@@ -36,6 +36,28 @@ using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_h
 struct llama_cparams;
 struct llama_layer;
 
+// one routed projection left in the escha 2/3-bit code; see ggml_escha_moe
+struct llm_escha_exps {
+    struct ggml_tensor * code = nullptr;
+    struct ggml_tensor * rin  = nullptr;
+    struct ggml_tensor * rout = nullptr;
+
+    bool active() const { return code != nullptr; }
+};
+
+// the escha side of one MoE block: the shared codec tables plus the three projections
+struct llm_escha_moe {
+    struct ggml_tensor * lut    = nullptr;
+    struct ggml_tensor * dep_k2 = nullptr;
+    struct ggml_tensor * dep_k3 = nullptr;
+
+    llm_escha_exps gate;
+    llm_escha_exps up;
+    llm_escha_exps down;
+
+    bool active() const { return down.active(); }
+};
+
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
@@ -1192,6 +1214,13 @@ struct llm_graph_context {
               ggml_tensor * tok_embd,
               ggml_tensor * ids) const;
 
+    // routed matmul for experts still in the escha code -- stands in for build_lora_mm_id
+    ggml_tensor * build_escha_mm_id(
+       const llm_escha_moe & escha,
+      const llm_escha_exps & w,
+              ggml_tensor * cur,
+              ggml_tensor * ids) const;
+
     ggml_tensor * build_norm(
              ggml_tensor * cur,
              ggml_tensor * mw,
@@ -1246,7 +1275,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+     const llm_escha_moe * escha = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1272,7 +1302,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+     const llm_escha_moe * escha = nullptr) const;
 
     //
     // inputs
