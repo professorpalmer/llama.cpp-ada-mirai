@@ -72,6 +72,22 @@ static __device__ __forceinline__ void dequantize_pq2_0(const void * vx, const i
     v.y = (c1 - 1) * d;
 }
 
+// values iqs and iqs + 16 (QR3_0 == 2), layout in ggml-common.h
+static __device__ __forceinline__ void dequantize_q3_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q3_0 * x = (const block_q3_0 *) vx;
+
+    const float d = x[ib].d;
+
+    const int j0 = iqs;
+    const int j1 = iqs + QK3_0/2;
+
+    v.x = ((x[ib].qs[j0%8] >> (2*(j0/8))) & 3) | (((x[ib].qs[8 + j0%4] >> (j0/4)) & 1) << 2);
+    v.y = ((x[ib].qs[j1%8] >> (2*(j1/8))) & 3) | (((x[ib].qs[8 + j1%4] >> (j1/4)) & 1) << 2);
+
+    v.x = (v.x - 4.0f) * d;
+    v.y = (v.y - 4.0f) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 

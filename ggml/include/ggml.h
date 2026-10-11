@@ -440,7 +440,8 @@ extern "C" {
         GGML_TYPE_MS_I3   = 93,
         GGML_TYPE_PQ2_0 = 142,
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
-        GGML_TYPE_COUNT   = 144,
+        GGML_TYPE_Q3_0   = 144, // Prism-private 3-bit KV cache type, symmetric, group 32
+        GGML_TYPE_COUNT   = 145,
     };
 
     // precision

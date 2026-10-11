@@ -182,6 +182,44 @@ void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_REST
     }
 }
 
+// q3_0: same scale rule as q4_0 (signed max over 32 values maps to q = 0), 8 levels; layout in ggml-common.h
+void quantize_row_q3_0_ref(const float * GGML_RESTRICT x, block_q3_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK3_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+        float max  = 0.0f;
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+                max  = v;
+            }
+        }
+
+        const float d  = max / -4;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+
+        for (int j = 0; j < qk; ++j) {
+            const float x0 = x[i*qk + j]*id;
+
+            const uint8_t q = MIN(7, (int8_t)(x0 + 4.5f));
+
+            y[i].qs[j%8]     |= (q & 3) << (2*(j/8));
+            y[i].qs[8 + j%4] |= (q >> 2) << (j/4);
+        }
+    }
+}
+
 void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_RESTRICT y, int64_t k) {
     const int qk = QK4_1;
 
@@ -527,6 +565,24 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
 
             y[i*qk + j + 0   ] = x0*d;
             y[i*qk + j + qk/2] = x1*d;
+        }
+    }
+}
+
+void dequantize_row_q3_0(const block_q3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK3_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            const int q = ((x[i].qs[j%8] >> (2*(j/8))) & 3) | (((x[i].qs[8 + j%4] >> (j/4)) & 1) << 2);
+
+            y[i*qk + j] = (q - 4)*d;
         }
     }
 }
@@ -2294,6 +2350,12 @@ size_t quantize_ptq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
         qrow += row_size;
     }
     return nrow * row_size;
+}
+
+size_t quantize_q3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights); // KV cache type: no imatrix path
+    quantize_row_q3_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q3_0, n_per_row);
 }
 
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -5715,6 +5777,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_PTQ1_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_ptq1_0, data, nb);
+            } break;
+        case GGML_TYPE_Q3_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q3_0, data, nb);
             } break;
         case GGML_TYPE_Q4_0:
             {

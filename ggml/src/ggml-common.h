@@ -104,6 +104,8 @@ typedef sycl::half2 ggml_half2;
 #define QI_PTQ1_0 (QK_PTQ1_0 / 32)
 #define QR_PTQ1_0 1
 
+#define QI3_0 (QK3_0 / (4 * QR3_0))
+#define QR3_0 2
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -218,6 +220,20 @@ typedef struct {
     ggml_half d;                                // scale
 } block_ptq1_0;
 static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
+
+// Q3_0: Prism-private 3-bit KV cache type. x = d*(q - 4), q in 0..7, symmetric per 32 values (like q4_0).
+// Value j (0..31) of a block:
+//   low 2 bits:  qs[j%8]     bits 2*(j/8) .. 2*(j/8)+1
+//   high bit:    qs[8 + j%4] bit  j/4
+// So 4 consecutive values 4i..4i+3 sit in 4 consecutive bytes at one shift in both fields: one 32-bit load
+// + shift + mask per field gives 4 bytes ready for dp4a (low: bytes 4*(i%2).., shift 2*(i/2); high: bytes 8..11,
+// shift i).
+#define QK3_0 32
+typedef struct {
+    ggml_half d;               // delta
+    uint8_t qs[QK3_0/4 + QK3_0/8]; // 8 bytes low 2 bits + 4 bytes high bit
+} block_q3_0;
+static_assert(sizeof(block_q3_0) == sizeof(ggml_half) + 3*QK3_0/8, "wrong q3_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {

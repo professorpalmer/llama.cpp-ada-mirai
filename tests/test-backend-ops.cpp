@@ -2481,7 +2481,7 @@ struct test_set_rows : public test_case {
 
     double max_nmse_err() override {
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
-            type_dst == GGML_TYPE_IQ4_NL ||
+            type_dst == GGML_TYPE_IQ4_NL || type_dst == GGML_TYPE_Q3_0 ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-1,1], so it'll be
@@ -2490,6 +2490,9 @@ struct test_set_rows : public test_case {
             double err_estimate = 1.0f/8.0f;
             if (type_src == GGML_TYPE_F16 && type_dst == GGML_TYPE_Q2_0) {
                 err_estimate *= 4.0f;
+            }
+            if (type_dst == GGML_TYPE_Q3_0) {
+                err_estimate *= 2.0f;
             }
             if (type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1) {
                 err_estimate /= 2.0f;
@@ -3010,6 +3013,7 @@ struct test_cpy : public test_case {
             return 0.0;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
+            type_dst == GGML_TYPE_Q3_0 ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-150,150], so it'll be
@@ -3018,6 +3022,9 @@ struct test_cpy : public test_case {
             double err_estimate = 1.0f/8.0f * 150.0f;
             if (type_dst == GGML_TYPE_IQ4_NL) {
                 // iq4_nl values are a bit more spread out
+                err_estimate *= 2.0f;
+            }
+            if (type_dst == GGML_TYPE_Q3_0) {
                 err_estimate *= 2.0f;
             }
             if (type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1) {
@@ -8608,6 +8615,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
+
+    // q3_0 (3-bit KV cache type, not in all_types): KV writes and reads
+    for (int b : {1, 7}) {
+        for (bool v : {false, true}) {
+            test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q3_0, 256, 5, 4, b, 1, v));
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q3_0, GGML_TYPE_I64, { 256, 5,  b, 3 }, { 1, 1, }, 1, v));
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q3_0, GGML_TYPE_I64, { 256, 11, 1, b }, { 2, 3, }, 7, v));
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q3_0, GGML_TYPE_I64, { 3*ggml_blck_size(GGML_TYPE_Q3_0), 3, b, 1 }, { 2, 3, }, 2, v));
+        }
+    }
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q3_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q3_0, GGML_TYPE_I64, { 1024, 32, 1, 1 }, { 1, 1, }, 7, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
@@ -9025,6 +9044,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3})); // cpy not-contiguous
         }
     }
+    // q3_0 (not in all_types): f32 <-> q3_0 (KV shift path) and same-type copy
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q3_0, {256, 4, 4, 4}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q3_0, {256, 2, 3, 4}, {-1,-1,-1,-1}, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q3_0, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q3_0, GGML_TYPE_F32, {256, 4, 4, 4}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q3_0, GGML_TYPE_F32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q3_0, GGML_TYPE_F32, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q3_0, GGML_TYPE_Q3_0, {64, 2, 3, 4}));
+
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
@@ -10212,7 +10240,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // in-place quantized K/V for the tensor-core prompt kernels (CUDA reads q4_0 / q8_0 straight from the cache at
     // hs 128 / 256 instead of converting the whole cache to F16): every GQA tiling, prompt-sized batches, a KV
     // length that is not a multiple of the tile (out-of-bounds rows), and the permuted cache layout.
-    for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+    for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q3_0 }) {
         for (int64_t kv : { 1024, 4096, 16384 }) {
             for (int64_t nb : { 3, 8, 35, 512 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
@@ -10252,6 +10280,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 2048, 512, true,  false, 0, 0, GGML_PREC_F32,
         GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, true));
+
+    // q3_0 K/V (3-bit KV cache): decode (vec kernel; in-place tensor-core kernel for wide GQA), small verify-sized
+    // batches and prompt batches (in-place tensor-core kernel at hs 128 / 256), with and without mask, no GQA,
+    // the permuted cache layout, a KV length that is not a multiple of the tile, hs 64 (f16 conversion path),
+    // and the chunked prefill path (f16 and packed masks)
+    for (int64_t hs : { 128, 256 }) {
+        const int64_t nh = hs == 256 ? 4 : 8;
+        const int64_t nr = hs == 256 ? 6 : 4;
+        for (bool mask : { true, false }) {
+            for (int64_t kv : { 512, 1024, 4096 }) {
+                for (int64_t nb : { 1, 2, 8, 64, 512 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr, 1}, kv, nb, mask, false, 0, 0, GGML_PREC_F32,
+                        GGML_TYPE_Q3_0, GGML_TYPE_Q3_0));
+                }
+            }
+        }
+        for (int64_t nb : { 1, 8, 64 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {1, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_Q3_0, GGML_TYPE_Q3_0));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_Q3_0, GGML_TYPE_Q3_0, {0, 2, 1, 3}));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr, 1}, 1025, 1, true, false, 0, 0, GGML_PREC_F32,
+            GGML_TYPE_Q3_0, GGML_TYPE_Q3_0));
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr, 1}, 1025, 64, true, false, 0, 0, GGML_PREC_F32,
+            GGML_TYPE_Q3_0, GGML_TYPE_Q3_0));
+    }
+    for (int64_t nb : { 1, 8, 64 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32,
+            GGML_TYPE_Q3_0, GGML_TYPE_Q3_0));
+    }
+    for (bool mask_packed : { false, true }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 2048, 512, true, false, 0, 0, GGML_PREC_F32,
+            GGML_TYPE_Q3_0, GGML_TYPE_Q3_0, {0, 2, 1, 3}, true, false, mask_packed));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

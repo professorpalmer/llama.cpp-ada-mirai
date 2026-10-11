@@ -36,7 +36,10 @@ SOURCE_FATTN_MMA_CASE = "DECL_FATTN_MMA_F16_CASE({head_size_kq}, {head_size_v}, 
 
 SOURCE_FATTN_MMA_CASE_KV = "DECL_FATTN_MMA_F16_CASE_KV({head_size_kq}, {head_size_v}, {ncols1}, {ncols2}, {type_kv});\n"
 
-TYPES_KV_MMA_NATIVE = ["GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0"]
+TYPES_KV_MMA_NATIVE = ["GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q3_0"]
+
+# K/V types with vec kernels only for the same-type pair (always compiled, see CMakeLists.txt)
+TYPES_KV_SAME_ONLY = ["GGML_TYPE_Q3_0"]
 HEAD_SIZES_MMA_NATIVE = [128, 256]
 
 TYPES_MMQ = [
@@ -90,6 +93,10 @@ for type_k in TYPES_KV:
     for type_v in TYPES_KV:
         with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
             f.write(SOURCE_FATTN_VEC.format(type_k=type_k, type_v=type_v))
+
+for type_kv in TYPES_KV_SAME_ONLY:
+    with open(f"fattn-vec-instance-{get_short_name(type_kv)}-{get_short_name(type_kv)}.cu", "w") as f:
+        f.write(SOURCE_FATTN_VEC.format(type_k=type_kv, type_v=type_kv))
 
 for ncols in [8, 16, 32, 64]:
     for ncols2 in [1, 2, 4, 8, 16, 32]:

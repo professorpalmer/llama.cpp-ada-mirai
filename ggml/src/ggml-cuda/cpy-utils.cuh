@@ -43,6 +43,38 @@ static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, blo
     }
 }
 
+// same arithmetic as quantize_row_q3_0_ref; layout in ggml-common.h
+static __device__ void quantize_f32_q3_0_block(const float * __restrict__ x, block_q3_0 * __restrict__ y) {
+    float amax = 0.0f;
+    float vmax = 0.0f;
+
+    for (int j = 0; j < QK3_0; ++j) {
+        const float v = x[j];
+        if (amax < fabsf(v)) {
+            amax = fabsf(v);
+            vmax = v;
+        }
+    }
+
+    const float d  = vmax / -4;
+    const float id = d ? 1.0f/d : 0.0f;
+
+    y->d = d;
+
+    uint32_t lo[2] = {0, 0};
+    uint32_t hi    = 0;
+#pragma unroll
+    for (int j = 0; j < QK3_0; ++j) {
+        const uint32_t q = min(7, (int8_t)(x[j]*id + 4.5f));
+
+        lo[(j%8)/4] |= (q & 3)  << (8*(j%4) + 2*(j/8));
+        hi          |= (q >> 2) << (8*(j%4) + j/4);
+    }
+    memcpy(y->qs + 0, &lo[0], sizeof(uint32_t));
+    memcpy(y->qs + 4, &lo[1], sizeof(uint32_t));
+    memcpy(y->qs + 8, &hi,    sizeof(uint32_t));
+}
+
 static __device__ void quantize_f32_q4_1_block(const float * __restrict__ x, block_q4_1 * __restrict__ y) {
     float vmin = FLT_MAX;
     float vmax = -FLT_MAX;
@@ -189,6 +221,10 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_q3_0(const char * cxi, char * cdsti) {
+    quantize_f32_q3_0_block((const float *)cxi, (block_q3_0 *)cdsti);
 }
 
 static __device__ void cpy_blck_f32_q4_1(const char * cxi, char * cdsti) {

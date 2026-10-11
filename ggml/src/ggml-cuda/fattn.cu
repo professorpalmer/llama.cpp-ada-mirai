@@ -146,6 +146,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             if (ggml_cuda_fattn_mma_kv_native_supported(dst)) {
                 if (K->type == GGML_TYPE_Q4_0) {
                     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, GGML_TYPE_Q4_0>(ctx, dst);
+                } else if (K->type == GGML_TYPE_Q3_0) {
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, GGML_TYPE_Q3_0>(ctx, dst);
                 } else {
                     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, GGML_TYPE_Q8_0>(ctx, dst);
                 }
@@ -174,6 +176,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             if (ggml_cuda_fattn_mma_kv_native_supported(dst)) {
                 if (K->type == GGML_TYPE_Q4_0) {
                     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, GGML_TYPE_Q4_0>(ctx, dst);
+                } else if (K->type == GGML_TYPE_Q3_0) {
+                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, GGML_TYPE_Q3_0>(ctx, dst);
                 } else {
                     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, GGML_TYPE_Q8_0>(ctx, dst);
                 }
@@ -339,11 +343,14 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q3_0, GGML_TYPE_Q3_0)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q3_0, GGML_TYPE_Q3_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -368,6 +375,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
 #ifndef GGML_CUDA_FA_ALL_QUANTS
             return false;
 #endif // GGML_CUDA_FA_ALL_QUANTS
+        case GGML_TYPE_Q3_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
@@ -468,6 +476,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // q3_0 has vec kernels only for K and V both q3_0
+    if ((K->type == GGML_TYPE_Q3_0) != (V->type == GGML_TYPE_Q3_0)) {
         return BEST_FATTN_KERNEL_NONE;
     }
 
