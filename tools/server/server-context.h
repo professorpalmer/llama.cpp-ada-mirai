@@ -52,6 +52,8 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    bool slot_save_delta;   // delta slot saves are safe for this model (no SWA, text only)
 };
 
 enum server_state {

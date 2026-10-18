@@ -2527,8 +2527,8 @@ private:
                     std::vector<char> packed;
                     llama_tokens      delta;   // a delta save: the plain text tokens from pos_min
                     if (pos_min > 0) {
-                        if (pos_min >= (int32_t) slot->prompt.tokens.size() || mctx != nullptr) {
-                            send_error(task, "pos_min must be below the slot's token count (and the slot text-only)", ERROR_TYPE_INVALID_REQUEST);
+                        if (pos_min >= (int32_t) slot->prompt.tokens.size() || mctx != nullptr || llama_model_n_swa(model_tgt) != 0) {
+                            send_error(task, "pos_min must be below the slot's token count (a text-only slot, a model without SWA)", ERROR_TYPE_INVALID_REQUEST);
                             break;
                         }
                         const llama_tokens all = slot->prompt.tokens.get_text_tokens();
@@ -2558,7 +2558,9 @@ private:
                     // after a restore runs the draft context from empty: ~9-11x slower prefill on an 8 GB 2060)
                     if (ctx_dft) {
                         const std::string path_dft = filepath + ".draft";
-                        if (llama_state_seq_save_file_from(ctx_dft, path_dft.c_str(), slot->id, pos_min, nullptr, 0) == 0) {
+                        // always in full (small): the draft context defers the rows of the last verify batch, so a delta
+                        // of it would leave a gap at each link
+                        if (llama_state_seq_save_file(ctx_dft, path_dft.c_str(), slot->id, nullptr, 0) == 0) {
                             SRV_WRN("slot %d: draft context state not saved to %s\n", slot->id, path_dft.c_str());
                         }
                     }
@@ -2602,6 +2604,9 @@ private:
                         if (append && (slot->prompt.tokens.empty() || mctx != nullptr)) {
                             throw std::runtime_error("append needs a text-only slot that already holds tokens");
                         }
+                        if (append && llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id) + 1 != (llama_pos) slot->prompt.tokens.size()) {
+                            throw std::runtime_error("append: the slot's cells do not end at its token count");
+                        }
                         size_t n_packed = 0;
                         llama_tokens packed;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
@@ -2617,7 +2622,7 @@ private:
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
 
-                        if (restored.size() > (size_t) slot->n_ctx) {
+                        if (restored.size() + (append ? slot->prompt.tokens.size() : 0) > (size_t) slot->n_ctx) {
                             throw std::runtime_error("Restored prompt does not fit in the slot context");
                         }
 
@@ -2643,16 +2648,13 @@ private:
                         if (ctx_dft) {
                             const std::string path_dft = filepath + ".draft";
                             size_t n_dft = 0;
-                            if (!append) {
-                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
-                            }
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);   // the sidecar is always full
                             if (std::ifstream(path_dft).good()) {
                                 // a token buffer is required: with tokens_out == nullptr the call only reads the header
                                 // (12 bytes) and restores nothing. The sidecar is saved with no tokens.
                                 llama_token tok_dft  = 0;
                                 size_t      n_tok_dft = 0;
-                                n_dft = llama_state_seq_load_file_ext(ctx_dft, path_dft.c_str(), slot->id, &tok_dft, 1, &n_tok_dft,
-                                                                      append ? LLAMA_STATE_SEQ_FLAGS_APPEND : 0);
+                                n_dft = llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id, &tok_dft, 1, &n_tok_dft);
                             }
                             if (n_dft == 0) {
                                 llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
@@ -4276,6 +4278,8 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
+
+        /* slot_save_delta        */ llama_model_n_swa(impl->model_tgt) == 0 && impl->mctx == nullptr,
     };
 }
 
@@ -4667,7 +4671,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
-        { "slot_save_delta",             true },   // slot save takes "pos_min", restore takes "append" (delta saves)
+        { "slot_save_delta",             meta.slot_save_delta },   // slot save takes "pos_min", restore "append" (delta saves)
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },
