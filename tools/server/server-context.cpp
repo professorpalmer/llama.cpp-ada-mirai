@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"  // staging API: delta slot saves (llama_state_seq_save_file_from / _load_file_ext)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -2522,18 +2523,31 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    const int32_t pos_min = task.slot_action.pos_min;
                     std::vector<char> packed;
-                    try {
-                        packed = slot->prompt.tokens.serialize();
-                    } catch (const std::exception & err) {
-                        send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
-                        break;
+                    llama_tokens      delta;   // a delta save: the plain text tokens from pos_min
+                    if (pos_min > 0) {
+                        if (pos_min >= (int32_t) slot->prompt.tokens.size() || mctx != nullptr) {
+                            send_error(task, "pos_min must be below the slot's token count (and the slot text-only)", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        const llama_tokens all = slot->prompt.tokens.get_text_tokens();
+                        delta.assign(all.begin() + pos_min, all.end());
+                    } else {
+                        try {
+                            packed = slot->prompt.tokens.serialize();
+                        } catch (const std::exception & err) {
+                            send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
+                            break;
+                        }
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                    const size_t nwrite = pos_min > 0
+                        ? llama_state_seq_save_file_from(ctx_tgt, filepath.c_str(), slot->id, pos_min, delta.data(), delta.size())
+                        : llama_state_seq_save_file(
+                            ctx_tgt, filepath.c_str(), slot->id,
+                            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                     if (nwrite == 0) {
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
@@ -2544,7 +2558,7 @@ private:
                     // after a restore runs the draft context from empty: ~9-11x slower prefill on an 8 GB 2060)
                     if (ctx_dft) {
                         const std::string path_dft = filepath + ".draft";
-                        if (llama_state_seq_save_file(ctx_dft, path_dft.c_str(), slot->id, nullptr, 0) == 0) {
+                        if (llama_state_seq_save_file_from(ctx_dft, path_dft.c_str(), slot->id, pos_min, nullptr, 0) == 0) {
                             SRV_WRN("slot %d: draft context state not saved to %s\n", slot->id, path_dft.c_str());
                         }
                     }
@@ -2583,13 +2597,18 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     size_t nread = 0;
+                    const bool append = task.slot_action.append;
                     try {
+                        if (append && (slot->prompt.tokens.empty() || mctx != nullptr)) {
+                            throw std::runtime_error("append needs a text-only slot that already holds tokens");
+                        }
                         size_t n_packed = 0;
                         llama_tokens packed;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                            nread = llama_state_seq_load_file_ext(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed,
+                                                                  append ? LLAMA_STATE_SEQ_FLAGS_APPEND : 0);
                         }
                         if (nread == 0) {
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
@@ -2606,21 +2625,34 @@ private:
                             throw std::runtime_error("Invalid tokens in slot save file");
                         }
 
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
+                        if (append) {
+                            // the delta's cells follow the slot's cells: the sequence must now end at the new token count
+                            slot->prompt.tokens.insert(restored.get_text_tokens());
+                            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                            if (pos_max + 1 != (llama_pos) slot->prompt.tokens.size()) {
+                                throw std::runtime_error("the delta does not continue the slot (pos_max " + std::to_string(pos_max) +
+                                                         ", tokens " + std::to_string(slot->prompt.tokens.size()) + ")");
+                            }
+                        } else {
+                            slot->prompt.clear();
+                            slot->prompt.tokens = std::move(restored);
+                        }
 
                         // the draft context: its sidecar file when there is one, else an empty draft sequence (it then
                         // refills from the next prompt, as it did before)
                         if (ctx_dft) {
                             const std::string path_dft = filepath + ".draft";
                             size_t n_dft = 0;
-                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                            if (!append) {
+                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                            }
                             if (std::ifstream(path_dft).good()) {
                                 // a token buffer is required: with tokens_out == nullptr the call only reads the header
                                 // (12 bytes) and restores nothing. The sidecar is saved with no tokens.
                                 llama_token tok_dft  = 0;
                                 size_t      n_tok_dft = 0;
-                                n_dft = llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id, &tok_dft, 1, &n_tok_dft);
+                                n_dft = llama_state_seq_load_file_ext(ctx_dft, path_dft.c_str(), slot->id, &tok_dft, 1, &n_tok_dft,
+                                                                      append ? LLAMA_STATE_SEQ_FLAGS_APPEND : 0);
                             }
                             if (n_dft == 0) {
                                 llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
@@ -4635,6 +4667,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
+        { "slot_save_delta",             true },   // slot save takes "pos_min", restore takes "append" (delta saves)
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },
@@ -5327,6 +5360,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.pos_min  = json_value(request_data, "pos_min", 0);
         rd.post_task(std::move(task));
     }
 
@@ -5363,6 +5397,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.append   = json_value(request_data, "append", false);
         rd.post_task(std::move(task));
     }
 

@@ -223,3 +223,19 @@ LLAMA_API bool llama_model_dspark_get_meta(const struct llama_model * model, lla
 LLAMA_API bool llama_model_dspark_get_markov(const struct llama_model * model,
                                              std::vector<float> &       w1,
                                              std::vector<float> &       w2);
+
+//
+// delta saves (layer cache): a save writes only the attention cells at or after a position, a load appends them
+//
+// load flag: the attention cells of the file are added to the cells the sequence already has (the file must start
+// where the sequence ends) instead of replacing them. Recurrent state is replaced as always.
+#define LLAMA_STATE_SEQ_FLAGS_APPEND 4
+
+// like llama_state_seq_save_file, but writes only the attention cells with pos >= pos_min (recurrent state in full)
+LLAMA_API size_t llama_state_seq_save_file_from(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id,
+                                                llama_pos pos_min, const llama_token * tokens, size_t n_token_count);
+
+// like llama_state_seq_load_file, with flags (LLAMA_STATE_SEQ_FLAGS_APPEND)
+LLAMA_API size_t llama_state_seq_load_file_ext(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id,
+                                               llama_token * tokens_out, size_t n_token_capacity,
+                                               size_t * n_token_count_out, llama_state_seq_flags flags);

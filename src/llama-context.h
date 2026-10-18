@@ -192,13 +192,15 @@ struct llama_context {
             const char * filepath,
            llama_token * tokens_out,
                 size_t   n_token_capacity,
-                size_t * n_token_count_out);
+                size_t * n_token_count_out,
+ llama_state_seq_flags   flags = 0);
 
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
             const char * filepath,
      const llama_token * tokens,
-                size_t   n_token_count);
+                size_t   n_token_count,
+             llama_pos   pos_min = 0);
 
     //
     // perf

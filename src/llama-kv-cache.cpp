@@ -2354,6 +2354,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            // delta saves: only the cells at or after io.pos_min (0: all)
+            add_cell = add_cell && (seq_id == -1 || io.pos_min <= 0 || cells.pos_get(i) >= io.pos_min);
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
@@ -2428,7 +2430,9 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
+        // LLAMA_STATE_SEQ_FLAGS_APPEND (4, llama-ext.h): add the cells to the sequence instead of replacing it
+        const bool append = seq_id != -1 && (flags & 4) != 0;
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, append);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2579,13 +2583,15 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, bool append) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
     if (dest_seq_id != -1) {
-        // single sequence
-        seq_rm(dest_seq_id, -1, -1);
+        // single sequence (append: a delta save, the cells go after the ones the sequence has)
+        if (!append) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 

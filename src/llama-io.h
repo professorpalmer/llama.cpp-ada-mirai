@@ -18,6 +18,10 @@ public:
     virtual size_t n_bytes() = 0;
 
     void write_string(const std::string & str);
+
+    // delta saves: a sequence save writes only the attention cells with pos >= pos_min (recurrent and other fixed-size
+    // state is written in full)
+    int32_t pos_min = 0;   // llama_pos
 };
 
 class llama_io_read_i {

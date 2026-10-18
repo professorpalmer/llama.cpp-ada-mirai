@@ -166,6 +166,8 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        int32_t pos_min = 0;    // save: write only the cells at or after this position (a delta save)
+        bool    append  = false; // restore: add the file's cells after the slot's cells (the file is a delta save)
     };
     slot_action slot_action;
 
