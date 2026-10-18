@@ -3045,6 +3045,17 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
+            // a draft stops at its first end-of-generation token. Without this, an n-gram draft continues past the end
+            // of the answer (the history makes "<|im_end|>\n<|im_start|>..." easy to predict), the target accepts those
+            // tokens and reads them into the slot, and the next turn of the conversation, which differs there, cannot
+            // reuse the state after the answer (it falls back to a context checkpoint; a saved state is not a prefix)
+            for (size_t i = 0; i < draft.size(); ++i) {
+                if (llama_vocab_is_eog(vocab, draft[i])) {
+                    draft.resize(i + 1);
+                    break;
+                }
+            }
+
             slot.stats.n_draft_tokens += draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
