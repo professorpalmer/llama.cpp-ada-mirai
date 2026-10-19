@@ -3564,13 +3564,23 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     {
-        // the tier prefetch pipeline instead (see ggml_cuda_tier_graph_wants_pipeline); one log line per switch
+        // the tier prefetch pipeline instead (see ggml_cuda_tier_graph_wants_pipeline). Past the tier line the target
+        // graph reads the host tail and the MTP draft graph does not, so the state switches at every decode step:
+        // each state is a warning the first time only, later switches are debug lines (bonsai-ada-surgery issue #7: 7,399 of 7,869 log lines)
         static int last = -1;
+        static int seen = 0;
         const bool pipe = ggml_cuda_tier_graph_wants_pipeline(cgraph);
         if ((int) pipe != last) {
             last = (int) pipe;
-            GGML_LOG_WARN("%s: attention %s the host tail of the tiered KV cache: CUDA graphs %s\n", __func__,
-                pipe ? "reads" : "does not read", pipe ? "off, tier prefetch pipeline on" : "on");
+            const int bit = 1 << (int) pipe;
+            if (!(seen & bit)) {
+                seen |= bit;
+                GGML_LOG_WARN("%s: attention %s the host tail of the tiered KV cache: CUDA graphs %s (later switches: debug log)\n", __func__,
+                    pipe ? "reads" : "does not read", pipe ? "off, tier prefetch pipeline on" : "on");
+            } else {
+                GGML_LOG_DEBUG("%s: attention %s the host tail of the tiered KV cache: CUDA graphs %s\n", __func__,
+                    pipe ? "reads" : "does not read", pipe ? "off, tier prefetch pipeline on" : "on");
+            }
         }
         if (pipe) {
             return false;
