@@ -65,7 +65,22 @@ struct common_reasoning_budget_ctx {
     size_t force_pos;         // next position in forced_tokens to force
 
     int32_t end_match;        // index into end_matcher.seqs of the sequence that transitioned to DONE, -1 if none
+
+    llama_tokens eog_ids;     // end-of-generation tokens, banned while the think block is open
 };
+
+static llama_tokens common_reasoning_budget_eog_ids(const llama_vocab * vocab) {
+    llama_tokens ids;
+    if (vocab != nullptr) {
+        const int32_t n = llama_vocab_n_tokens(vocab);
+        for (llama_token id = 0; id < n; id++) {
+            if (llama_vocab_is_eog(vocab, id)) {
+                ids.push_back(id);
+            }
+        }
+    }
+    return ids;
+}
 
 static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
     return "reasoning-budget";
@@ -166,6 +181,25 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
+    // inside an open think block an end-of-generation token would end the turn with no answer and no tool call
+    // (low-bit checkpoints leak a little probability onto it; over thousands of thinking tokens at temp 1 it gets
+    // sampled): the block has to close first, by the model or by the budget
+    if (ctx->state == REASONING_BUDGET_COUNTING || ctx->state == REASONING_BUDGET_WAITING_UTF8) {
+        for (const llama_token eog : ctx->eog_ids) {
+            if ((size_t) eog < cur_p->size && cur_p->data[eog].id == eog) {   // full vocab in id order (the CPU path)
+                cur_p->data[eog].logit = -INFINITY;
+                continue;
+            }
+            for (size_t i = 0; i < cur_p->size; i++) {
+                if (cur_p->data[i].id == eog) {
+                    cur_p->data[i].logit = -INFINITY;
+                    break;
+                }
+            }
+        }
+        return;
+    }
+
     if (ctx->state != REASONING_BUDGET_FORCING) {
         // passthrough — don't modify logits
         return;
@@ -254,6 +288,7 @@ static struct llama_sampler * common_reasoning_budget_init_state(
             /* .state         = */ initial_state,
             /* .force_pos     = */ 0,
             /* .end_match     = */ -1,
+            /* .eog_ids       = */ common_reasoning_budget_eog_ids(vocab),
         }
     );
 }
