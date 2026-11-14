@@ -39,7 +39,7 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
         const int32_t mask_packed);   // 1: the mask is GGML_TYPE_I32, 32 KV cells per word, bit set = attend
 
 typedef float (*vec_dot_KQ_t)(
@@ -1322,7 +1322,7 @@ void launch_fattn(
     // a GGML_CUDA_FA_SPARSE mask (fattn.cu) always takes the tile map: without it the kernel reads every masked tile,
     // also the unselected host pages over PCIe
     const bool want_vis = (tile_skip || ggml_cuda_fa_sparse_active) && !mask_packed && !chunk;
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || want_vis)) {
+    if (mask && mask->ne[2] == 1 && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || want_vis)) {
         const size_t  es  = mask_packed ? sizeof(uint32_t) : sizeof(half2);
         const int64_t s31 = mask->nb[1] / es;
         const int64_t s33 = mask->nb[3] / es;
