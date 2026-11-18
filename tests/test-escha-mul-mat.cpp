@@ -144,10 +144,10 @@ static double tolerance_for(int64_t rows, bool cuda) {
     if (cuda && gemv && rows <= gemv_max) {
         return 1e-3;
     }
-    // GGML_ESCHA_PREFILL=i8 is approximate by design: int8 weights (w*32) and int8 activation rows. Measured rel_rms 1.06e-2 to 1.23e-2 from GGML_ESCHA_RECON_MIN_ROWS rows (default 448, minimum 17).
-    static const bool i8        = getenv("GGML_ESCHA_PREFILL") != nullptr && strcmp(getenv("GGML_ESCHA_PREFILL"), "i8") == 0;
-    static const int  recon_min = getenv("GGML_ESCHA_RECON_MIN_ROWS") != nullptr ? std::max(17, atoi(getenv("GGML_ESCHA_RECON_MIN_ROWS"))) : 448;
-    if (cuda && mma && i8 && rows >= recon_min) {
+    // GGML_ESCHA_PREFILL=i8 is approximate by design: int8 weights (w*32) and int8 activation rows. Measured rel_rms 1.06e-2 to 1.23e-2 from GGML_ESCHA_I8_MIN_ROWS rows (default 49, minimum 17).
+    static const bool i8     = getenv("GGML_ESCHA_PREFILL") != nullptr && strcmp(getenv("GGML_ESCHA_PREFILL"), "i8") == 0;
+    static const int  i8_min = std::max(17, getenv("GGML_ESCHA_I8_MIN_ROWS") != nullptr ? atoi(getenv("GGML_ESCHA_I8_MIN_ROWS")) : 49);
+    if (cuda && mma && i8 && rows >= i8_min) {
         return 3e-2;
     }
     return (cuda && mma && rows > 16) ? 5e-4 : 1e-5;

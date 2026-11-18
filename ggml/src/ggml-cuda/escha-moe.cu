@@ -62,6 +62,7 @@
 // prefill by reconstruction (escha_mul_mat_recon); the environment can change each value
 #define ESCHA_PREFILL_DEFAULT       ESCHA_PREFILL_RECON
 #define ESCHA_I8_WSCALE             32.0f   // int8 weights of the i8 path: round(w*32)
+#define ESCHA_I8_MIN_ROWS           49
 #define ESCHA_RECON_MIN_ROWS        448   // the decode to fp16 costs as much as the GEMM gain of about 390 rows (4070: slower at 256 rows, 1.2x at 1024)
 #define ESCHA_RECON_MIB             64    // dense weight scratch: 256 is not faster, 32 is 2 % slower
                                    //     prefill: at batch 1 there are only n_ocb blocks
@@ -1282,6 +1283,16 @@ static int escha_recon_min_rows() {
     return rows;
 }
 
+// GGML_ESCHA_I8_MIN_ROWS=n: the row threshold of the int8 read (default 49: all batches that the small-batch GEMV chunks do not take).
+// Its decode writes half the bytes of the fp16 decode and its GEMM is 3.5x faster, so it is faster than one block of the tiled kernel from the first row.
+static int escha_i8_min_rows() {
+    static const int rows = [] {
+        const char * e = getenv("GGML_ESCHA_I8_MIN_ROWS");
+        return MAX(ESCHA_GEN_MAX_ROWS + 1, e != nullptr ? atoi(e) : ESCHA_I8_MIN_ROWS);
+    }();
+    return rows;
+}
+
 // GGML_ESCHA_RECON_MIB=n: limit of the dense weight scratch. A larger projection is done in column chunks, one decode and one GEMM for each.
 static size_t escha_recon_max_bytes() {
     static const size_t bytes = [] {
@@ -1357,16 +1368,21 @@ static escha_prefill_mode escha_prefill_for(ggml_backend_cuda_context & ctx, con
     const int OC     = code->ne[1]*16;
     const int n_rows = x->ne[1]*x->ne[2];
 
-    if (n_rows <= ESCHA_GEN_MAX_ROWS || n_rows < escha_recon_min_rows()
+    const bool want_i8 = escha_prefill() == ESCHA_PREFILL_I8;
+
+    if (n_rows <= ESCHA_GEN_MAX_ROWS || n_rows < (want_i8 ? escha_i8_min_rows() : escha_recon_min_rows())
             || ggml_cuda_info().devices[ctx.device].cc < GGML_CUDA_CC_TURING
             || OC % ESCHA_MMA_BN != 0
             || getenv("ESCHA_NO_MMA") != nullptr) {
         return ESCHA_PREFILL_MMA;
     }
-    if (escha_prefill() == ESCHA_PREFILL_I8) {
+    if (want_i8) {
         // the int8 path needs the warp kernel for the output rotation (16-byte aligned rows)
         const bool rows_aligned = (uintptr_t) dst->data % 16 == 0 && dst->nb[1] % 16 == 0 && dst->nb[2] % 16 == 0;
-        return rows_aligned ? ESCHA_PREFILL_I8 : ESCHA_PREFILL_RECON;
+        if (rows_aligned) {
+            return ESCHA_PREFILL_I8;
+        }
+        return n_rows >= escha_recon_min_rows() ? ESCHA_PREFILL_RECON : ESCHA_PREFILL_MMA;
     }
     return escha_prefill();
 }
