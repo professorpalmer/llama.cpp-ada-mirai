@@ -53,10 +53,11 @@ static __global__ void escha_gemv_had_in(
 }
 
 // dst[row] = T128(mid[row]) * rout, one warp per 128 columns
+// mid can be the memory of dst: a lane reads its 4 values before it writes them
 static __global__ void escha_gemv_had_out(
-        const float * __restrict__ mid,
+        const float * mid,
         const half  * __restrict__ rout,
-        float       * __restrict__ dst,
+        float       * dst,
         const int OC, const int n_rows, const int ne1,
         const int64_t nb_d1, const int64_t nb_d2) {
     const int nb = OC/128;
@@ -376,10 +377,46 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     return true;
 }
 
+bool ggml_cuda_escha_had_in(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * rin, half * xh) {
+    if (!escha_gemv_rows_aligned(x) || (uintptr_t) xh%16 != 0) {
+        return false;
+    }
+    const int IC     = x->ne[0];
+    const int n_rows = x->ne[1]*x->ne[2];
+    escha_gemv_had_in<<<(n_rows*(IC/128) + 7)/8, 256, 0, ctx.stream()>>>(
+        (const float *) x->data, (const half *) rin->data, xh,
+        IC, n_rows, (int) x->ne[1], x->nb[1], x->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool ggml_cuda_escha_had_out(ggml_backend_cuda_context & ctx, const float * mid, const ggml_tensor * rout, ggml_tensor * dst) {
+    if (!escha_gemv_rows_aligned(dst) || (uintptr_t) mid%16 != 0) {
+        return false;
+    }
+    const int OC     = dst->ne[0];
+    const int n_rows = dst->ne[1]*dst->ne[2];
+    escha_gemv_had_out<<<(n_rows*(OC/128) + 7)/8, 256, 0, ctx.stream()>>>(
+        mid, (const half *) rout->data, (float *) dst->data,
+        OC, n_rows, (int) dst->ne[1], dst->nb[1], dst->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 #else
 
 bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED_VARS(ctx, dst);
+    return false;
+}
+
+bool ggml_cuda_escha_had_in(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * rin, half * xh) {
+    GGML_UNUSED_VARS(ctx, x, rin, xh);
+    return false;
+}
+
+bool ggml_cuda_escha_had_out(ggml_backend_cuda_context & ctx, const float * mid, const ggml_tensor * rout, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, mid, rout, dst);
     return false;
 }
 

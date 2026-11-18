@@ -59,6 +59,10 @@
 #define ESCHA_MMA_BN 128   //   BM*BN/256, so BM drives register pressure and occupancy.
 #define ESCHA_TM   8
 #define ESCHA_TN   8
+// prefill by reconstruction (escha_mul_mat_recon); the environment can change each value
+#define ESCHA_PREFILL_RECON_DEFAULT true
+#define ESCHA_RECON_MIN_ROWS        448   // the decode to fp16 costs as much as the GEMM gain of about 390 rows (4070: slower at 256 rows, 1.2x at 1024)
+#define ESCHA_RECON_MIB             64    // dense weight scratch: 256 is not faster, 32 is 2 % slower
                                    //     prefill: at batch 1 there are only n_ocb blocks
                                    //     before slicing (136 for the FFN), which leaves an
                                    //     82-SM device idle. Swept 1/2/4/8/16/32 -- flat from
@@ -1076,10 +1080,11 @@ static __global__ void escha_matmul_dense(
 
 // sum the slices in a fixed order (so the result is reproducible), rotate the
 // 128-column group, scale by rout
+// partial and dst can be the same memory (recon path, 1 slice): a block reads its 128 values before it writes them
 static __global__ void escha_finalize_dense(
         const half  * __restrict__ rout,
-        const float * __restrict__ partial,
-        float       * __restrict__ dst,
+        const float * partial,
+        float       * dst,
         const int OC, const int ne1, const int n_rows, const int n_slices,
         const int64_t nb_d1, const int64_t nb_d2) {
     __shared__ float s_acc[ESCHA_NT];
@@ -1100,6 +1105,170 @@ static __global__ void escha_finalize_dense(
     float * dst_row = (float *)((char *) dst + (int64_t)(row % ne1)*nb_d1
                                              + (int64_t)(row / ne1)*nb_d2);
     dst_row[c] = s_acc[tid]*__half2float(rout[c]);
+}
+
+// Prefill by reconstruction (the exllamav3 route for large batches): decode the projection to dense fp16 once for a micro-batch, then one tensor-core GEMM.
+// The tiled MMA kernel above decodes the weights again for each 128-row block.
+
+// w[c][k] = decode(code) for the output columns [oc0, oc0 + gridDim.x*128), one row of IC halves for each column.
+// A block has 8 output tiles and a slice of the input tiles. A thread has one column: it decodes the 16 weights of that column in a tile and writes them as 32 contiguous bytes.
+template <int K>
+static __global__ void escha_reconstruct_dense(
+        const int16_t * __restrict__ code,
+        half          * __restrict__ w,
+        const int IC, const int OC, const int oc0, const int n_slices) {
+    __shared__ uint2 s_pay[ESCHA_GROUPS*ESCHA_MAX_W];
+
+    const int NW = 8*K;
+    const int NB = 32*NW;
+
+    const int nit  = IC/ESCHA_TILE;
+    const int nct  = OC/ESCHA_TILE;
+    const int n_wd = (16*K)/2;
+
+    const int tid = threadIdx.x;
+    const int grp = tid / ESCHA_TILE;
+    const int cc  = tid % ESCHA_TILE;
+    const int tj  = oc0/ESCHA_TILE + blockIdx.x*ESCHA_GROUPS + grp;
+
+    const int sl = blockIdx.y;
+    const int lo = (int) (((int64_t) nit*sl)/n_slices);
+    const int hi = (int) (((int64_t) nit*(sl + 1))/n_slices);
+
+    uint2 * pay = s_pay + grp*ESCHA_MAX_W;
+
+    int s0 = ((32 - K) - K*(32*cc + 4*(cc >> 3))) % NB;
+    if (s0 < 0) {
+        s0 += NB;
+    }
+
+    // payload words of this thread, fetched one tile ahead (as in escha_matmul_dense)
+    constexpr int NPW = (8*K + ESCHA_TILE - 1)/ESCHA_TILE;
+    uint32_t pre[NPW];
+    if (lo < hi) {
+        const uint32_t * s0p = (const uint32_t *)(code + (int64_t)(lo*nct + tj)*(16*K));
+#pragma unroll
+        for (int i = 0; i < NPW; ++i) {
+            const int wd = cc + i*ESCHA_TILE;
+            if (wd < n_wd) {
+                pre[i] = s0p[wd];
+            }
+        }
+    }
+
+    uint4 * w_col = (uint4 *)(w + (int64_t)(blockIdx.x*ESCHA_NT + tid)*IC);
+
+    for (int ti = lo; ti < hi; ++ti) {
+#pragma unroll
+        for (int i = 0; i < NPW; ++i) {
+            const int wd = cc + i*ESCHA_TILE;
+            if (wd < n_wd) {
+                pay[wd].y = pre[i];
+                pay[wd + 1 == NW ? 0 : wd + 1].x = pre[i];
+            }
+        }
+        if (ti + 1 < hi) {
+            const uint32_t * nxt = (const uint32_t *)(code + (int64_t)((ti + 1)*nct + tj)*(16*K));
+#pragma unroll
+            for (int i = 0; i < NPW; ++i) {
+                const int wd = cc + i*ESCHA_TILE;
+                if (wd < n_wd) {
+                    pre[i] = nxt[wd];
+                }
+            }
+        }
+        // the 16 threads of a column group share one payload, and a warp has two whole groups
+        __syncwarp();
+
+        uint32_t v[ESCHA_TILE/2];
+#pragma unroll
+        for (int r = 0; r < ESCHA_TILE; ++r) {
+            int sp = s0 - K*escha_dep_pi(r);
+            if (sp < 0) {
+                sp += NB;
+            }
+            const int g0 = sp >> 5;
+            const int w0 = g0 ? (NW - g0) : 0;
+
+            const uint2 p = pay[w0];
+            const uint32_t h = __half_as_ushort(escha_codebook_h(__funnelshift_r(p.y, p.x, sp & 31) & 0xffffu));
+            if (r & 1) {
+                v[r/2] |= h << 16;
+            } else {
+                v[r/2] = h;
+            }
+        }
+        w_col[2*ti]     = make_uint4(v[0], v[1], v[2], v[3]);
+        w_col[2*ti + 1] = make_uint4(v[4], v[5], v[6], v[7]);
+        __syncwarp();
+    }
+}
+
+// GGML_ESCHA_PREFILL=recon|mma: the prefill path for rows >= GGML_ESCHA_RECON_MIN_ROWS
+static bool escha_prefill_recon() {
+    static const bool recon = [] {
+        const char * e = getenv("GGML_ESCHA_PREFILL");
+        return e != nullptr ? strcmp(e, "recon") == 0 : ESCHA_PREFILL_RECON_DEFAULT;
+    }();
+    return recon;
+}
+
+static int escha_recon_min_rows() {
+    static const int rows = [] {
+        const char * e = getenv("GGML_ESCHA_RECON_MIN_ROWS");
+        return e != nullptr ? MAX(ESCHA_GEN_MAX_ROWS + 1, atoi(e)) : ESCHA_RECON_MIN_ROWS;
+    }();
+    return rows;
+}
+
+// GGML_ESCHA_RECON_MIB=n: limit of the dense weight scratch. A larger projection is done in column chunks, one decode and one GEMM for each.
+static size_t escha_recon_max_bytes() {
+    static const size_t bytes = [] {
+        const char * e = getenv("GGML_ESCHA_RECON_MIB");
+        return (size_t) MAX(1, e != nullptr ? atoi(e) : ESCHA_RECON_MIB) << 20;
+    }();
+    return bytes;
+}
+
+// partial[row][c] = u[row] . decode(code)[c], u in fp16, sum in fp32
+static void escha_mul_mat_recon(
+        ggml_backend_cuda_context & ctx, const int16_t * code, const half * u, float * partial,
+        const int K, const int IC, const int OC, const int n_rows) {
+    cudaStream_t stream = ctx.stream();
+
+    // equal chunks of whole 128-column groups
+    const int64_t fit     = MAX((int64_t) 1, (int64_t) (escha_recon_max_bytes()/((size_t) IC*sizeof(half)))/ESCHA_NT);
+    const int64_t n_grp   = OC/ESCHA_NT;
+    const int64_t n_chunk = (n_grp + fit - 1)/fit;
+    const int     oc_step = (int) ((n_grp + n_chunk - 1)/n_chunk)*ESCHA_NT;
+
+    ggml_cuda_pool_alloc<half> w_buf(ctx.pool(), (size_t) oc_step*IC);
+
+    // about 32 input tiles for each block
+    const int n_slices = MAX(1, IC/ESCHA_TILE/32);
+
+    cublasHandle_t handle = ctx.cublas_handle();
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+
+    for (int oc0 = 0; oc0 < OC; oc0 += oc_step) {
+        const int n_oc = MIN(oc_step, OC - oc0);
+
+        const dim3 grid(n_oc/ESCHA_NT, n_slices);
+        switch (K) {
+            case 2: escha_reconstruct_dense<2><<<grid, ESCHA_NT, 0, stream>>>(code, w_buf.get(), IC, OC, oc0, n_slices); break;
+            case 3: escha_reconstruct_dense<3><<<grid, ESCHA_NT, 0, stream>>>(code, w_buf.get(), IC, OC, oc0, n_slices); break;
+            default: GGML_ABORT("escha: unsupported K=%d", K);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        // column-major: C (n_oc x n_rows, in partial with ld OC) = W^T (n_oc x IC) * U (IC x n_rows)
+        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n_oc, n_rows, IC,
+            &alpha, w_buf.get(),   CUDA_R_16F, IC,
+                    u,             CUDA_R_16F, IC,
+            &beta,  partial + oc0, CUDA_R_32F, OC,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
 }
 
 void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1141,10 +1310,14 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
                       && OC % ESCHA_MMA_BN == 0
                       && getenv("ESCHA_NO_MMA") == nullptr;
 
+    const bool use_recon = use_mma && n_rows >= escha_recon_min_rows() && escha_prefill_recon();
+
     ggml_cuda_pool_alloc<char> u_buf(ctx.pool(),
         (size_t) n_rows*IC*(use_mma ? sizeof(half) : sizeof(float)));
 
-    if (use_mma) {
+    // recon: one warp for each 128 channels (escha-gemv.cu). The block kernel is the fallback, and the mma path keeps it.
+    if (use_recon && ggml_cuda_escha_had_in(ctx, x, rin, (half *) u_buf.get())) {
+    } else if (use_mma) {
         escha_rotate_in_dense<half><<<n_rows, 256, 0, stream>>>(
             (const half *) rin->data, (const float *) x->data, (half *) u_buf.get(),
             IC, (int) x->ne[1], x->nb[1], x->nb[2]);
@@ -1169,9 +1342,13 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // batch-invariant mode: 2 to ESCHA_GEN_MAX_ROWS rows get the slice count of 1 row, so the fp32 sum of a row has the same order alone and in a batch
     const int n_rb_slices = gen && ggml_cuda_batch_invariant() ? 1 : n_rb;
     int n_slices = target/MAX(1, gen ? n_rb_slices*n_ocb : n_tb*n_cb);
-    n_slices = MIN(MAX(n_slices, 1), nit);
+    n_slices = use_recon ? 1 : MIN(MAX(n_slices, 1), nit);
 
-    ggml_cuda_pool_alloc<float> p_buf(ctx.pool(), (size_t) n_slices*n_rows*OC);
+    // recon: the GEMM writes into dst when its rows are contiguous, and the output rotation then works in place
+    const bool in_place = use_recon && dst->nb[1] == (size_t) OC*sizeof(float) && dst->nb[2] == dst->nb[1]*dst->ne[1];
+
+    ggml_cuda_pool_alloc<float> p_buf(ctx.pool());
+    float * partial = in_place ? (float *) dst->data : p_buf.alloc((size_t) n_slices*n_rows*OC);
 
     if (decode1) {
         // widest slice any block gets, since lo/hi split nit unevenly by at most one tile
@@ -1182,7 +1359,7 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
         auto launch = [&](auto kernel) {
             kernel<<<dim3(n_rb, n_ocb, n_slices), ESCHA_NT, smem, stream>>>(
                 (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
-                (const float *) u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+                (const float *) u_buf.get(), partial, IC, OC, n_rows, n_slices);
         };
         switch (K) {
             case 2: launch(escha_matmul_dense<2, ESCHA_ROWS_DENSE_GEN>); break;
@@ -1195,7 +1372,7 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
         auto launch = [&](auto kernel) {
             kernel<<<dim3(n_rb, n_ocb, n_slices), ESCHA_NT, smem, stream>>>(
                 (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
-                (const float *) u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+                (const float *) u_buf.get(), partial, IC, OC, n_rows, n_slices);
         };
         switch (K) {
             case 2: launch(escha_matmul_dense<2, ESCHA_ROWS_DENSE_SPEC>); break;
@@ -1212,13 +1389,15 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
             kernel<<<dim3((n_rows + ESCHA_ROWS_DENSE - 1)/ESCHA_ROWS_DENSE, n_ocb, n_slices),
                      ESCHA_NT, smem, stream>>>(
                 (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
-                (const float *) u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+                (const float *) u_buf.get(), partial, IC, OC, n_rows, n_slices);
         };
         switch (K) {
             case 2: launch(escha_matmul_dense<2, ESCHA_ROWS_DENSE>); break;
             case 3: launch(escha_matmul_dense<3, ESCHA_ROWS_DENSE>); break;
             default: GGML_ABORT("escha: unsupported K=%d", K);
         }
+    } else if (use_recon) {
+        escha_mul_mat_recon(ctx, (const int16_t *) code->data, (const half *) u_buf.get(), partial, K, IC, OC, n_rows);
     } else if (use_mma) {
         // tensor-core prefill. Weights are exact; activations are rounded to fp16, which is
         // what escha's runtime does. ESCHA_NO_MMA=1 falls back to the fp32 FMA kernel.
@@ -1231,7 +1410,7 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
         auto launch = [&](auto kernel) {
             kernel<<<dim3(n_tb_mma, n_cb_mma, n_slices), dim3(32, 256/32), smem, stream>>>(
                 (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
-                (const half *) u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+                (const half *) u_buf.get(), partial, IC, OC, n_rows, n_slices);
         };
         switch (K) {
             case 2: launch((escha_matmul_dense_tiled_mma<2, ESCHA_MMA_BM, ESCHA_MMA_BN>)); break;
@@ -1247,7 +1426,7 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
         auto launch = [&](auto kernel) {
             kernel<<<dim3(n_tb, n_cb, n_slices), NT, smem, stream>>>(
                 (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
-                (const float *) u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+                (const float *) u_buf.get(), partial, IC, OC, n_rows, n_slices);
         };
         switch (K) {
             case 2: launch((escha_matmul_dense_tiled<2, ESCHA_BM, ESCHA_BN, ESCHA_TM, ESCHA_TN>)); break;
@@ -1257,8 +1436,11 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }
     CUDA_CHECK(cudaGetLastError());
 
-    escha_finalize_dense<<<dim3(n_rows, n_ocb), ESCHA_NT, 0, stream>>>(
-        (const half *) rout->data, p_buf.get(), (float *) dst->data,
-        OC, (int) x->ne[1], n_rows, n_slices, dst->nb[1], dst->nb[2]);
+    if (use_recon && ggml_cuda_escha_had_out(ctx, partial, rout, dst)) {
+    } else {
+        escha_finalize_dense<<<dim3(n_rows, n_ocb), ESCHA_NT, 0, stream>>>(
+            (const half *) rout->data, partial, (float *) dst->data,
+            OC, (int) x->ne[1], n_rows, n_slices, dst->nb[1], dst->nb[2]);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
