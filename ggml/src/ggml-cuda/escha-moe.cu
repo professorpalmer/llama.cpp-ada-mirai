@@ -60,7 +60,8 @@
 #define ESCHA_TM   8
 #define ESCHA_TN   8
 // prefill by reconstruction (escha_mul_mat_recon); the environment can change each value
-#define ESCHA_PREFILL_RECON_DEFAULT true
+#define ESCHA_PREFILL_DEFAULT       ESCHA_PREFILL_RECON
+#define ESCHA_I8_WSCALE             32.0f   // int8 weights of the i8 path: round(w*32)
 #define ESCHA_RECON_MIN_ROWS        448   // the decode to fp16 costs as much as the GEMM gain of about 390 rows (4070: slower at 256 rows, 1.2x at 1024)
 #define ESCHA_RECON_MIB             64    // dense weight scratch: 256 is not faster, 32 is 2 % slower
                                    //     prefill: at batch 1 there are only n_ocb blocks
@@ -1110,12 +1111,13 @@ static __global__ void escha_finalize_dense(
 // Prefill by reconstruction (the exllamav3 route for large batches): decode the projection to dense fp16 once for a micro-batch, then one tensor-core GEMM.
 // The tiled MMA kernel above decodes the weights again for each 128-row block.
 
-// w[c][k] = decode(code) for the output columns [oc0, oc0 + gridDim.x*128), one row of IC halves for each column.
-// A block has 8 output tiles and a slice of the input tiles. A thread has one column: it decodes the 16 weights of that column in a tile and writes them as 32 contiguous bytes.
-template <int K>
+// w[c][k] = decode(code) for the output columns [oc0, oc0 + gridDim.x*128), one row of IC values for each column.
+// A block has 8 output tiles and a slice of the input tiles. A thread has one column: it decodes the 16 weights of that column in a tile and writes them as one contiguous run.
+// W = half: the exact weights. W = int8_t: round(w*ESCHA_I8_WSCALE), for the int8 path (the codebook is inside +-4).
+template <int K, typename W>
 static __global__ void escha_reconstruct_dense(
         const int16_t * __restrict__ code,
-        half          * __restrict__ w,
+        W             * __restrict__ w,
         const int IC, const int OC, const int oc0, const int n_slices) {
     __shared__ uint2 s_pay[ESCHA_GROUPS*ESCHA_MAX_W];
 
@@ -1180,7 +1182,7 @@ static __global__ void escha_reconstruct_dense(
         // the 16 threads of a column group share one payload, and a warp has two whole groups
         __syncwarp();
 
-        uint32_t v[ESCHA_TILE/2];
+        uint32_t v[ESCHA_TILE/2] = {};
 #pragma unroll
         for (int r = 0; r < ESCHA_TILE; ++r) {
             int sp = s0 - K*escha_dep_pi(r);
@@ -1191,26 +1193,85 @@ static __global__ void escha_reconstruct_dense(
             const int w0 = g0 ? (NW - g0) : 0;
 
             const uint2 p = pay[w0];
-            const uint32_t h = __half_as_ushort(escha_codebook_h(__funnelshift_r(p.y, p.x, sp & 31) & 0xffffu));
-            if (r & 1) {
-                v[r/2] |= h << 16;
+            const half  h = escha_codebook_h(__funnelshift_r(p.y, p.x, sp & 31) & 0xffffu);
+            if constexpr (sizeof(W) == sizeof(half)) {
+                v[r/2] |= (uint32_t) __half_as_ushort(h) << (16*(r & 1));
             } else {
-                v[r/2] = h;
+                const int q = max(-127, min(127, __float2int_rn(__half2float(h)*ESCHA_I8_WSCALE)));
+                v[r/4] |= (uint32_t) (q & 0xff) << (8*(r & 3));
             }
         }
-        w_col[2*ti]     = make_uint4(v[0], v[1], v[2], v[3]);
-        w_col[2*ti + 1] = make_uint4(v[4], v[5], v[6], v[7]);
+        if constexpr (sizeof(W) == sizeof(half)) {
+            w_col[2*ti]     = make_uint4(v[0], v[1], v[2], v[3]);
+            w_col[2*ti + 1] = make_uint4(v[4], v[5], v[6], v[7]);
+        } else {
+            w_col[ti] = make_uint4(v[0], v[1], v[2], v[3]);
+        }
         __syncwarp();
     }
 }
 
-// GGML_ESCHA_PREFILL=recon|mma: the prefill path for rows >= GGML_ESCHA_RECON_MIN_ROWS
-static bool escha_prefill_recon() {
-    static const bool recon = [] {
+// q[row] = int8(u[row]*127/amax(row)), scales[row] = amax(row)/127/ESCHA_I8_WSCALE: acc*scales[row] is then the fp32 product
+static __global__ void escha_quantize_rows_i8(
+        const half * __restrict__ u,
+        int8_t     * __restrict__ q,
+        float      * __restrict__ scales,
+        const int IC) {
+    __shared__ float s_max[8];
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+
+    const half2 * u_row = (const half2 *)(u + (int64_t) row*IC);
+
+    float amax = 0.0f;
+    for (int i = tid; i < IC/2; i += blockDim.x) {
+        const float2 f = __half22float2(u_row[i]);
+        amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+    }
+    amax = warp_reduce_max(amax);
+    if (tid % 32 == 0) {
+        s_max[tid/32] = amax;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        amax = fmaxf(amax, s_max[i]);
+    }
+
+    const float inv = amax > 0.0f ? 127.0f/amax : 0.0f;
+    uint32_t * q_row = (uint32_t *)(q + (int64_t) row*IC);
+    for (int i = tid; i < IC/4; i += blockDim.x) {
+        const float2 a = __half22float2(u_row[2*i]);
+        const float2 b = __half22float2(u_row[2*i + 1]);
+        const int q0 = max(-127, min(127, __float2int_rn(a.x*inv)));
+        const int q1 = max(-127, min(127, __float2int_rn(a.y*inv)));
+        const int q2 = max(-127, min(127, __float2int_rn(b.x*inv)));
+        const int q3 = max(-127, min(127, __float2int_rn(b.y*inv)));
+        q_row[i] = (uint32_t) (q0 & 0xff) | (uint32_t) (q1 & 0xff) << 8 | (uint32_t) (q2 & 0xff) << 16 | (uint32_t) (q3 & 0xff) << 24;
+    }
+    if (tid == 0) {
+        scales[row] = amax/(127.0f*ESCHA_I8_WSCALE);
+    }
+}
+
+// GGML_ESCHA_PREFILL=recon|mma|i8: the prefill path for rows >= GGML_ESCHA_RECON_MIN_ROWS
+//   recon: exact read. Exact weights in fp16, fp16 activations, fp32 sum.
+//   mma:   exact read with the tiled kernel above (same numbers as recon).
+//   i8:    fast read (int8), approximate. int8 weights round(w*32) and int8 activations (one scale for each row), int32 sum. 3.5x the GEMM rate of fp16 on an RTX 4070, 1.1 to 1.2 % error for each projection (exact read: 0.02 %).
+// With i8 a token that is read in a batch of GGML_ESCHA_RECON_MIN_ROWS rows or more and the same token read alone (exact kernels) do not give the same output, so GGML_CUDA_BATCH_INVARIANT does not cover prefill against decode in this mode.
+// Drafting on / off stays identical: the two read the prompt the same way, and the int8 result of a row does not change with the other rows of the batch (integer sums, one scale for each row).
+enum escha_prefill_mode { ESCHA_PREFILL_MMA, ESCHA_PREFILL_RECON, ESCHA_PREFILL_I8 };
+
+static escha_prefill_mode escha_prefill() {
+    static const escha_prefill_mode mode = [] {
         const char * e = getenv("GGML_ESCHA_PREFILL");
-        return e != nullptr ? strcmp(e, "recon") == 0 : ESCHA_PREFILL_RECON_DEFAULT;
+        if (e == nullptr) {
+            return ESCHA_PREFILL_DEFAULT;
+        }
+        return strcmp(e, "i8") == 0 ? ESCHA_PREFILL_I8 : strcmp(e, "recon") == 0 ? ESCHA_PREFILL_RECON : ESCHA_PREFILL_MMA;
     }();
-    return recon;
+    return mode;
 }
 
 static int escha_recon_min_rows() {
@@ -1230,44 +1291,61 @@ static size_t escha_recon_max_bytes() {
     return bytes;
 }
 
-// partial[row][c] = u[row] . decode(code)[c], u in fp16, sum in fp32
+// partial[row][c] = u[row] . decode(code)[c]
+//   q == nullptr: u in fp16, exact weights, fp32 sum
+//   q != nullptr: the int8 rows of escha_quantize_rows_i8, int8 weights, int32 sum (partial has int32 values)
 static void escha_mul_mat_recon(
-        ggml_backend_cuda_context & ctx, const int16_t * code, const half * u, float * partial,
+        ggml_backend_cuda_context & ctx, const int16_t * code, const half * u, const int8_t * q, float * partial,
         const int K, const int IC, const int OC, const int n_rows) {
     cudaStream_t stream = ctx.stream();
 
+    const bool   i8 = q != nullptr;
+    const size_t ws = i8 ? sizeof(int8_t) : sizeof(half);
+
     // equal chunks of whole 128-column groups
-    const int64_t fit     = MAX((int64_t) 1, (int64_t) (escha_recon_max_bytes()/((size_t) IC*sizeof(half)))/ESCHA_NT);
+    const int64_t fit     = MAX((int64_t) 1, (int64_t) (escha_recon_max_bytes()/((size_t) IC*ws))/ESCHA_NT);
     const int64_t n_grp   = OC/ESCHA_NT;
     const int64_t n_chunk = (n_grp + fit - 1)/fit;
     const int     oc_step = (int) ((n_grp + n_chunk - 1)/n_chunk)*ESCHA_NT;
 
-    ggml_cuda_pool_alloc<half> w_buf(ctx.pool(), (size_t) oc_step*IC);
+    ggml_cuda_pool_alloc<char> w_buf(ctx.pool(), (size_t) oc_step*IC*ws);
 
     // about 32 input tiles for each block
     const int n_slices = MAX(1, IC/ESCHA_TILE/32);
 
     cublasHandle_t handle = ctx.cublas_handle();
-    const float alpha = 1.0f;
-    const float beta  = 0.0f;
 
     for (int oc0 = 0; oc0 < OC; oc0 += oc_step) {
         const int n_oc = MIN(oc_step, OC - oc0);
 
         const dim3 grid(n_oc/ESCHA_NT, n_slices);
-        switch (K) {
-            case 2: escha_reconstruct_dense<2><<<grid, ESCHA_NT, 0, stream>>>(code, w_buf.get(), IC, OC, oc0, n_slices); break;
-            case 3: escha_reconstruct_dense<3><<<grid, ESCHA_NT, 0, stream>>>(code, w_buf.get(), IC, OC, oc0, n_slices); break;
+        switch (2*K + (i8 ? 1 : 0)) {
+            case 4: escha_reconstruct_dense<2, half>  <<<grid, ESCHA_NT, 0, stream>>>(code, (half *)   w_buf.get(), IC, OC, oc0, n_slices); break;
+            case 5: escha_reconstruct_dense<2, int8_t><<<grid, ESCHA_NT, 0, stream>>>(code, (int8_t *) w_buf.get(), IC, OC, oc0, n_slices); break;
+            case 6: escha_reconstruct_dense<3, half>  <<<grid, ESCHA_NT, 0, stream>>>(code, (half *)   w_buf.get(), IC, OC, oc0, n_slices); break;
+            case 7: escha_reconstruct_dense<3, int8_t><<<grid, ESCHA_NT, 0, stream>>>(code, (int8_t *) w_buf.get(), IC, OC, oc0, n_slices); break;
             default: GGML_ABORT("escha: unsupported K=%d", K);
         }
         CUDA_CHECK(cudaGetLastError());
 
         // column-major: C (n_oc x n_rows, in partial with ld OC) = W^T (n_oc x IC) * U (IC x n_rows)
-        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n_oc, n_rows, IC,
-            &alpha, w_buf.get(),   CUDA_R_16F, IC,
-                    u,             CUDA_R_16F, IC,
-            &beta,  partial + oc0, CUDA_R_32F, OC,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (i8) {
+            const int alpha = 1;
+            const int beta  = 0;
+            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n_oc, n_rows, IC,
+                &alpha, w_buf.get(),   CUDA_R_8I,  IC,
+                        q,             CUDA_R_8I,  IC,
+                &beta,  partial + oc0, CUDA_R_32I, OC,
+                CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else {
+            const float alpha = 1.0f;
+            const float beta  = 0.0f;
+            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n_oc, n_rows, IC,
+                &alpha, w_buf.get(),   CUDA_R_16F, IC,
+                        u,             CUDA_R_16F, IC,
+                &beta,  partial + oc0, CUDA_R_32F, OC,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
     }
 }
 
@@ -1310,7 +1388,7 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
                       && OC % ESCHA_MMA_BN == 0
                       && getenv("ESCHA_NO_MMA") == nullptr;
 
-    const bool use_recon = use_mma && n_rows >= escha_recon_min_rows() && escha_prefill_recon();
+    const bool use_recon = use_mma && n_rows >= escha_recon_min_rows() && escha_prefill() != ESCHA_PREFILL_MMA;
 
     ggml_cuda_pool_alloc<char> u_buf(ctx.pool(),
         (size_t) n_rows*IC*(use_mma ? sizeof(half) : sizeof(float)));
@@ -1397,7 +1475,19 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
             default: GGML_ABORT("escha: unsupported K=%d", K);
         }
     } else if (use_recon) {
-        escha_mul_mat_recon(ctx, (const int16_t *) code->data, (const half *) u_buf.get(), partial, K, IC, OC, n_rows);
+        // the int8 path needs the warp kernel for the output rotation (16-byte aligned rows)
+        const bool rows_aligned = (uintptr_t) dst->data % 16 == 0 && dst->nb[1] % 16 == 0 && dst->nb[2] % 16 == 0;
+        if (escha_prefill() == ESCHA_PREFILL_I8 && rows_aligned) {
+            ggml_cuda_pool_alloc<int8_t> q_buf(ctx.pool(), (size_t) n_rows*IC);
+            ggml_cuda_pool_alloc<float>  s_buf(ctx.pool(), (size_t) n_rows);
+            escha_quantize_rows_i8<<<n_rows, 256, 0, stream>>>((const half *) u_buf.get(), q_buf.get(), s_buf.get(), IC);
+            CUDA_CHECK(cudaGetLastError());
+            escha_mul_mat_recon(ctx, (const int16_t *) code->data, nullptr, q_buf.get(), partial, K, IC, OC, n_rows);
+            const bool done = ggml_cuda_escha_had_out_i32(ctx, (const int32_t *) partial, s_buf.get(), rout, dst);
+            GGML_ASSERT(done);
+            return;
+        }
+        escha_mul_mat_recon(ctx, (const int16_t *) code->data, (const half *) u_buf.get(), nullptr, partial, K, IC, OC, n_rows);
     } else if (use_mma) {
         // tensor-core prefill. Weights are exact; activations are rounded to fp16, which is
         // what escha's runtime does. ESCHA_NO_MMA=1 falls back to the fp32 FMA kernel.

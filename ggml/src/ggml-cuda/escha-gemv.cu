@@ -72,6 +72,50 @@ static __global__ void escha_gemv_had_out(
     had_ff_r_128_inner<false, true>(mid + (int64_t) row*OC + blk*128, dst_row + blk*128, rout + blk*128, ESCHA_GEMV_RS);
 }
 
+// dst[row] = T128(acc[row]*scales[row]) * rout for the int32 sums of an int8 GEMM, one warp per 128 columns. acc can be the memory of dst.
+// Same steps as had_ff_r_128_inner (exl3/quant/hadamard_inner.cuh) with an int32 load.
+static __global__ void escha_gemv_had_out_i32(
+        const int32_t * acc,
+        const float   * __restrict__ scales,
+        const half    * __restrict__ rout,
+        float         * dst,
+        const int OC, const int n_rows, const int ne1,
+        const int64_t nb_d1, const int64_t nb_d2) {
+    const int nb = OC/128;
+    const int w  = blockIdx.x*(blockDim.x/32) + threadIdx.x/32;
+    if (w >= n_rows*nb) {
+        return;
+    }
+    const int row = w/nb;
+    const int blk = w%nb;
+    const int t   = threadIdx.x%32;
+
+    const int4  a = ((const int4 *)(acc + (int64_t) row*OC + blk*128))[t];
+    const float s = scales[row];
+
+    const float v0 = (float) a.x*s;
+    const float v1 = (float) a.y*s;
+    const float v2 = (float) a.z*s;
+    const float v3 = (float) a.w*s;
+    const float s0 = v0 + v1;
+    const float d0 = v0 - v1;
+    const float s1 = v2 + v3;
+    const float d1 = v2 - v3;
+    float4 v = make_float4(s0 + s1, d0 + d1, s0 - s1, d0 - d1);
+
+    shuffle_had_f2x32(v.x, v.y, t);
+    shuffle_had_f2x32(v.z, v.w, t);
+
+    const half4 r = ((const half4 *)(rout + blk*128))[t];
+    v.x *= ESCHA_GEMV_RS*__low2float(r.x);
+    v.y *= ESCHA_GEMV_RS*__high2float(r.x);
+    v.z *= ESCHA_GEMV_RS*__low2float(r.y);
+    v.w *= ESCHA_GEMV_RS*__high2float(r.y);
+
+    float * dst_row = (float *)((char *) dst + (int64_t)(row%ne1)*nb_d1 + (int64_t)(row/ne1)*nb_d2);
+    ((float4 *)(dst_row + blk*128))[t] = v;
+}
+
 // mid = xh @ decode(code): the main loop of exl3_gemv_kernel (shuffle extraction, mcg codebook, fp16 accumulate folded to fp32).
 // A warp has WNT adjacent n-tiles and 1/S of k. A block has G column groups and S k-splits.
 //   FUSE = false: G = 1, one block per column group as in exllamav3. C is mid [rows][OC].
@@ -403,7 +447,25 @@ bool ggml_cuda_escha_had_out(ggml_backend_cuda_context & ctx, const float * mid,
     return true;
 }
 
+bool ggml_cuda_escha_had_out_i32(ggml_backend_cuda_context & ctx, const int32_t * acc, const float * scales, const ggml_tensor * rout, ggml_tensor * dst) {
+    if (!escha_gemv_rows_aligned(dst) || (uintptr_t) acc%16 != 0) {
+        return false;
+    }
+    const int OC     = dst->ne[0];
+    const int n_rows = dst->ne[1]*dst->ne[2];
+    escha_gemv_had_out_i32<<<(n_rows*(OC/128) + 7)/8, 256, 0, ctx.stream()>>>(
+        acc, scales, (const half *) rout->data, (float *) dst->data,
+        OC, n_rows, (int) dst->ne[1], dst->nb[1], dst->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 #else
+
+bool ggml_cuda_escha_had_out_i32(ggml_backend_cuda_context & ctx, const int32_t * acc, const float * scales, const ggml_tensor * rout, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, acc, scales, rout, dst);
+    return false;
+}
 
 bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED_VARS(ctx, dst);

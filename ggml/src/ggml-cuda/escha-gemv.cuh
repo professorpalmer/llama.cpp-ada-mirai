@@ -8,3 +8,5 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 //   dst[row] = T128(mid[row]) * rout, mid is [rows][OC] and can be the memory of dst
 bool ggml_cuda_escha_had_in(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * rin, half * xh);
 bool ggml_cuda_escha_had_out(ggml_backend_cuda_context & ctx, const float * mid, const ggml_tensor * rout, ggml_tensor * dst);
+//   dst[row] = T128(acc[row]*scales[row]) * rout, acc is [rows][OC] int32 and can be the memory of dst
+bool ggml_cuda_escha_had_out_i32(ggml_backend_cuda_context & ctx, const int32_t * acc, const float * scales, const ggml_tensor * rout, ggml_tensor * dst);
