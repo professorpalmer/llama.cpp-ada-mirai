@@ -133,8 +133,15 @@ static bool check_codebook(const ggml_tensor * lut) {
 // tolerance that admits it while still catching a broken kernel by orders of magnitude. The
 // weights stay exact either way, and batch 1 (rows <= ESCHA_GEN_MAX_ROWS) never leaves fp32.
 // ESCHA_NO_MMA=1 selects the scalar fp32 path in the op, and tightens this back to 1e-5.
+//
+// Rows <= 8 take the exllamav3 GEMV kernel (escha-gemv.cu). It rounds the rotated activations to fp16 as prefill does, and it also adds up to 64 products in fp16 before each fold to fp32.
+// Measured on the real shapes: rel_rms 3.8e-4 to 5.2e-4, where the fp16 activations alone give 2.1e-4. GGML_ESCHA_GEMV=0 selects the fp32 kernels and the 1e-5 tolerance.
 static double tolerance_for(int64_t rows, bool cuda) {
-    static const bool mma = getenv("ESCHA_NO_MMA") == nullptr;
+    static const bool mma  = getenv("ESCHA_NO_MMA") == nullptr;
+    static const bool gemv = getenv("GGML_ESCHA_GEMV") == nullptr || atoi(getenv("GGML_ESCHA_GEMV")) != 0;
+    if (cuda && gemv && rows <= 8) {
+        return 1e-3;
+    }
     return (cuda && mma && rows > 16) ? 5e-4 : 1e-5;
 }
 
@@ -163,14 +170,49 @@ static bool score(const char * label, uint32_t ic, int64_t K, int64_t IC, int64_
     return ok;
 }
 
+// Runs each row of a small batch alone and compares it with the same row of the batch result.
+// Report only: the fp32 kernels slice the reduction differently for 1 row and for 2 to 16 rows.
+static void batch_invariance(const escha_case & c, ggml_backend_t backend, uint32_t ic, const std::vector<float> & batch) {
+    const int64_t IC   = c.x->ne[0];
+    const int64_t OC   = c.yref->ne[0];
+    const int64_t rows = c.x->ne[1];
+
+    ggml_init_params ip = { ggml_tensor_overhead()*2*rows, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+
+    double  max_abs = 0.0;
+    int64_t n_diff  = 0;
+    for (int64_t r = 0; r < rows; ++r) {
+        escha_case c1 = c;
+        c1.x          = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, 1);
+        c1.x->data    = (char *) c.x->data + r*IC*sizeof(float);
+        c1.yref       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, OC, 1);
+        c1.yref->data = (char *) c.yref->data + r*OC*sizeof(float);
+
+        const std::vector<float> one = run_case(c1, backend);
+        for (int64_t j = 0; j < OC; ++j) {
+            const float b = batch[r*OC + j];
+            max_abs = std::max(max_abs, std::fabs((double) one[j] - (double) b));
+            n_diff += memcmp(&one[j], &b, sizeof(float)) != 0;
+        }
+    }
+    printf("case %u  cuda  rows=%-4" PRId64 "  row alone vs row in batch: max_abs=%.3e, %" PRId64 " of %" PRId64 " values differ\n",
+           ic, rows, max_abs, n_diff, rows*OC);
+
+    ggml_free(ctx);
+}
+
 // wall-clock per op, so kernel changes can be judged without a model load
+// The graph has n_copy projections, each with its own copy of the weights (256 MB in total): the op reads cold weights, as it does in a model.
 static void bench(const escha_case & c, ggml_backend_t backend, uint32_t ic) {
     const int64_t IC   = c.code->ne[2]*16;
     const int64_t OC   = c.code->ne[1]*16;
     const int64_t rows = c.x->ne[1];
     const int64_t decodes = rows*IC*OC;
 
-    ggml_init_params ip = { ggml_tensor_overhead()*32 + ggml_graph_overhead(), nullptr, true };
+    const int n_copy = (int) std::max<int64_t>(1, (256ll << 20)/(int64_t) ggml_nbytes(c.code));
+
+    ggml_init_params ip = { ggml_tensor_overhead()*(8 + 2*n_copy) + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
 
     ggml_tensor * src[6] = { c.code, c.rin, c.rout, c.lut, c.dep, c.x };
@@ -178,14 +220,22 @@ static void bench(const escha_case & c, ggml_backend_t backend, uint32_t ic) {
     for (int i = 0; i < 6; ++i) {
         dev[i] = ggml_dup_tensor(ctx, src[i]);
     }
-    ggml_tensor * y = ggml_escha_mul_mat(ctx, dev[0], dev[1], dev[2], dev[3], dev[4], dev[5]);
+    std::vector<ggml_tensor *> codes(n_copy, dev[0]);
+    for (int i = 1; i < n_copy; ++i) {
+        codes[i] = ggml_dup_tensor(ctx, c.code);
+    }
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, y);
+    for (int i = 0; i < n_copy; ++i) {
+        ggml_build_forward_expand(gf, ggml_escha_mul_mat(ctx, codes[i], dev[1], dev[2], dev[3], dev[4], dev[5]));
+    }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     for (int i = 0; i < 6; ++i) {
         ggml_backend_tensor_set(dev[i], src[i]->data, 0, ggml_nbytes(src[i]));
+    }
+    for (int i = 1; i < n_copy; ++i) {
+        ggml_backend_tensor_set(codes[i], c.code->data, 0, ggml_nbytes(c.code));
     }
 
     for (int i = 0; i < 8; ++i) {
@@ -199,7 +249,7 @@ static void bench(const escha_case & c, ggml_backend_t backend, uint32_t ic) {
         ggml_backend_graph_compute(backend, gf);
     }
     ggml_backend_synchronize(backend);
-    const double us = (double)(ggml_time_us() - t0)/reps;
+    const double us = (double)(ggml_time_us() - t0)/reps/n_copy;
 
     printf("bench %u  K=%" PRId64 "  %4" PRId64 " -> %-4" PRId64 "  rows=%-4" PRId64
            "  %7.1f us/op   %6.1f Gdecode/s\n",
@@ -268,7 +318,18 @@ int main(int argc, char ** argv) {
 
         ok &= score("cpu", i, K, IC, OC, rows, run_case(c, nullptr), c.yref);
         if (gpu) {
-            ok &= score("cuda", i, K, IC, OC, rows, run_case(c, gpu), c.yref);
+            const std::vector<float> got = run_case(c, gpu);
+            ok &= score("cuda", i, K, IC, OC, rows, got, c.yref);
+
+            // same input again: the bits must not change
+            const std::vector<float> again = run_case(c, gpu);
+            if (memcmp(got.data(), again.data(), got.size()*sizeof(float)) != 0) {
+                printf("case %u  cuda  the second run gives different bits  FAIL\n", i);
+                ok = false;
+            }
+            if (rows >= 2 && rows <= 8) {
+                batch_invariance(c, gpu, i, got);
+            }
         }
     }
 

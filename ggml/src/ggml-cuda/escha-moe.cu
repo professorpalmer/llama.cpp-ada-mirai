@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "escha-moe.cuh"
+#include "escha-gemv.cuh"
 #include "mmid.cuh"
 #include "mma.cuh"
 #include <cuda_pipeline.h>
@@ -1112,6 +1113,11 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(code->type == GGML_TYPE_I16 && dep->type == GGML_TYPE_I16);
     GGML_ASSERT(rin->type == GGML_TYPE_F16 && rout->type == GGML_TYPE_F16 && lut->type == GGML_TYPE_F16);
     GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    // rows <= 8 on tensor cores, GGML_ESCHA_GEMV=0 keeps the fp32 kernels below
+    if (ggml_cuda_escha_gemv(ctx, dst)) {
+        return;
+    }
 
     const int K   = code->ne[0]/16;
     const int OC  = code->ne[1]*16;
