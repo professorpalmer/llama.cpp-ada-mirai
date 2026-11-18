@@ -901,10 +901,11 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     { LLM_TENSOR_FFN_GATE_CHEXPS,          { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID } },
     { LLM_TENSOR_FFN_UP_CHEXPS,            { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID } },
     { LLM_TENSOR_FFN_EXP_PROBS_B,          { LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD }        },
-    // codec tables are layer-independent, but must land wherever the escha op runs
-    { LLM_TENSOR_ESCHA_LUT,                { LLM_TENSOR_LAYER_INPUT, GGML_OP_ESCHA_MOE }      },
-    { LLM_TENSOR_ESCHA_DEP_K2,             { LLM_TENSOR_LAYER_INPUT, GGML_OP_ESCHA_MOE }      },
-    { LLM_TENSOR_ESCHA_DEP_K3,             { LLM_TENSOR_LAYER_INPUT, GGML_OP_ESCHA_MOE }      },
+    // codec tables are sources of every escha op. They load with the output layer: with full offload that is the device of the layers.
+    // On the CPU (input layer) each escha op on a GPU has a weight in a different backend, and the scheduler starts a new split at each such op that follows a split input.
+    { LLM_TENSOR_ESCHA_LUT,                { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_ESCHA_MOE }     },
+    { LLM_TENSOR_ESCHA_DEP_K2,             { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_ESCHA_MOE }     },
+    { LLM_TENSOR_ESCHA_DEP_K3,             { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_ESCHA_MOE }     },
     // altup / laurel (gemma 3n)
     { LLM_TENSOR_PER_LAYER_TOKEN_EMBD,     { LLM_TENSOR_LAYER_INPUT, GGML_OP_GET_ROWS }       },
     { LLM_TENSOR_PER_LAYER_MODEL_PROJ,     { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT }    },
