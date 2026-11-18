@@ -1709,6 +1709,19 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    // The kernels for 5 to 8 columns have fewer warps than the kernels for 1 to 4 columns, so their fp32 sums of K have a different order.
+    // Batch-invariant mode: run 5 to 8 columns as two launches of at most 4 columns. PTQ1_0 has its own column-independent geometry.
+    if (ggml_cuda_batch_invariant() && !ids && ncols_dst > 4 && y_layout == GGML_CUDA_Q8_1_AOS) {
+        for (int64_t c0 = 0; c0 < ncols_dst; c0 += 4) {
+            mul_mat_vec_q_switch_type(
+                src0->data, src0->type, src1_q8_1_d + c0*stride_col_y*sizeof(block_q8_1), ids_d, fusion_local, dst_d + c0*stride_col_dst, ne00,
+                ne01,              MIN(ncols_dst - c0, (int64_t) 4), s01, stride_col_y, stride_col_dst,
+                ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+                ne03,              ne3,           s03, s13,              s3,               ids_stride, y_layout, stream);
+        }
+        return;
+    }
+
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,

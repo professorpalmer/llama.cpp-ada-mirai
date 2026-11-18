@@ -1368,6 +1368,15 @@ void launch_fattn(
 
     const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
+    // Batch-invariant mode, tensor-core kernel, up to 8 queries (decode, speculative verify): a stream-k split puts the seams
+    // between the blocks at places that change with the KV length, and a verify batch can have a longer KV view than the
+    // same tokens decoded alone. Give each output tile a fixed number of blocks that take the KV batches in turn
+    // (flash_attn_ext_f16, mask_packed & 16). The number of blocks is the stream-k number for one tile of queries.
+    int bi_stripe_blocks = 0;
+    if (stream_k && ggml_cuda_batch_invariant() && Q->ne[1] <= 8 && Q->ne[3] == 1 && !chunk && KV_max.ptr == nullptr && K->ne[1] % nbatch_fa == 0) {
+        bi_stripe_blocks = std::min(std::max(max_blocks_per_sm*nsm / (ntiles_dst / ntiles_x), 1), ntiles_KV);
+    }
+
     dim3 blocks_num;
     if (stream_k) {
         // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
@@ -1398,6 +1407,12 @@ void launch_fattn(
             blocks_num.x = nblocks_stream_k;
         }
 
+        if (bi_stripe_blocks > 1) {
+            blocks_num.x = ntiles_dst * bi_stripe_blocks;
+        } else if (bi_stripe_blocks == 1) {
+            blocks_num.x = ntiles_dst; // each block has a whole tile
+        }
+
         if (chunk) {
             dst_tmp_meta.alloc(size_t(ntiles_dst) * ncols); // (max, rowsum) per block and column
         } else if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
@@ -1405,7 +1420,12 @@ void launch_fattn(
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        // Batch-invariant mode, up to 8 queries: no limit from the KV length. A verify batch can have a longer KV view than
+        // the same tokens decoded alone, and block b has the KV batches b, b + parallel_blocks, ...: the number of blocks must
+        // be the same for the two. A block with no KV batch gives a result with weight 0 (flash_attn_combine_results).
+        const bool bi_decode = ggml_cuda_batch_invariant() && Q->ne[1] <= 8 && Q->ne[3] == 1;
+        const int parallel_blocks_max = bi_decode ? std::max(parallel_blocks, 64) : ntiles_KV;
+        parallel_blocks = std::min(parallel_blocks, parallel_blocks_max);
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
@@ -1415,7 +1435,7 @@ void launch_fattn(
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= parallel_blocks_max; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
@@ -1480,7 +1500,7 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        (mask_packed ? 1 : 0) | (chunk ? 2 : 0) | (tile_vis ? 4 : 0) | (v_skip ? 8 : 0)   // 2: chunk launch, 4: tile visibility map (fattn-mma-f16.cuh), 8: V skip (fattn-vec.cuh)
+        (mask_packed ? 1 : 0) | (chunk ? 2 : 0) | (tile_vis ? 4 : 0) | (v_skip ? 8 : 0) | (bi_stripe_blocks > 1 ? 16 : 0)   // 2: chunk launch, 4: tile visibility map, 16: batch-invariant KV split (fattn-mma-f16.cuh), 8: V skip (fattn-vec.cuh)
     );
     CUDA_CHECK(cudaGetLastError());
 

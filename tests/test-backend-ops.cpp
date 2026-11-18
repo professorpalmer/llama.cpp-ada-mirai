@@ -10242,7 +10242,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // length that is not a multiple of the tile (out-of-bounds rows), and the permuted cache layout.
     for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q3_0 }) {
         for (int64_t kv : { 1024, 4096, 16384 }) {
-            for (int64_t nb : { 3, 8, 35, 512 }) {
+            for (int64_t nb : { 1, 3, 8, 35, 512 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
             }
         }

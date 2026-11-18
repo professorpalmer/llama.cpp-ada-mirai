@@ -461,6 +461,13 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
     };
 }
 
+// Prompt-sized batches: the chunked MMA kernel takes the first tokens, the recurrent kernel the last n tokens (the tokens
+// that a rollback can remove). The two kernels do not give the same bits. Batch-invariant mode: the number of tail tokens
+// is the same with and without rollback (speculative decoding on / off), for a rollback depth of up to 7 tokens.
+static int64_t gdn_mma_tail(const int64_t n_min) {
+    return ggml_cuda_batch_invariant() ? std::max<int64_t>(n_min, 8) : n_min;
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -574,7 +581,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
         rp.p_out        = dst_d + S_v * H * n_tokens * n_seqs + S_v * S_v * H * n_seqs;
         rp.mode         = 1;
 
-        const int64_t n_mma_r = n_seqs == 1 ? n_tokens - (rp.P + 1) : 0;
+        const int64_t n_tail_r = gdn_mma_tail(rp.P + 1);
+        const int64_t n_mma_r  = n_seqs == 1 ? n_tokens - n_tail_r : 0;
         if (!mma_off && n_mma_r >= 64 && ggml_cuda_gdn_mma_device_supported(ctx.device)) {
             ggml_cuda_pool_alloc<float> s_rep(ctx.pool(), S_v * S_v * H * n_seqs);
             ggml_cuda_pool_alloc<float> s_mid(ctx.pool(), S_v * S_v * H * n_seqs);
@@ -605,7 +613,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 rp_tail.p_in = nullptr;
                 launch_gated_delta_net<false, false, true, false>(q_d + t0 * sq2, k_d + t0 * sq2, v_d + t0 * sv2,
                     g_d + t0 * sb2, b_d + t0 * sb2, rb_d, ra_d, s_mid.ptr, dst_d + t0 * S_v * H, state_d,
-                    S_v, H, rp.P + 1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, 0, 1,
+                    S_v, H, n_tail_r, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, 0, 1,
                     nullptr, 0, stream, rp_tail);
                 return;
             }
@@ -621,7 +629,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // product graph (raw gates on CUDA) can take it. With K > 1 rollback snapshots (speculative decoding), one
     // sequence: the MMA kernel runs tokens [0, n - K) into a temporary state and the recurrent kernel continues
     // over the last K tokens from it, writing the K snapshot slots exactly as before.
-    const int64_t n_mma = K == 1 ? n_tokens : (n_seqs == 1 ? n_tokens - K : 0);
+    // n_tail: the last tokens, which the recurrent kernel takes (0: the MMA kernel takes all tokens)
+    const int64_t n_tail = K > 1 ? gdn_mma_tail(K) : (ggml_cuda_batch_invariant() && n_seqs == 1 ? gdn_mma_tail(K) : 0);
+    const int64_t n_mma  = n_tail == 0 ? n_tokens : (n_seqs == 1 ? n_tokens - n_tail : 0);
     if (!mma_off && n_tokens >= 64 && (kda || n_mma < 64)) {
         static bool logged_skip = false;
         if (!logged_skip) {
@@ -665,7 +675,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             args.g    = g_act.ptr;
             args.beta = b_act.ptr;
         }
-        if (K > 1) {
+        if (n_tail > 0) {
             s_mid.alloc(S_v * S_v * H * n_seqs);
             args.state_out = s_mid.ptr;
         } else {
@@ -680,8 +690,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
             logged = true;
         }
         if (launched) {
-            if (K > 1) {
-                // the last K tokens from the MMA state, with the snapshot slots (raw gates still raw here)
+            if (n_tail > 0) {
+                // the last n_tail tokens from the MMA state, with the snapshot slots when K > 1 (raw gates still raw here)
                 const int64_t t0 = n_mma;
                 const float * q_t = q_d + t0 * sq2;
                 const float * k_t = k_d + t0 * sq2;
@@ -689,15 +699,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 const float * g_t = g_d + t0 * sb2;
                 const float * b_t = b_d + t0 * sb2;
                 float       * o_t = dst_d + t0 * S_v * H;
+#define GDN_LAUNCH_TAIL(KEEP_, RAW_)                                                                                         \
+                launch_gated_delta_net<false, KEEP_, RAW_, false>(q_t, k_t, v_t, g_t, b_t, rb_d, ra_d, s_mid.ptr, o_t, state_d, \
+                    S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, \
+                    nullptr, 0, stream)
                 if (raw) {
-                    launch_gated_delta_net<false, true, true, false>(q_t, k_t, v_t, g_t, b_t, rb_d, ra_d, s_mid.ptr, o_t, state_d,
-                        S_v, H, K, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
-                        nullptr, 0, stream);
+                    if (keep_rs) { GDN_LAUNCH_TAIL(true, true);  } else { GDN_LAUNCH_TAIL(false, true);  }
                 } else {
-                    launch_gated_delta_net<false, true, false, false>(q_t, k_t, v_t, g_t, b_t, rb_d, ra_d, s_mid.ptr, o_t, state_d,
-                        S_v, H, K, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
-                        nullptr, 0, stream);
+                    if (keep_rs) { GDN_LAUNCH_TAIL(true, false); } else { GDN_LAUNCH_TAIL(false, false); }
                 }
+#undef GDN_LAUNCH_TAIL
             }
             return;
         }

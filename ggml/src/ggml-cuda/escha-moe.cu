@@ -1166,7 +1166,9 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // batch 1 has only n_ocb blocks before slicing (136 for the FFN), which leaves an 82-SM
     // device mostly idle, so generation slices the reduction much harder than prefill
     const int target = gen ? ESCHA_GEN_TARGET_MUL*ESCHA_TARGET : ESCHA_TARGET;
-    int n_slices = target/MAX(1, gen ? n_rb*n_ocb : n_tb*n_cb);
+    // batch-invariant mode: 2 to ESCHA_GEN_MAX_ROWS rows get the slice count of 1 row, so the fp32 sum of a row has the same order alone and in a batch
+    const int n_rb_slices = gen && ggml_cuda_batch_invariant() ? 1 : n_rb;
+    int n_slices = target/MAX(1, gen ? n_rb_slices*n_ocb : n_tb*n_cb);
     n_slices = MIN(MAX(n_slices, 1), nit);
 
     ggml_cuda_pool_alloc<float> p_buf(ctx.pool(), (size_t) n_slices*n_rows*OC);

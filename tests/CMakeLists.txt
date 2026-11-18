@@ -392,6 +392,9 @@ endif()
 llama_build(test-escha-moe.cpp)
 llama_build(test-escha-mul-mat.cpp)
 
+# needs a model file, so build only
+llama_build(test-batch-identity.cpp)
+
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)

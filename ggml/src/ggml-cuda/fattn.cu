@@ -16,21 +16,25 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
+    // Each instance has its own softmax batch size and KV split. Batch-invariant mode: 1 to 8 queries (decode, speculative verify)
+    // take the instance of 8 queries, so a token has the same arithmetic alone and in a verify batch.
+    const int64_t n_q = ggml_cuda_batch_invariant() && Q->ne[1] <= 8 && Q->ne[3] == 1 ? 8 : Q->ne[1];
+
     if constexpr (ncols2 <= 8) {
-        if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+        if (turing_mma_available(cc) && n_q <= 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, type_KV>(ctx, dst);
             return;
         }
     }
 
     if constexpr (ncols2 <= 16) {
-        if (Q->ne[1] <= 16/ncols2) {
+        if (n_q <= 16/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, type_KV>(ctx, dst);
             return;
         }
     }
 
-    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
+    if (n_q <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, type_KV>(ctx, dst);
         return;

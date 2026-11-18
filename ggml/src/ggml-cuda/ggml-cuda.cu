@@ -3999,6 +3999,25 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
             gather.base       = (const float *) cache->data;
             gather.ids        = (const int32_t *) ids->data;
             gather.row_stride = (int64_t) (cache->nb[1] / sizeof(float));
+
+            // The kernel reads the row id when the gated delta net runs. When no node from there on uses the ids tensor
+            // (the last recurrent layer of the graph), the graph allocator can give its memory to a node between this
+            // GET_ROWS and the gated delta net. Then keep a copy of the id in the output of the GET_ROWS: it is not
+            // written, and it stays allocated until the gated delta net has run.
+            const ggml_tensor * ids_base = ids->view_src ? ids->view_src : ids;
+            bool ids_live = false;
+            for (int u = j; u < cgraph->n_nodes && !ids_live; ++u) {
+                const ggml_tensor * t = cgraph->nodes[u];
+                ids_live = t->view_src == ids_base;
+                for (int s = 0; s < GGML_MAX_SRC && !ids_live; ++s) {
+                    ids_live = t->src[s] != nullptr && (t->src[s] == ids_base || t->src[s]->view_src == ids_base);
+                }
+            }
+            if (!ids_live) {
+                CUDA_CHECK(cudaMemcpyAsync(gr->data, ids->data, sizeof(int32_t), cudaMemcpyDeviceToDevice, ctx.stream()));
+                gather.ids = (const int32_t *) gr->data;
+            }
+
             ctx.gdn_gathers().set(n, gather);
             return true;
         }

@@ -1430,7 +1430,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int zt_gqa,
         const int kb0_start,
         const int kb0_stop,
-        const uint8_t * tile_vis = nullptr) {   // per FATTN_TILE_VIS cells of this query tile: 0 = all masked, skip
+        const uint8_t * tile_vis = nullptr,     // per FATTN_TILE_VIS cells of this query tile: 0 = all masked, skip
+        const int kb_step = 1) {                // the block has the KV batches kb0_start, kb0_start + kb_step, ..., kb0_stop - 1
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1582,7 +1583,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ) {
-            const int kb0_next = next_vis(kb0 + 1);   // fully masked tiles are skipped, also by the preload
+            const int kb0_next = next_vis(kb0 + kb_step);   // fully masked tiles are skipped, also by the preload
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -1604,7 +1605,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ) {
-            const int kb0_next = next_vis(kb0 + 1);   // fully masked tiles are skipped, also by the preload
+            const int kb0_next = next_vis(kb0 + kb_step);   // fully masked tiles are skipped, also by the preload
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -2116,7 +2117,7 @@ static __global__ void flash_attn_ext_f16(
 
     // kbc == k block continuous, current index in continuous ijk space.
     int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
-    const int kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
+    int       kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
 
     // If the seams of 2 CUDA blocks fall within an output tile their results need to be combined.
     // For this we need to track both the block that starts the tile (needs_fixup) and the block that finishes the tile (is_fixup).
@@ -2126,7 +2127,27 @@ static __global__ void flash_attn_ext_f16(
     int kb0_start = kbc % iter_k;
     int kb0_stop  = min(iter_k, kb0_start + kbc_stop - kbc);
 
-    while (kbc < kbc_stop && kb0_stop == iter_k) {
+    // mask_packed & 16: batch-invariant launch (launch_fattn). Each output tile has bpt blocks; block s of a tile has the KV
+    // batches s, s + bpt, s + 2*bpt, ... of the tile (bpt <= iter_k). The batches of a block do not depend on the KV length,
+    // and a KV batch with no visible cell adds nothing, so a query has the same result for each KV length that has its
+    // visible cells. The blocks write their results as the blocks of a uniform stream-k split: the last block of the tile
+    // on the needs_fixup path below, the other blocks on the is_fixup path.
+    const bool stripes = (mask_packed & 16) != 0;
+    int  kb_step   = 1;
+    bool ends_tile = kb0_stop == iter_k;
+    if (stripes) {
+        const int bpt    = gridDim.x / (iter_j*iter_z_gqa*ne12*ne03);
+        const int stripe = blockIdx.x % bpt;
+
+        kbc       = (blockIdx.x / bpt) * iter_k;
+        kbc_stop  = kbc + 1;
+        kb_step   = bpt;
+        kb0_start = stripe;
+        kb0_stop  = stripe + ((iter_k - 1 - stripe)/bpt)*bpt + 1;
+        ends_tile = stripe == bpt - 1;
+    }
+
+    while (kbc < kbc_stop && ends_tile) {
         // z_KV == K/V head index, zt_gqa = Q head start index per K/V head, jt = token position start index
         const int sequence =  kbc /(iter_k*iter_j*iter_z_gqa*ne12);
         const int z_KV     = (kbc - iter_k*iter_j*iter_z_gqa*ne12 * sequence)/(iter_k*iter_j*iter_z_gqa);
@@ -2150,7 +2171,7 @@ static __global__ void flash_attn_ext_f16(
             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        if (kb0_start == 0 && !chunk_part) {
+        if (kb0_start == 0 && !chunk_part && !stripes) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
@@ -2161,7 +2182,7 @@ static __global__ void flash_attn_ext_f16(
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop,
-                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_TILE_VIS) : nullptr);
+                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_TILE_VIS) : nullptr, kb_step);
         }
 
         kbc += iter_k;
@@ -2169,6 +2190,7 @@ static __global__ void flash_attn_ext_f16(
 
         kb0_start = 0;
         kb0_stop  = min(iter_k, kbc_stop - kbc);
+        ends_tile = kb0_stop == iter_k;
     }
 
     if (kbc >= kbc_stop) {
@@ -2203,7 +2225,7 @@ static __global__ void flash_attn_ext_f16(
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop,
-                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_TILE_VIS) : nullptr);
+                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_TILE_VIS) : nullptr, kb_step);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,

@@ -171,7 +171,7 @@ static bool score(const char * label, uint32_t ic, int64_t K, int64_t IC, int64_
 }
 
 // Runs each row of a small batch alone and compares it with the same row of the batch result.
-// Report only: the fp32 kernels slice the reduction differently for 1 row and for 2 to 16 rows.
+// Report only: the fp32 kernels slice the reduction differently for 1 row and for 5 to 16 rows (not with GGML_CUDA_BATCH_INVARIANT=1).
 static void batch_invariance(const escha_case & c, ggml_backend_t backend, uint32_t ic, const std::vector<float> & batch) {
     const int64_t IC   = c.x->ne[0];
     const int64_t OC   = c.yref->ne[0];
