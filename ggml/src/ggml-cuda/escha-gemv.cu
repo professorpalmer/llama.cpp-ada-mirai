@@ -128,7 +128,7 @@ static __global__ void __launch_bounds__(32*S*(FUSE ? 8/WNT : 1), S*(FUSE ? 8/WN
         const half     * __restrict__ rout,
         float          * __restrict__ C,
         const int size_m, const int size_k, const int size_n, const int ne1,
-        const int64_t nb_d1, const int64_t nb_d2) {
+        const int64_t nb_d1, const int64_t nb_d2, const int row0) {
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int cb   = 1;   // mcg
     constexpr int G    = FUSE ? 8/WNT : 1;
@@ -318,12 +318,13 @@ static __global__ void __launch_bounds__(32*S*(FUSE ? 8/WNT : 1), S*(FUSE ? 8/WN
         __syncthreads();
         // warp r does row r
         if (warp < rows_out) {
-            float * dst_row = (float *)((char *) C + (int64_t)(warp%ne1)*nb_d1 + (int64_t)(warp/ne1)*nb_d2);
+            const int orow = row0 + warp;
+            float * dst_row = (float *)((char *) C + (int64_t)(orow%ne1)*nb_d1 + (int64_t)(orow/ne1)*nb_d2);
             had_ff_r_128_inner<false, true>(sh_red[0][warp], dst_row + blockIdx.x*128, rout + blockIdx.x*128, ESCHA_GEMV_RS);
         }
     }
 #else
-    GGML_UNUSED_VARS(A, B, rout, C, size_m, size_k, size_n, ne1, nb_d1, nb_d2);
+    GGML_UNUSED_VARS(A, B, rout, C, size_m, size_k, size_n, ne1, nb_d1, nb_d2, row0);
     NO_DEVICE_CODE;
 #endif // AMPERE_MMA_AVAILABLE
 }
@@ -358,7 +359,14 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int IC = code->ne[2]*16;
     const int n_rows = x->ne[1]*x->ne[2];
 
-    if (!enabled || n_rows < 1 || n_rows > EXL3_GEMV_MAX_M || (K != 2 && K != 3) || IC%128 != 0 || OC%128 != 0) {
+    // GGML_ESCHA_GEMV_MAX_ROWS=n (default 48, 8 = one chunk only): a batch of 9 to n rows runs as chunks of 8 rows.
+    // A chunk costs about as much as 1 row, and the tiled prefill kernel costs the same for 1 to 128 rows (about 6 chunks). A row has the same bits alone and in a chunk.
+    static const int max_rows = [] {
+        const char * e = getenv("GGML_ESCHA_GEMV_MAX_ROWS");
+        return e != nullptr ? MAX(EXL3_GEMV_MAX_M, atoi(e)) : 48;
+    }();
+
+    if (!enabled || n_rows < 1 || n_rows > max_rows || (K != 2 && K != 3) || IC%128 != 0 || OC%128 != 0) {
         return false;
     }
     if (!ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
@@ -379,36 +387,39 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // exllamav3 on Ada (exl3_gemv_cfg): narrow up to n = 8192, wide above
     const int cfg = cfg_env != CFG_EXL3 ? cfg_env : OC <= 8192 ? CFG_NARROW : CFG_WIDE;
     const bool fuse = cfg == CFG_FUSED;
-    const int mmode = n_rows == 1 ? 0 : 1;
-
     ggml_cuda_pool_alloc<float> mid(ctx.pool());
     if (!fuse) {
         mid.alloc((size_t) n_rows*OC);
     }
 
-    auto launch = [&](auto kernel, const int grid, const int threads) {
-        kernel<<<grid, threads, 0, stream>>>(
-            xh.get(), (const uint16_t *) code->data, (const half *) rout->data,
-            fuse ? (float *) dst->data : mid.get(),
-            n_rows, IC, OC, (int) x->ne[1], dst->nb[1], dst->nb[2]);
-    };
+    for (int row0 = 0; row0 < n_rows; row0 += EXL3_GEMV_MAX_M) {
+        const int m     = MIN(EXL3_GEMV_MAX_M, n_rows - row0);
+        const int mmode = m == 1 ? 0 : 1;
+
+        auto launch = [&](auto kernel, const int grid, const int threads) {
+            kernel<<<grid, threads, 0, stream>>>(
+                xh.get() + (size_t) row0*IC, (const uint16_t *) code->data, (const half *) rout->data,
+                fuse ? (float *) dst->data : mid.get() + (size_t) row0*OC,
+                m, IC, OC, (int) x->ne[1], dst->nb[1], dst->nb[2], row0);
+        };
 
 #define ESCHA_GEMV_LAUNCH(bits, mm) \
-    if (cfg == CFG_FUSED) { \
-        launch(escha_gemv_kernel<bits, mm, 2, 8, true>, OC/128, 1024); \
-    } else if (cfg == CFG_NARROW) { \
-        launch(escha_gemv_kernel<bits, mm, 2, 16, false>, OC/32, 512); \
-    } else { \
-        launch(escha_gemv_kernel<bits, mm, 4, 8, false>, OC/64, 256); \
-    }
+        if (cfg == CFG_FUSED) { \
+            launch(escha_gemv_kernel<bits, mm, 2, 8, true>, OC/128, 1024); \
+        } else if (cfg == CFG_NARROW) { \
+            launch(escha_gemv_kernel<bits, mm, 2, 16, false>, OC/32, 512); \
+        } else { \
+            launch(escha_gemv_kernel<bits, mm, 4, 8, false>, OC/64, 256); \
+        }
 
-    switch (2*K + mmode) {
-        case 4: ESCHA_GEMV_LAUNCH(2, 0); break;
-        case 5: ESCHA_GEMV_LAUNCH(2, 1); break;
-        case 6: ESCHA_GEMV_LAUNCH(3, 0); break;
-        case 7: ESCHA_GEMV_LAUNCH(3, 1); break;
-    }
+        switch (2*K + mmode) {
+            case 4: ESCHA_GEMV_LAUNCH(2, 0); break;
+            case 5: ESCHA_GEMV_LAUNCH(2, 1); break;
+            case 6: ESCHA_GEMV_LAUNCH(3, 0); break;
+            case 7: ESCHA_GEMV_LAUNCH(3, 1); break;
+        }
 #undef ESCHA_GEMV_LAUNCH
+    }
     CUDA_CHECK(cudaGetLastError());
 
     if (!fuse) {

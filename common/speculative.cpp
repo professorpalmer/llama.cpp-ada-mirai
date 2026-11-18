@@ -3433,6 +3433,9 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_dflash = std::find(params.speculative.types.begin(),
+                                       params.speculative.types.end(),
+                                       COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -3503,6 +3506,19 @@ common_speculative_init_result::common_speculative_init_result(
                 // The forward block can exceed the retained verification depth.
                 cparams.n_outputs_max_per_seq = meta.block_size;
                 cparams.n_outputs_max         = cparams.n_seq_max * meta.block_size;
+            }
+        }
+
+        // LLAMA_DFLASH_DRAFT_UBATCH=N: a smaller micro-batch for the DFlash draft context. Its compute buffer is reserved for n_ubatch rows (1112 MiB at 1024 with the 27B drafter).
+        // The encode and inject loops chunk by the draft n_ubatch. The noise block is one non-causal decode, so N must hold all its rows. Unset = unchanged.
+        if (spec_dflash) {
+            if (const char * s = std::getenv("LLAMA_DFLASH_DRAFT_UBATCH")) {
+                const int v_min = std::max(32, (int) cparams.n_outputs_max);
+                const int v     = std::max(std::atoi(s), v_min);
+                if (std::atoi(s) > 0 && (uint32_t) v < cparams.n_ubatch) {
+                    LOG_INF("%s: DFlash draft context n_ubatch %u -> %d (LLAMA_DFLASH_DRAFT_UBATCH, minimum %d)\n", __func__, cparams.n_ubatch, v, v_min);
+                    cparams.n_ubatch = (uint32_t) v;
+                }
             }
         }
 

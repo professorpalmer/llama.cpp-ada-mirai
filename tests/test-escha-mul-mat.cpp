@@ -139,7 +139,9 @@ static bool check_codebook(const ggml_tensor * lut) {
 static double tolerance_for(int64_t rows, bool cuda) {
     static const bool mma  = getenv("ESCHA_NO_MMA") == nullptr;
     static const bool gemv = getenv("GGML_ESCHA_GEMV") == nullptr || atoi(getenv("GGML_ESCHA_GEMV")) != 0;
-    if (cuda && gemv && rows <= 8) {
+    // batches of 9 to GGML_ESCHA_GEMV_MAX_ROWS rows (default 48) run as GEMV chunks of 8 rows
+    static const int gemv_max = getenv("GGML_ESCHA_GEMV_MAX_ROWS") != nullptr ? std::max(8, atoi(getenv("GGML_ESCHA_GEMV_MAX_ROWS"))) : 48;
+    if (cuda && gemv && rows <= gemv_max) {
         return 1e-3;
     }
     // GGML_ESCHA_PREFILL=i8 is approximate by design: int8 weights (w*32) and int8 activation rows. Measured rel_rms 1.06e-2 to 1.23e-2 from GGML_ESCHA_RECON_MIN_ROWS rows (default 448, minimum 17).
@@ -333,7 +335,7 @@ int main(int argc, char ** argv) {
                 printf("case %u  cuda  the second run gives different bits  FAIL\n", i);
                 ok = false;
             }
-            if (rows >= 2 && rows <= 8) {
+            if (rows >= 2 && rows <= 48) {
                 batch_invariance(c, gpu, i, got);
             }
         }

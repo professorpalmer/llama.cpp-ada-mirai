@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -472,9 +473,25 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, (int) cap);
         }
 
+        n_draft_max = std::min(n_draft_max, spec_verify_draft_cap());
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
+    }
+
+    // GGML_CUDA_BATCH_INVARIANT: a row has the same bits alone and in a batch of up to 8 rows only (head, attention and gated delta net pick other kernels for more rows).
+    // So a verify batch (the sampled token and the draft) gets at most 8 rows there: a longer lookup draft is verified in steps of 7 tokens.
+    // LLAMA_SPEC_VERIFY_MAX_ROWS=n sets another limit (n < 2: no limit).
+    static int spec_verify_draft_cap() {
+        static const int cap = [] {
+            if (const char * e = getenv("LLAMA_SPEC_VERIFY_MAX_ROWS")) {
+                const int n = atoi(e);
+                return n < 2 ? INT_MAX : n - 1;
+            }
+            return getenv("GGML_CUDA_BATCH_INVARIANT") != nullptr ? 7 : INT_MAX;
+        }();
+        return cap;
     }
 
     // the same limits for the lookup drafters, with --spec-lookup-n-max in place of the model drafter's cap
@@ -486,7 +503,7 @@ struct server_slot {
         if (n_remaining() > 0) {
             n = std::min(n, n_remaining() - 1);
         }
-        return std::max(0, std::min(n, (int) spec_n_max_lookup));
+        return std::max(0, std::min({ n, (int) spec_n_max_lookup, spec_verify_draft_cap() }));
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
