@@ -1565,11 +1565,22 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    // Batch-invariant mode: 9 to GGML_CUDA_BATCH_INVARIANT_MAX_ROWS queries run as groups of 8 queries (see the dispatch below).
+    // The kernel choice is then that of a batch of up to 8 queries.
+    const bool bi_groups = ggml_cuda_batch_invariant() && dst->src[0]->ne[1] > 8
+        && dst->src[0]->ne[1] <= GGML_CUDA_BATCH_INVARIANT_MAX_ROWS && dst->src[0]->ne[3] == 1;
+    ggml_tensor bi_q_probe   = *dst->src[0];
+    ggml_tensor bi_dst_probe = *dst;
+    if (bi_groups) {
+        bi_q_probe.ne[1]    = 8;
+        bi_dst_probe.src[0] = &bi_q_probe;
+    }
+
     ggml_tensor * mask_in = dst->src[3];
     ggml_tensor mask_f16;
     ggml_cuda_pool_alloc<half> mask_buf(ctx.pool());
     // the tensor-core kernel reads packed bits natively; the vec and tile kernels get the expanded f16 copy
-    const best_fattn_kernel best_for_mask = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    const best_fattn_kernel best_for_mask = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), bi_groups ? &bi_dst_probe : dst);
     if (mask_in && mask_in->type == GGML_TYPE_I32 && best_for_mask != BEST_FATTN_KERNEL_MMA_F16) {
         const int64_t n_words = mask_in->ne[0];
         const int64_t rows    = mask_in->ne[1]*mask_in->ne[2]*mask_in->ne[3];
@@ -1640,18 +1651,50 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
     }
 
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
-        case BEST_FATTN_KERNEL_NONE:
-            GGML_ABORT("fatal error");
-        case BEST_FATTN_KERNEL_TILE:
-            ggml_cuda_flash_attn_ext_tile(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_VEC:
-            ggml_cuda_flash_attn_ext_vec(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_MMA_F16:
-            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
-            break;
+    auto run = [&](ggml_tensor * d) {
+        switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), d)) {
+            case BEST_FATTN_KERNEL_NONE:
+                GGML_ABORT("fatal error");
+            case BEST_FATTN_KERNEL_TILE:
+                ggml_cuda_flash_attn_ext_tile(ctx, d);
+                break;
+            case BEST_FATTN_KERNEL_VEC:
+                ggml_cuda_flash_attn_ext_vec(ctx, d);
+                break;
+            case BEST_FATTN_KERNEL_MMA_F16:
+                ggml_cuda_flash_attn_ext_mma_f16(ctx, d);
+                break;
+        }
+    };
+
+    if (bi_groups) {
+        // Each group is a view of 8 queries (Q and mask: dim 1, dst: dim 2) with the K/V of the op. A query then has the arithmetic of a batch of up to 8 queries, as when it is decoded alone.
+        const ggml_tensor * Q_all    = dst->src[0];
+        const ggml_tensor * mask_all = dst->src[3];
+        for (int64_t q0 = 0; q0 < Q_all->ne[1]; q0 += 8) {
+            const int64_t m = std::min<int64_t>(8, Q_all->ne[1] - q0);
+
+            ggml_tensor q_c = *Q_all;
+            q_c.ne[1] = m;
+            q_c.data  = (char *) Q_all->data + q0*Q_all->nb[1];
+
+            ggml_tensor mask_c;
+            if (mask_all != nullptr) {
+                mask_c = *mask_all;
+                mask_c.ne[1] = mask_all->ne[1] - q0;
+                mask_c.data  = (char *) mask_all->data + q0*mask_all->nb[1];
+            }
+
+            ggml_tensor dst_c = *dst;
+            dst_c.ne[2]  = m;
+            dst_c.data   = (char *) dst->data + q0*dst->nb[2];
+            dst_c.src[0] = &q_c;
+            dst_c.src[3] = mask_all != nullptr ? &mask_c : nullptr;
+
+            run(&dst_c);
+        }
+    } else {
+        run(dst);
     }
 
     if (tier_piped) {

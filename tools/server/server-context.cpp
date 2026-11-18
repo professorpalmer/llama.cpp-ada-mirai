@@ -480,8 +480,8 @@ struct server_slot {
         return n_draft_max;
     }
 
-    // GGML_CUDA_BATCH_INVARIANT: a row has the same bits alone and in a batch of up to 8 rows only (head, attention and gated delta net pick other kernels for more rows).
-    // So a verify batch (the sampled token and the draft) gets at most 8 rows there: a longer lookup draft is verified in steps of 7 tokens.
+    // GGML_CUDA_BATCH_INVARIANT: a row has the same bits alone and in a batch of up to 48 rows (GGML_CUDA_BATCH_INVARIANT_MAX_ROWS in the CUDA backend; test-batch-identity covers 33).
+    // So a verify batch (the sampled token and the draft) gets at most 33 rows there, the size of a full lookup draft (--spec-lookup-n-max 32).
     // LLAMA_SPEC_VERIFY_MAX_ROWS=n sets another limit (n < 2: no limit).
     static int spec_verify_draft_cap() {
         static const int cap = [] {
@@ -489,7 +489,7 @@ struct server_slot {
                 const int n = atoi(e);
                 return n < 2 ? INT_MAX : n - 1;
             }
-            return getenv("GGML_CUDA_BATCH_INVARIANT") != nullptr ? 7 : INT_MAX;
+            return getenv("GGML_CUDA_BATCH_INVARIANT") != nullptr ? 32 : INT_MAX;
         }();
         return cap;
     }

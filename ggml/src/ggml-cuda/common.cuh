@@ -183,6 +183,9 @@ static inline bool ggml_cuda_batch_invariant() {
     return enabled;
 }
 
+// Batches of up to this many rows are covered in batch-invariant mode: ops that have other kernels above 8 rows run them as chunks of 8 rows.
+#define GGML_CUDA_BATCH_INVARIANT_MAX_ROWS 48
+
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
 
 #define GGML_CUDA_MAX_STREAMS 8

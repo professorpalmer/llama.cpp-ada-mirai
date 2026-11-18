@@ -2837,6 +2837,31 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // Batch-invariant mode: a batch of 9 to GGML_CUDA_BATCH_INVARIANT_MAX_ROWS columns runs as chunks of 8 columns.
+    // Each column then takes the kernels of a batch of 1 to 8 columns (mmvf, mmvq), so it has the same bits alone and in the batch.
+    if (ggml_cuda_batch_invariant() && ne11 > 8 && ne11 <= GGML_CUDA_BATCH_INVARIANT_MAX_ROWS
+            && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+        for (int64_t c0 = 0; c0 < ne11; c0 += 8) {
+            const int64_t m = std::min<int64_t>(8, ne11 - c0);
+
+            ggml_tensor src1_c = *src1;
+            src1_c.ne[1] = m;
+            src1_c.nb[2] = src1_c.nb[1]*m;
+            src1_c.nb[3] = src1_c.nb[2];
+            src1_c.data  = (char *) src1->data + c0*src1->nb[1];
+
+            ggml_tensor dst_c = *dst;
+            dst_c.ne[1]  = m;
+            dst_c.nb[2]  = dst_c.nb[1]*m;
+            dst_c.nb[3]  = dst_c.nb[2];
+            dst_c.data   = (char *) dst->data + c0*dst->nb[1];
+            dst_c.src[1] = &src1_c;
+
+            ggml_cuda_mul_mat(ctx, src0, &src1_c, &dst_c);
+        }
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
