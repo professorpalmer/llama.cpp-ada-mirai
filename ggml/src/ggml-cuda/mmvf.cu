@@ -822,7 +822,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 // ne2*ne3==1 used to mark every 2D matrix "small", including FFN/Q and
                 // vocab-sized lm_heads. MMVF is one-block-per-row and only wins for thin
                 // K/V GEMV; send anything wider to mmf/cublas.
-                const bool src0_small = src0_ne[1] <= 2048 &&
+                // batch-invariant mode keeps every 2D matrix on MMVF (same kernel for 1 to 8 columns)
+                const bool src0_small = (src0_ne[1] <= 2048 || ggml_cuda_batch_invariant()) &&
                     (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
                     if (ggml_cuda_batch_invariant()) {
@@ -852,7 +853,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return ne11 <= 8;
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-                const bool src0_small = src0_ne[1] <= 2048 &&
+                const bool src0_small = (src0_ne[1] <= 2048 || ggml_cuda_batch_invariant()) &&
                     (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
                     // a few dozen rows (the qwen35 gated-delta-net gate projections) run faster as a

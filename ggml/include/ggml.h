@@ -2656,6 +2656,7 @@ extern "C" {
             struct ggml_tensor  * gdn,
             struct ggml_tensor  * dt_bias,
             struct ggml_tensor  * a);
+
     // fused decode + routed matmul for Escha ESCHAM experts
     //
     // the weights stay in the 2/3-bit trellis code and are decoded on the fly. each 16x16 tile

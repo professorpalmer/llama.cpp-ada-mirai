@@ -663,7 +663,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    if (ggml_is_mirai_s(model.layers[il].ssm_out->type) && num_k_heads != num_v_heads) {
+    if (model.layers[il].ssm_out && ggml_is_mirai_s(model.layers[il].ssm_out->type) && num_k_heads != num_v_heads) {
         // Mirai S keeps ssm_out's columns in the checkpoint's order, V heads grouped by K head: undo the tiled order
         // (head vi * num_k_heads + g -> g * (num_v_heads / num_k_heads) + vi)
         attn_out_norm = ggml_reshape_4d(ctx0, attn_out_norm, head_v_dim, num_k_heads, num_v_heads / num_k_heads, n_seq_tokens * n_seqs);
