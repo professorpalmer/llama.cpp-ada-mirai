@@ -1,4 +1,5 @@
 #include "escha-gemv.cuh"
+#include "unary.cuh"
 
 // Small-batch path of ggml_escha_mul_mat: the GEMV kernel of exllamav3 (exl3/quant/exl3_gemv_kernel.cuh, MIT, Copyright (c) 2025 Turboderp).
 //
@@ -93,10 +94,11 @@ static __global__ void escha_gemv_had_out_i32(
     const int4  a = ((const int4 *)(acc + (int64_t) row*OC + blk*128))[t];
     const float s = scales[row];
 
-    const float v0 = (float) a.x*s;
-    const float v1 = (float) a.y*s;
-    const float v2 = (float) a.z*s;
-    const float v3 = (float) a.w*s;
+    // __fmul_rn: no FMA with the sums below, so the fused SwiGLU epilogue gives the same bits
+    const float v0 = __fmul_rn((float) a.x, s);
+    const float v1 = __fmul_rn((float) a.y, s);
+    const float v2 = __fmul_rn((float) a.z, s);
+    const float v3 = __fmul_rn((float) a.w, s);
     const float s0 = v0 + v1;
     const float d0 = v0 - v1;
     const float s1 = v2 + v3;
@@ -107,13 +109,92 @@ static __global__ void escha_gemv_had_out_i32(
     shuffle_had_f2x32(v.z, v.w, t);
 
     const half4 r = ((const half4 *)(rout + blk*128))[t];
-    v.x *= ESCHA_GEMV_RS*__low2float(r.x);
-    v.y *= ESCHA_GEMV_RS*__high2float(r.x);
-    v.z *= ESCHA_GEMV_RS*__low2float(r.y);
-    v.w *= ESCHA_GEMV_RS*__high2float(r.y);
+    v.x = v.x*ESCHA_GEMV_RS*__low2float(r.x);
+    v.y = v.y*ESCHA_GEMV_RS*__high2float(r.x);
+    v.z = v.z*ESCHA_GEMV_RS*__low2float(r.y);
+    v.w = v.w*ESCHA_GEMV_RS*__high2float(r.y);
 
     float * dst_row = (float *)((char *) dst + (int64_t)(row%ne1)*nb_d1 + (int64_t)(row/ne1)*nb_d2);
     ((float4 *)(dst_row + blk*128))[t] = v;
+}
+
+// T128 of the 4 values of a lane, without the 1/sqrt(128): the steps of had_ff_r_128_inner
+static __device__ __forceinline__ void escha_gemv_had_lane(float4 & v, const int t) {
+    const float s0 = v.x + v.y;
+    const float d0 = v.x - v.y;
+    const float s1 = v.z + v.w;
+    const float d1 = v.z - v.w;
+    v = make_float4(s0 + s1, d0 + d1, s0 - s1, d0 - d1);
+    shuffle_had_f2x32(v.x, v.y, t);
+    shuffle_had_f2x32(v.z, v.w, t);
+}
+
+// h[row] = silu(T128(g[row]) * rout_g) * (T128(u[row]) * rout_u), one warp per 128 columns.
+// I8: g and u are the int32 sums of an int8 GEMM, sg[row] and su[row] are their fp32 factors.
+// XH = false: dst[row] = h[row] (fp32; g or u can be the memory of dst).
+// XH = true:  dst is [rows][OC] fp16 and gets f16(T128(h[row] * rin)), the rotated input of the next projection (rin of that projection).
+template <bool I8, bool XH>
+static __global__ void escha_gemv_swiglu_out(
+        const void  * g,
+        const void  * u,
+        const float * __restrict__ sg,
+        const float * __restrict__ su,
+        const half  * __restrict__ rout_g,
+        const half  * __restrict__ rout_u,
+        const half  * __restrict__ rin,
+        void        * dst,
+        const int OC, const int n_rows, const int ne1,
+        const int64_t nb_d1, const int64_t nb_d2) {
+    const int nb = OC/128;
+    const int w  = blockIdx.x*(blockDim.x/32) + threadIdx.x/32;
+    if (w >= n_rows*nb) {
+        return;
+    }
+    const int row = w/nb;
+    const int blk = w%nb;
+    const int t   = threadIdx.x%32;
+
+    const int64_t off = (int64_t) row*OC + blk*128;
+    float4 a, b;
+    if constexpr (I8) {
+        const int4  ia = ((const int4 *)((const int32_t *) g + off))[t];
+        const int4  ib = ((const int4 *)((const int32_t *) u + off))[t];
+        const float fa = sg[row];
+        const float fb = su[row];
+        a = make_float4(__fmul_rn((float) ia.x, fa), __fmul_rn((float) ia.y, fa), __fmul_rn((float) ia.z, fa), __fmul_rn((float) ia.w, fa));
+        b = make_float4(__fmul_rn((float) ib.x, fb), __fmul_rn((float) ib.y, fb), __fmul_rn((float) ib.z, fb), __fmul_rn((float) ib.w, fb));
+    } else {
+        a = ((const float4 *)((const float *) g + off))[t];
+        b = ((const float4 *)((const float *) u + off))[t];
+    }
+
+    escha_gemv_had_lane(a, t);
+    escha_gemv_had_lane(b, t);
+
+    const half4 rg = ((const half4 *)(rout_g + blk*128))[t];
+    const half4 ru = ((const half4 *)(rout_u + blk*128))[t];
+
+    float4 o;
+    o.x = ggml_cuda_op_silu_single(a.x*ESCHA_GEMV_RS*__low2float(rg.x))  * (b.x*ESCHA_GEMV_RS*__low2float(ru.x));
+    o.y = ggml_cuda_op_silu_single(a.y*ESCHA_GEMV_RS*__high2float(rg.x)) * (b.y*ESCHA_GEMV_RS*__high2float(ru.x));
+    o.z = ggml_cuda_op_silu_single(a.z*ESCHA_GEMV_RS*__low2float(rg.y))  * (b.z*ESCHA_GEMV_RS*__low2float(ru.y));
+    o.w = ggml_cuda_op_silu_single(a.w*ESCHA_GEMV_RS*__high2float(rg.y)) * (b.w*ESCHA_GEMV_RS*__high2float(ru.y));
+
+    if constexpr (XH) {
+        const half4 ri = ((const half4 *)(rin + blk*128))[t];
+        o.x *= __low2float(ri.x);
+        o.y *= __high2float(ri.x);
+        o.z *= __low2float(ri.y);
+        o.w *= __high2float(ri.y);
+        escha_gemv_had_lane(o, t);
+        half4 h;
+        h.x = __floats2half2_rn(o.x*ESCHA_GEMV_RS, o.y*ESCHA_GEMV_RS);
+        h.y = __floats2half2_rn(o.z*ESCHA_GEMV_RS, o.w*ESCHA_GEMV_RS);
+        ((half4 *)((half *) dst + off))[t] = h;
+    } else {
+        float * dst_row = (float *)((char *) dst + (int64_t)(row%ne1)*nb_d1 + (int64_t)(row/ne1)*nb_d2);
+        ((float4 *)(dst_row + blk*128))[t] = o;
+    }
 }
 
 // mid = xh @ decode(code): the main loop of exl3_gemv_kernel (shuffle extraction, mcg codebook, fp16 accumulate folded to fp32).
@@ -334,6 +415,16 @@ static bool escha_gemv_rows_aligned(const ggml_tensor * t) {
     return (uintptr_t) t->data%16 == 0 && t->nb[1]%16 == 0 && t->nb[2]%16 == 0;
 }
 
+// GGML_ESCHA_GEMV_MAX_ROWS=n (default 48, 8 = one chunk only): a batch of 9 to n rows runs as chunks of 8 rows.
+// A chunk costs about as much as 1 row, and the tiled prefill kernel costs the same for 1 to 128 rows (about 6 chunks). A row has the same bits alone and in a chunk.
+int ggml_cuda_escha_gemv_max_rows() {
+    static const int max_rows = [] {
+        const char * e = getenv("GGML_ESCHA_GEMV_MAX_ROWS");
+        return e != nullptr ? MAX(EXL3_GEMV_MAX_M, atoi(e)) : 48;
+    }();
+    return max_rows;
+}
+
 bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * code = dst->src[0];
     const ggml_tensor * rin  = dst->src[1];
@@ -359,14 +450,7 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int IC = code->ne[2]*16;
     const int n_rows = x->ne[1]*x->ne[2];
 
-    // GGML_ESCHA_GEMV_MAX_ROWS=n (default 48, 8 = one chunk only): a batch of 9 to n rows runs as chunks of 8 rows.
-    // A chunk costs about as much as 1 row, and the tiled prefill kernel costs the same for 1 to 128 rows (about 6 chunks). A row has the same bits alone and in a chunk.
-    static const int max_rows = [] {
-        const char * e = getenv("GGML_ESCHA_GEMV_MAX_ROWS");
-        return e != nullptr ? MAX(EXL3_GEMV_MAX_M, atoi(e)) : 48;
-    }();
-
-    if (!enabled || n_rows < 1 || n_rows > max_rows || (K != 2 && K != 3) || IC%128 != 0 || OC%128 != 0) {
+    if (!enabled || n_rows < 1 || n_rows > ggml_cuda_escha_gemv_max_rows() || (K != 2 && K != 3) || IC%128 != 0 || OC%128 != 0) {
         return false;
     }
     if (!ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
@@ -471,7 +555,65 @@ bool ggml_cuda_escha_had_out_i32(ggml_backend_cuda_context & ctx, const int32_t 
     return true;
 }
 
+bool ggml_cuda_escha_swiglu_out(ggml_backend_cuda_context & ctx, const void * g, const void * u, const float * sg, const float * su,
+                                const ggml_tensor * rout_g, const ggml_tensor * rout_u, ggml_tensor * dst) {
+    if (!escha_gemv_rows_aligned(dst) || (uintptr_t) g%16 != 0 || (uintptr_t) u%16 != 0) {
+        return false;
+    }
+    const int OC     = dst->ne[0];
+    const int n_rows = dst->ne[1]*dst->ne[2];
+    const int grid   = (n_rows*(OC/128) + 7)/8;
+    if (sg != nullptr) {
+        escha_gemv_swiglu_out<true, false><<<grid, 256, 0, ctx.stream()>>>(
+            g, u, sg, su, (const half *) rout_g->data, (const half *) rout_u->data, nullptr, dst->data,
+            OC, n_rows, (int) dst->ne[1], dst->nb[1], dst->nb[2]);
+    } else {
+        escha_gemv_swiglu_out<false, false><<<grid, 256, 0, ctx.stream()>>>(
+            g, u, sg, su, (const half *) rout_g->data, (const half *) rout_u->data, nullptr, dst->data,
+            OC, n_rows, (int) dst->ne[1], dst->nb[1], dst->nb[2]);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool ggml_cuda_escha_swiglu_xh(ggml_backend_cuda_context & ctx, const void * g, const void * u, const float * sg, const float * su,
+                               const ggml_tensor * rout_g, const ggml_tensor * rout_u, const ggml_tensor * rin, half * xh,
+                               const int OC, const int n_rows) {
+    if ((uintptr_t) g%16 != 0 || (uintptr_t) u%16 != 0 || (uintptr_t) xh%16 != 0) {
+        return false;
+    }
+    const int grid = (n_rows*(OC/128) + 7)/8;
+    if (sg != nullptr) {
+        escha_gemv_swiglu_out<true, true><<<grid, 256, 0, ctx.stream()>>>(
+            g, u, sg, su, (const half *) rout_g->data, (const half *) rout_u->data, (const half *) rin->data, xh,
+            OC, n_rows, 1, 0, 0);
+    } else {
+        escha_gemv_swiglu_out<false, true><<<grid, 256, 0, ctx.stream()>>>(
+            g, u, sg, su, (const half *) rout_g->data, (const half *) rout_u->data, (const half *) rin->data, xh,
+            OC, n_rows, 1, 0, 0);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 #else
+
+int ggml_cuda_escha_gemv_max_rows() {
+    return 0;
+}
+
+bool ggml_cuda_escha_swiglu_out(ggml_backend_cuda_context & ctx, const void * g, const void * u, const float * sg, const float * su,
+                                const ggml_tensor * rout_g, const ggml_tensor * rout_u, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, g, u, sg, su, rout_g, rout_u, dst);
+    return false;
+}
+
+bool ggml_cuda_escha_swiglu_xh(ggml_backend_cuda_context & ctx, const void * g, const void * u, const float * sg, const float * su,
+                               const ggml_tensor * rout_g, const ggml_tensor * rout_u, const ggml_tensor * rin, half * xh,
+                               const int OC, const int n_rows) {
+    GGML_UNUSED_VARS(ctx, g, u, sg, su, rout_g, rout_u, rin, xh, OC, n_rows);
+    return false;
+}
 
 bool ggml_cuda_escha_had_out_i32(ggml_backend_cuda_context & ctx, const int32_t * acc, const float * scales, const ggml_tensor * rout, ggml_tensor * dst) {
     GGML_UNUSED_VARS(ctx, acc, scales, rout, dst);

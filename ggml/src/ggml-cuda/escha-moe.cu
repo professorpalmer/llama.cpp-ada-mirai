@@ -1349,6 +1349,175 @@ static void escha_mul_mat_recon(
     }
 }
 
+// The prefill path of a projection node for its batch: recon or i8, or mma when the batch does not take the reconstruction path
+static escha_prefill_mode escha_prefill_for(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * code = dst->src[0];
+    const ggml_tensor * x    = dst->src[5];
+
+    const int OC     = code->ne[1]*16;
+    const int n_rows = x->ne[1]*x->ne[2];
+
+    if (n_rows <= ESCHA_GEN_MAX_ROWS || n_rows < escha_recon_min_rows()
+            || ggml_cuda_info().devices[ctx.device].cc < GGML_CUDA_CC_TURING
+            || OC % ESCHA_MMA_BN != 0
+            || getenv("ESCHA_NO_MMA") != nullptr) {
+        return ESCHA_PREFILL_MMA;
+    }
+    if (escha_prefill() == ESCHA_PREFILL_I8) {
+        // the int8 path needs the warp kernel for the output rotation (16-byte aligned rows)
+        const bool rows_aligned = (uintptr_t) dst->data % 16 == 0 && dst->nb[1] % 16 == 0 && dst->nb[2] % 16 == 0;
+        return rows_aligned ? ESCHA_PREFILL_I8 : ESCHA_PREFILL_RECON;
+    }
+    return escha_prefill();
+}
+
+// Input rotation, decode and GEMM of one projection node: partial[row][c] = xh[row] . decode(code)[c].
+// i8: the rows are quantized first, partial has int32 sums and scales[row] is their fp32 factor.
+// xh_ready: the rotated input in fp16 when a fused epilogue made it already.
+static void escha_recon_stage(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const bool i8, float * partial, float * scales,
+                              const half * xh_ready = nullptr) {
+    const ggml_tensor * code = dst->src[0];
+    const ggml_tensor * rin  = dst->src[1];
+    const ggml_tensor * x    = dst->src[5];
+
+    const int K      = code->ne[0]/16;
+    const int OC     = code->ne[1]*16;
+    const int IC     = code->ne[2]*16;
+    const int n_rows = x->ne[1]*x->ne[2];
+
+    cudaStream_t stream = ctx.stream();
+
+    // one warp for each 128 channels (escha-gemv.cu); the block kernel is the fallback
+    ggml_cuda_pool_alloc<half> u_buf(ctx.pool());
+    const half * xh = xh_ready;
+    if (xh == nullptr) {
+        xh = u_buf.alloc((size_t) n_rows*IC);
+        if (!ggml_cuda_escha_had_in(ctx, x, rin, u_buf.get())) {
+            escha_rotate_in_dense<half><<<n_rows, 256, 0, stream>>>(
+                (const half *) rin->data, (const float *) x->data, u_buf.get(),
+                IC, (int) x->ne[1], x->nb[1], x->nb[2]);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+
+    if (i8) {
+        ggml_cuda_pool_alloc<int8_t> q_buf(ctx.pool(), (size_t) n_rows*IC);
+        escha_quantize_rows_i8<<<n_rows, 256, 0, stream>>>(xh, q_buf.get(), scales, IC);
+        CUDA_CHECK(cudaGetLastError());
+        escha_mul_mat_recon(ctx, (const int16_t *) code->data, nullptr, q_buf.get(), partial, K, IC, OC, n_rows);
+    } else {
+        escha_mul_mat_recon(ctx, (const int16_t *) code->data, xh, nullptr, partial, K, IC, OC, n_rows);
+    }
+}
+
+// One projection node on the recon / i8 path: the stage above, then the output rotation into dst
+static void escha_recon_node(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool i8, const half * xh_ready = nullptr) {
+    const ggml_tensor * rout = dst->src[2];
+    const ggml_tensor * x    = dst->src[5];
+
+    const int OC     = dst->src[0]->ne[1]*16;
+    const int n_rows = x->ne[1]*x->ne[2];
+
+    // the GEMM writes into dst when its rows are contiguous, and the output rotation then works in place
+    const bool in_place = dst->nb[1] == (size_t) OC*sizeof(float) && dst->nb[2] == dst->nb[1]*dst->ne[1];
+
+    ggml_cuda_pool_alloc<float> p_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float> s_buf(ctx.pool());
+    float * partial = in_place ? (float *) dst->data : p_buf.alloc((size_t) n_rows*OC);
+    if (i8) {
+        s_buf.alloc((size_t) n_rows);
+    }
+
+    escha_recon_stage(ctx, dst, i8, partial, s_buf.get(), xh_ready);
+
+    if (i8) {
+        const bool done = ggml_cuda_escha_had_out_i32(ctx, (const int32_t *) partial, s_buf.get(), rout, dst);
+        GGML_ASSERT(done);
+    } else if (!ggml_cuda_escha_had_out(ctx, partial, rout, dst)) {
+        escha_finalize_dense<<<dim3(n_rows, OC/ESCHA_NT), ESCHA_NT, 0, ctx.stream()>>>(
+            (const half *) rout->data, partial, (float *) dst->data,
+            OC, (int) x->ne[1], n_rows, 1, dst->nb[1], dst->nb[2]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+static bool escha_ranges_overlap(const void * a, const void * b, const size_t bytes) {
+    const uintptr_t pa = (uintptr_t) a;
+    const uintptr_t pb = (uintptr_t) b;
+    return pa < pb + bytes && pb < pa + bytes;
+}
+
+// mul = silu(gate(x)) * up(x) for two projection nodes that take the recon / i8 path: the two GEMMs, then one epilogue kernel for both output rotations, SiLU and the product.
+// Without it the two rotated outputs, the SiLU output and the product are 4 fp32 passes over [rows][OC]. Returns false if it does not take the nodes.
+// down != nullptr: the projection that has mul as its input is done too. The epilogue then writes the rotated fp16 input of down, and mul gets no data.
+// GGML_ESCHA_FUSE_SWIGLU=0: no fused epilogue (each node runs alone). GGML_ESCHA_FUSE_SWIGLU=1: the form without down only.
+bool ggml_cuda_op_escha_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * mul, ggml_tensor * down) {
+    static const int level = getenv("GGML_ESCHA_FUSE_SWIGLU") == nullptr ? 2 : atoi(getenv("GGML_ESCHA_FUSE_SWIGLU"));
+    if (level <= 0 || (down != nullptr && level < 2)) {
+        return false;
+    }
+
+    const int OC     = gate->src[0]->ne[1]*16;
+    const int n_rows = gate->src[5]->ne[1]*gate->src[5]->ne[2];
+
+    const escha_prefill_mode mode = escha_prefill_for(ctx, gate);
+    if (mode == ESCHA_PREFILL_MMA || escha_prefill_for(ctx, up) != mode
+            || n_rows <= ggml_cuda_escha_gemv_max_rows()
+            || up->src[0]->ne[1]*16 != OC || up->src[5]->ne[1]*up->src[5]->ne[2] != n_rows
+            || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32
+            || !ggml_are_same_shape(gate, mul) || !ggml_are_same_shape(up, mul)) {
+        return false;
+    }
+
+    // the epilogue reads and writes whole rows of 128-column groups, 16 bytes for each lane
+    auto rows_ok = [&](const ggml_tensor * t) {
+        return (uintptr_t) t->data % 16 == 0 && t->nb[1] == (size_t) OC*sizeof(float) && t->nb[2] == t->nb[1]*t->ne[1];
+    };
+    if (down == nullptr && !rows_ok(mul)) {
+        return false;
+    }
+    if (down != nullptr && (down->src[5] != mul || down->src[0]->ne[2]*16 != OC || escha_prefill_for(ctx, down) != mode)) {
+        return false;
+    }
+
+    const bool   i8    = mode == ESCHA_PREFILL_I8;
+    const size_t bytes = (size_t) n_rows*OC*sizeof(float);
+
+    // The sums go into the buffers of the gate and up nodes. The graph allocator can give the memory of a node to a later node of the group:
+    // a buffer is used only if it is the buffer of mul (in place, row by row) or apart from it, and the two are apart from each other.
+    // With down, mul gets no data and down is written after the epilogue has read the sums.
+    auto usable = [&](const ggml_tensor * t) {
+        return rows_ok(t) && (down != nullptr || t->data == mul->data || !escha_ranges_overlap(t->data, mul->data, bytes));
+    };
+
+    ggml_cuda_pool_alloc<float> pg_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float> pu_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float> sg_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float> su_buf(ctx.pool());
+
+    float * part_g = usable(gate) ? (float *) gate->data : pg_buf.alloc((size_t) n_rows*OC);
+    float * part_u = usable(up) && !escha_ranges_overlap(up->data, part_g, bytes) ? (float *) up->data : pu_buf.alloc((size_t) n_rows*OC);
+    if (i8) {
+        sg_buf.alloc((size_t) n_rows);
+        su_buf.alloc((size_t) n_rows);
+    }
+
+    escha_recon_stage(ctx, gate, i8, part_g, sg_buf.get());
+    escha_recon_stage(ctx, up,   i8, part_u, su_buf.get());
+
+    if (down != nullptr) {
+        ggml_cuda_pool_alloc<half> xh_buf(ctx.pool(), (size_t) n_rows*OC);
+        const bool done = ggml_cuda_escha_swiglu_xh(ctx, part_g, part_u, sg_buf.get(), su_buf.get(), gate->src[2], up->src[2], down->src[1], xh_buf.get(), OC, n_rows);
+        GGML_ASSERT(done);
+        escha_recon_node(ctx, down, i8, xh_buf.get());
+        return true;
+    }
+
+    const bool done = ggml_cuda_escha_swiglu_out(ctx, part_g, part_u, sg_buf.get(), su_buf.get(), gate->src[2], up->src[2], mul);
+    GGML_ASSERT(done);
+    return true;
+}
+
 void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * code = dst->src[0];
     const ggml_tensor * rin  = dst->src[1];
@@ -1376,6 +1545,13 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     cudaStream_t stream = ctx.stream();
 
+    // prefill by reconstruction (exact read) or its int8 form (fast read)
+    const escha_prefill_mode mode = escha_prefill_for(ctx, dst);
+    if (mode != ESCHA_PREFILL_MMA) {
+        escha_recon_node(ctx, dst, mode == ESCHA_PREFILL_I8);
+        return;
+    }
+
     // The tensor-core path wants its activations already in fp16 so cp.async can move them
     // verbatim, so the rotation has to know its consumer before it runs.
     // n_rows==1 is decode; 2..ESCHA_GEN_MAX_ROWS is speculative verify (reuse decoded
@@ -1388,14 +1564,10 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
                       && OC % ESCHA_MMA_BN == 0
                       && getenv("ESCHA_NO_MMA") == nullptr;
 
-    const bool use_recon = use_mma && n_rows >= escha_recon_min_rows() && escha_prefill() != ESCHA_PREFILL_MMA;
-
     ggml_cuda_pool_alloc<char> u_buf(ctx.pool(),
         (size_t) n_rows*IC*(use_mma ? sizeof(half) : sizeof(float)));
 
-    // recon: one warp for each 128 channels (escha-gemv.cu). The block kernel is the fallback, and the mma path keeps it.
-    if (use_recon && ggml_cuda_escha_had_in(ctx, x, rin, (half *) u_buf.get())) {
-    } else if (use_mma) {
+    if (use_mma) {
         escha_rotate_in_dense<half><<<n_rows, 256, 0, stream>>>(
             (const half *) rin->data, (const float *) x->data, (half *) u_buf.get(),
             IC, (int) x->ne[1], x->nb[1], x->nb[2]);
@@ -1420,13 +1592,10 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // batch-invariant mode: 2 to ESCHA_GEN_MAX_ROWS rows get the slice count of 1 row, so the fp32 sum of a row has the same order alone and in a batch
     const int n_rb_slices = gen && ggml_cuda_batch_invariant() ? 1 : n_rb;
     int n_slices = target/MAX(1, gen ? n_rb_slices*n_ocb : n_tb*n_cb);
-    n_slices = use_recon ? 1 : MIN(MAX(n_slices, 1), nit);
+    n_slices = MIN(MAX(n_slices, 1), nit);
 
-    // recon: the GEMM writes into dst when its rows are contiguous, and the output rotation then works in place
-    const bool in_place = use_recon && dst->nb[1] == (size_t) OC*sizeof(float) && dst->nb[2] == dst->nb[1]*dst->ne[1];
-
-    ggml_cuda_pool_alloc<float> p_buf(ctx.pool());
-    float * partial = in_place ? (float *) dst->data : p_buf.alloc((size_t) n_slices*n_rows*OC);
+    ggml_cuda_pool_alloc<float> p_buf(ctx.pool(), (size_t) n_slices*n_rows*OC);
+    float * partial = p_buf.get();
 
     if (decode1) {
         // widest slice any block gets, since lo/hi split nit unevenly by at most one tile
@@ -1474,20 +1643,6 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
             case 3: launch(escha_matmul_dense<3, ESCHA_ROWS_DENSE>); break;
             default: GGML_ABORT("escha: unsupported K=%d", K);
         }
-    } else if (use_recon) {
-        // the int8 path needs the warp kernel for the output rotation (16-byte aligned rows)
-        const bool rows_aligned = (uintptr_t) dst->data % 16 == 0 && dst->nb[1] % 16 == 0 && dst->nb[2] % 16 == 0;
-        if (escha_prefill() == ESCHA_PREFILL_I8 && rows_aligned) {
-            ggml_cuda_pool_alloc<int8_t> q_buf(ctx.pool(), (size_t) n_rows*IC);
-            ggml_cuda_pool_alloc<float>  s_buf(ctx.pool(), (size_t) n_rows);
-            escha_quantize_rows_i8<<<n_rows, 256, 0, stream>>>((const half *) u_buf.get(), q_buf.get(), s_buf.get(), IC);
-            CUDA_CHECK(cudaGetLastError());
-            escha_mul_mat_recon(ctx, (const int16_t *) code->data, nullptr, q_buf.get(), partial, K, IC, OC, n_rows);
-            const bool done = ggml_cuda_escha_had_out_i32(ctx, (const int32_t *) partial, s_buf.get(), rout, dst);
-            GGML_ASSERT(done);
-            return;
-        }
-        escha_mul_mat_recon(ctx, (const int16_t *) code->data, (const half *) u_buf.get(), nullptr, partial, K, IC, OC, n_rows);
     } else if (use_mma) {
         // tensor-core prefill. Weights are exact; activations are rounded to fp16, which is
         // what escha's runtime does. ESCHA_NO_MMA=1 falls back to the fp32 FMA kernel.
@@ -1526,11 +1681,8 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }
     CUDA_CHECK(cudaGetLastError());
 
-    if (use_recon && ggml_cuda_escha_had_out(ctx, partial, rout, dst)) {
-    } else {
-        escha_finalize_dense<<<dim3(n_rows, n_ocb), ESCHA_NT, 0, stream>>>(
-            (const half *) rout->data, partial, (float *) dst->data,
-            OC, (int) x->ne[1], n_rows, n_slices, dst->nb[1], dst->nb[2]);
-    }
+    escha_finalize_dense<<<dim3(n_rows, n_ocb), ESCHA_NT, 0, stream>>>(
+        (const half *) rout->data, partial, (float *) dst->data,
+        OC, (int) x->ne[1], n_rows, n_slices, dst->nb[1], dst->nb[2]);
     CUDA_CHECK(cudaGetLastError());
 }

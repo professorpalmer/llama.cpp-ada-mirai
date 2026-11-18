@@ -4596,6 +4596,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Escha SwiGLU on the prefill path: gate projection, SiLU, up projection, MUL with one epilogue kernel; with the down projection when it is the only reader of MUL
+    if (node->op == GGML_OP_ESCHA_MUL_MAT &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ESCHA_MUL_MAT, GGML_OP_UNARY, GGML_OP_ESCHA_MUL_MAT, GGML_OP_MUL }, { i + 3 })) {
+        ggml_tensor * gate = cgraph->nodes[i];
+        ggml_tensor * silu = cgraph->nodes[i + 1];
+        ggml_tensor * up   = cgraph->nodes[i + 2];
+        ggml_tensor * mul  = cgraph->nodes[i + 3];
+
+        if (ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == gate && mul->src[0] == silu && mul->src[1] == up) {
+            if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ESCHA_MUL_MAT, GGML_OP_UNARY, GGML_OP_ESCHA_MUL_MAT, GGML_OP_MUL, GGML_OP_ESCHA_MUL_MAT }, { i + 4 }) &&
+                    ggml_cuda_op_escha_swiglu(*cuda_ctx, gate, up, mul, cgraph->nodes[i + 4])) {
+                return 4;
+            }
+            if (ggml_cuda_op_escha_swiglu(*cuda_ctx, gate, up, mul, nullptr)) {
+                return 3;
+            }
+        }
+    }
+
     // GB10 prefill: apply SWIGLU while quantizing the activation consumed by the
     // following low-bit down projection. This avoids materializing and rereading
     // the GLU output and removes one launch per transformer block.
