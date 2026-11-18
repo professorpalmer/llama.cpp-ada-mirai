@@ -859,8 +859,6 @@ struct ggml_cuda_tier_redirect {
     void *       data;     // the node's own address, restored after the write-back
     const void * entry;    // ggml_cuda_tier_entry of the tiered buffer
     size_t       base;     // offset of the node's data in the tiered buffer
-    size_t       h_lo;     // host run of the node's range, as offsets from base
-    size_t       h_hi;
 };
 struct ggml_cuda_tier_state {
     std::vector<ggml_cuda_tier_redirect> rd; // set_rows nodes that write through the alias, in graph order
@@ -1805,7 +1803,7 @@ static void ggml_cuda_tier_graph_begin(ggml_backend_cuda_context & ctx, ggml_cud
                 const bool flat = idx && (idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32) && ggml_is_contiguous(idx) &&
                     idx->ne[1] == 1 && idx->ne[2] == 1 && idx->ne[3] == 1 && n->ne[2] == 1 && n->ne[3] == 1;
                 if (redirect_on && flat) {
-                    ts.rd.push_back({ i, n, n->data, e, base, a - base, b - base });
+                    ts.rd.push_back({ i, n, n->data, e, base });
                 } else {
                     all_redirected = false;
                 }
@@ -1850,16 +1848,25 @@ static void ggml_cuda_tier_step(ggml_backend_cuda_context & ctx, ggml_cuda_tier_
         const size_t row_bytes = ggml_row_size(n->type, n->ne[0]);
         const size_t align = (size_t) r.base | (size_t) n->nb[1] | row_bytes;
         const int    vec = align % 16 == 0 ? 16 : align % 4 == 0 ? 4 : 1;
-        if (idx->ne[0] == 0) {
-            // nothing written
-        } else if (idx->type == GGML_TYPE_I64) {
-            k_tier_write_back<<<(unsigned) idx->ne[0], 128, 0, ctx.stream()>>>(alias, orig, (const int64_t *) idx->data,
-                n->nb[1], row_bytes, r.h_lo, r.h_hi, vec);
-        } else {
-            k_tier_write_back<<<(unsigned) idx->ne[0], 128, 0, ctx.stream()>>>(alias, orig, (const int32_t *) idx->data,
-                n->nb[1], row_bytes, r.h_lo, r.h_hi, vec);
+        // One launch for each host run that the node's range meets. A tensor can meet more than one: when the size of
+        // a part is not a multiple of the page size, the last page of the K tail holds the first cells of V, so V has
+        // that page and its own tail. (With only the first run, the V rows of the tail stayed in staging and the host
+        // pages kept their old bytes: wrong V for all cells past the line that a prefill batch wrote.)
+        const size_t n_lo = r.base, n_hi = std::min(e->total, r.base + ggml_nbytes(n));
+        for (auto & hr : e->host_runs) {
+            const size_t a = std::max(n_lo, hr.first), b = std::min(n_hi, hr.first + hr.second);
+            if (a >= b || idx->ne[0] == 0) {
+                continue;
+            }
+            if (idx->type == GGML_TYPE_I64) {
+                k_tier_write_back<<<(unsigned) idx->ne[0], 128, 0, ctx.stream()>>>(alias, orig, (const int64_t *) idx->data,
+                    n->nb[1], row_bytes, a - r.base, b - r.base, vec);
+            } else {
+                k_tier_write_back<<<(unsigned) idx->ne[0], 128, 0, ctx.stream()>>>(alias, orig, (const int32_t *) idx->data,
+                    n->nb[1], row_bytes, a - r.base, b - r.base, vec);
+            }
+            CUDA_CHECK(cudaGetLastError());
         }
-        CUDA_CHECK(cudaGetLastError());
         r.node->data = r.data;
     }
     if (ts.inflight && ts.rd_next < ts.rd.size() && ts.rd[ts.rd_next].at <= i + 4) {
