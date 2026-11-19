@@ -1309,6 +1309,10 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // GGML_CUDA_POOL_RESERVE_MIB: map the reserve now (the backend calls this when it starts, so a shortage shows at
+    // load and not in a run). Pools without a reserve do nothing.
+    virtual void reserve() {}
 };
 
 template<typename T>

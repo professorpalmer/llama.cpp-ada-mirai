@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/wddm.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -597,6 +598,17 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         *actual_size = size;
         pool_used += size;
 
+        // high-water mark of the bytes in use: one line for each new 16 MiB step, so the last line of a log is the
+        // peak of the run to within 16 MiB (the server is stopped by its process id; no exit line is sure to print)
+        if (pool_used > pool_peak) {
+            pool_peak = pool_used;
+            if (pool_peak >= peak_logged + ((size_t) 16 << 20)) {
+                peak_logged = pool_peak;
+                GGML_LOG_INFO("cuda pool[%d] %p: high-water %llu MiB in use, %llu MiB mapped\n", device, (void *) this,
+                    (unsigned long long) (pool_peak >> 20), (unsigned long long) (pool_size >> 20));
+            }
+        }
+
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
 #endif
@@ -622,6 +634,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         }
     }
     bool reserved = false;
+    size_t pool_peak   = 0;
+    size_t peak_logged = 0;
+
+    void reserve() override {
+        reserve_once();
+    }
 
     // add reserve_size bytes of physical memory at the end of the pool. Under WDDM a growth can fail for a moment
     // (CUDA_ERROR_NOT_READY from cuMemSetAccess seen on an 8 GB card): undo the partial step, sync and retry, and say
@@ -5973,10 +5991,105 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// Memory report and spill guard (Windows). The driver's system-memory fallback moves blocks of VRAM to system RAM with no
+// error when dedicated memory is full: prompt reads then run about 20 times slower, and nvidia-smi does not show it.
+// First call (the warm-up graph at load): one line with the dedicated bytes of this process, its budget, and the bytes
+// in system RAM; a warning if more is in system RAM than the engine put there by design (the host tail of a tiered K/V
+// cache, the exact rows of the two-stage head). Later calls (at most one a second): a warning when that figure grows.
+// GGML_CUDA_SPILL_GUARD=0 turns it off.
+static void ggml_cuda_memory_guard(const int device) {
+#if defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // GGML_CUDA_SPILL_GUARD=0: off. =2: also one line for each change of 32 MiB or more (to study a spill).
+    static const int level = [] { const char * e = getenv("GGML_CUDA_SPILL_GUARD"); return e == nullptr ? 1 : atoi(e); }();
+    if (level <= 0) {
+        return;
+    }
+    static std::mutex mutex;
+    static bool       have_base = false;
+    static uint64_t   last_shared = 0, last_dedicated = 0, warned_over = 0;
+    static int64_t    t_last = 0;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    const int64_t t_now = ggml_time_us();
+    if (have_base && t_now - t_last < 500000) {
+        return;
+    }
+    t_last = t_now;
+
+    CUdevice dev;
+    char luid[8] = {};
+    unsigned int node_mask = 0;
+    if (cuDeviceGet(&dev, ggml_cuda_get_physical_device(device)) != CUDA_SUCCESS || cuDeviceGetLuid(luid, &node_mask, dev) != CUDA_SUCCESS) {
+        return;
+    }
+    uint64_t budget = 0, dedicated = 0, shared = 0;
+    if (!ggml_cuda_wddm_query(luid, &budget, &dedicated, &shared)) {
+        return;
+    }
+    const double mib = 1.0/1048576.0;
+    // GGML_CUDA_DEDICATED_CEILING_MIB=n (the launcher sets it): what the card can hold as dedicated memory (nvidia-smi
+    // tops out there; 12,000 of 12,282 MiB on an RTX 4070 under Windows). The DXGI figure of the process goes on past it,
+    // and the part over the ceiling is in system RAM. (cudaMemGetInfo is of no use here: it gave "0 free" at 11,731 MiB.)
+    static const uint64_t ceiling = [] {
+        const char * e = getenv("GGML_CUDA_DEDICATED_CEILING_MIB");
+        return e ? (uint64_t) std::max(0ll, atoll(e)) << 20 : (uint64_t) 0;
+    }();
+    const uint64_t over = ceiling > 0 && dedicated > ceiling ? dedicated - ceiling : 0;
+    if (!have_base) {
+        have_base      = true;
+        last_shared    = shared;
+        last_dedicated = dedicated;
+        uint64_t by_design = 0;
+#if defined(GGML_USE_VMM)
+        {
+            std::lock_guard<std::mutex> tier_lock(g_tier_mutex);
+            for (auto & sp : g_tier_spans) {
+                for (auto & rr : sp.runs) {
+                    by_design += rr.host ? rr.len : 0;
+                }
+            }
+        }
+#endif
+        GGML_LOG_INFO("%s: this process: %.0f MiB dedicated (budget %.0f MiB), %.0f MiB in system RAM (%.0f MiB by design)\n",
+            __func__, dedicated*mib, budget*mib, shared*mib, by_design*mib);
+        if (shared > by_design + ((uint64_t) 512 << 20)) {
+            GGML_LOG_WARN("%s: spill at load: %.0f MiB of GPU memory are in system RAM, %.0f MiB by design. Dedicated memory is full "
+                "(%.0f MiB of a %.0f MiB budget): prompt reads will be much slower. Use fewer K/V cells in VRAM or a larger margin.\n",
+                __func__, shared*mib, by_design*mib, dedicated*mib, budget*mib);
+        }
+        return;
+    }
+    // A block that the driver moves out of VRAM shows as one large step of the system-RAM figure between two samples.
+    // Pinned host buffers that the engine makes at first use also count there, but they come in smaller steps.
+    const int64_t d_shared    = (int64_t) shared - (int64_t) last_shared;
+    const int64_t d_dedicated = (int64_t) dedicated - (int64_t) last_dedicated;
+    if (level >= 2 && (llabs(d_shared) >= ((int64_t) 32 << 20) || llabs(d_dedicated) >= ((int64_t) 32 << 20))) {
+        GGML_LOG_INFO("%s: sample: dedicated %.0f MiB (%+.0f), in system RAM %.0f MiB (%+.0f)\n", __func__,
+            dedicated*mib, d_dedicated*mib, shared*mib, d_shared*mib);
+    }
+    if (over >= ((uint64_t) 64 << 20) && over >= warned_over + ((uint64_t) 64 << 20)) {
+        warned_over = over;
+        GGML_LOG_WARN("%s: spill: this process has %.0f MiB of dedicated GPU memory but the card holds %.0f MiB: about %.0f MiB "
+            "are in system RAM now. Prompt reads will be slower. Use fewer K/V cells in VRAM or a larger margin.\n",
+            __func__, dedicated*mib, ceiling*mib, over*mib);
+    }
+    if (d_shared >= ((int64_t) 400 << 20)) {
+        GGML_LOG_WARN("%s: spill: %.0f MiB of GPU memory went to system RAM in one step (now %.0f MiB there; dedicated %.0f MiB). "
+            "Prompt reads will be much slower. Use fewer K/V cells in VRAM or a larger margin.\n",
+            __func__, d_shared*mib, shared*mib, dedicated*mib);
+    }
+    last_shared    = shared;
+    last_dedicated = dedicated;
+#else
+    (void) device;
+#endif
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_memory_guard(cuda_ctx->device);
 
     if (ggml_cuda_shared_pool_enabled()) {
         ggml_cuda_shared_pool_order & order = ggml_cuda_shared_pool_order_get(cuda_ctx->device);
@@ -7354,6 +7467,12 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
         /* .context = */ ctx,
     };
+
+    // GGML_CUDA_POOL_RESERVE_MIB: map the pool reserve when the backend starts, not at the first op
+    if (getenv("GGML_CUDA_POOL_RESERVE_MIB") != nullptr) {
+        ggml_cuda_set_device(device);
+        ctx->pool(device).reserve();
+    }
 
     return cuda_backend;
 }
