@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/head2.cuh"
 #include "ggml-cuda/wddm.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1543,7 +1544,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
     CUdeviceptr va2 = 0;
     std::vector<std::pair<size_t, size_t>> host_runs;
     {
-        static const bool staging = [] { const char * e = getenv("GGML_CUDA_KV_TIER_STAGING"); return !e || atoi(e) != 0; }();
+        static const bool staging_on = [] { const char * e = getenv("GGML_CUDA_KV_TIER_STAGING"); return !e || atoi(e) != 0; }();
+        // a tag that starts with "nostage" (the two-stage head's exact rows): no alias, the kernels read the pages in place
+        const bool staging = staging_on && bctx->name.find("_tier_nostage") == std::string::npos;
         if (staging && cuMemAddressReserve(&va2, total, gran, 0, 0) == CUDA_SUCCESS) {
             bool ok = true;
             int  ih = 0;
@@ -2841,11 +2844,76 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// set while the check mode of the two-stage head runs the single-pass head
+static thread_local bool g_head2_bypass = false;
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    // Two-stage output head (head2.cuh): all tokens with the small copy in VRAM, then the exact logits of the best
+    // candidates of each row from the Q8_0 rows in system RAM. Check mode also runs the single-pass head for a compare.
+    ggml_cuda_head2_entry h2;
+    if (!g_head2_bypass && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_cuda_head2_find(src0, &h2)) {
+        ggml_tensor src0_s1 = *src0;
+        src0_s1.type     = h2.type1;
+        src0_s1.data     = (void *) h2.q4;
+        src0_s1.nb[0]    = ggml_type_size(h2.type1);
+        src0_s1.nb[1]    = ggml_row_size(h2.type1, ne00);
+        src0_s1.nb[2]    = src0_s1.nb[1]*ne01;
+        src0_s1.nb[3]    = src0_s1.nb[2];
+        src0_s1.view_src = nullptr;
+        ggml_tensor dst_s1 = *dst;
+        dst_s1.src[0] = &src0_s1;
+        // Batch-invariant mode: Q8_0 and Q4_0 have the same bits for 1 to 8 columns. The other stage-1 types do not: for
+        // 5 to 8 columns they take another kernel, with another int8 form of the hidden rows (Q2_K: values up to 1.6
+        // apart from the 1-to-4-column kernel, test-batch-identity 2026-11-19). They run in chunks of 4 columns.
+        // Two ways to keep a row's bits: the matrix-matrix kernel for every column count (default; one launch, and the
+        // speed of the stock 5-to-8-column path), or chunks of 4 columns of the matrix-vector kernel
+        // (GGML_CUDA_HEAD2_S1=chunk4; two launches for 8 rows: DFlash 7 decode -11 % against the exact head).
+        static const bool s1_chunk4 = [] { const char * e = getenv("GGML_CUDA_HEAD2_S1"); return e != nullptr && strcmp(e, "chunk4") == 0; }();
+        const bool s1_other = ggml_cuda_batch_invariant() && ne11 <= GGML_CUDA_BATCH_INVARIANT_MAX_ROWS
+            && h2.type1 != GGML_TYPE_Q8_0 && h2.type1 != GGML_TYPE_Q4_0;
+        if (s1_other && !s1_chunk4) {
+            ggml_cuda_mul_mat_q(ctx, &src0_s1, src1, nullptr, &dst_s1);
+        } else if (s1_other && ne11 > 4) {
+            for (int64_t c0 = 0; c0 < ne11; c0 += 4) {
+                const int64_t m = std::min<int64_t>(4, ne11 - c0);
+
+                ggml_tensor src1_c = *src1;
+                src1_c.ne[1] = m;
+                src1_c.nb[2] = src1_c.nb[1]*m;
+                src1_c.nb[3] = src1_c.nb[2];
+                src1_c.data  = (char *) src1->data + c0*src1->nb[1];
+
+                ggml_tensor dst_c = dst_s1;
+                dst_c.ne[1]  = m;
+                dst_c.nb[2]  = dst_c.nb[1]*m;
+                dst_c.nb[3]  = dst_c.nb[2];
+                dst_c.data   = (char *) dst->data + c0*dst->nb[1];
+                dst_c.src[1] = &src1_c;
+
+                ggml_cuda_mul_mat(ctx, &src0_s1, &src1_c, &dst_c);
+            }
+        } else {
+            ggml_cuda_mul_mat(ctx, &src0_s1, src1, &dst_s1);
+        }
+
+        ggml_cuda_pool_alloc<float> exact(ctx.pool());
+        if (ggml_cuda_head2_check_enabled()) {
+            exact.alloc(ggml_nelements(dst));
+            ggml_tensor dst_e = *dst;
+            dst_e.data = exact.get();
+            g_head2_bypass = true;
+            ggml_cuda_mul_mat(ctx, src0, src1, &dst_e);
+            g_head2_bypass = false;
+        }
+        ggml_cuda_head2_refine(ctx, h2, src0, src1, dst, exact.get());
         return;
     }
 
@@ -3619,6 +3687,11 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+    // the check mode of the two-stage head reads its counters back in the op;
+    // GGML_CUDA_OP_TIMING needs each op on the stream by itself, so it also turns CUDA graphs off
+    if (ggml_cuda_head2_check_enabled() || getenv("GGML_CUDA_OP_TIMING") != nullptr) {
+        return false;
+    }
 
     {
         // the tier prefetch pipeline instead (see ggml_cuda_tier_graph_wants_pipeline). Past the tier line the target
@@ -7382,6 +7455,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_tier_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_tier_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_cuda_head2_register") == 0) {
+        return (void *)ggml_backend_cuda_head2_register;
+    }
+    if (strcmp(name, "ggml_backend_cuda_head2_unregister") == 0) {
+        return (void *)ggml_backend_cuda_head2_unregister;
+    }
+    if (strcmp(name, "ggml_backend_cuda_gather_bench") == 0) {
+        return (void *)ggml_backend_cuda_gather_bench;
     }
     return nullptr;
 }

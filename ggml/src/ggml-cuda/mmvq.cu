@@ -1112,10 +1112,16 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
-// Batch-invariant mode, 5 to 8 columns: Q8_0 (the output head) has a kernel instance with the warp count and the rows per block of the 1-to-4-column kernels.
+// Batch-invariant mode, 5 to 8 columns: Q8_0 (the output head) and Q4_0 (stage 1 of the two-stage head) have a kernel instance with the warp count and the rows per block of the 1-to-4-column kernels.
 // A column then has the same fp32 sum order as alone, and the weights are read once. The other types run 5 to 8 columns as two launches of 4 columns.
+// the types with that instance (the exact head and the stage-1 types of the two-stage head)
+static constexpr bool mmvq_wide_type(const ggml_type type) {
+    // Q2_K and Q3_K: the instance gave other values for 5 to 8 columns (test-batch-identity, 2026-11-19); they take the two launches
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0;
+}
+
 static bool mmvq_batch_invariant_wide(const ggml_type type, const mmvq_parameter_table_id table_id) {
-    return ggml_cuda_batch_invariant() && type == GGML_TYPE_Q8_0
+    return ggml_cuda_batch_invariant() && mmvq_wide_type(type)
         && calc_nwarps(type, 8, table_id, false, true) == calc_nwarps(type, 4, table_id)
         && calc_rows_per_block(type, 8, table_id) == calc_rows_per_block(type, 4, table_id);
 }
@@ -1394,7 +1400,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 5: {
             constexpr int c_ncols_dst = 5;
-            if constexpr (type == GGML_TYPE_Q8_0) {
+            if constexpr (mmvq_wide_type(type)) {
                 if (wide_warps) {
                     std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true);
                     mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, true>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1412,7 +1418,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 6: {
             constexpr int c_ncols_dst = 6;
-            if constexpr (type == GGML_TYPE_Q8_0) {
+            if constexpr (mmvq_wide_type(type)) {
                 if (wide_warps) {
                     std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true);
                     mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, true>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1430,7 +1436,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 7: {
             constexpr int c_ncols_dst = 7;
-            if constexpr (type == GGML_TYPE_Q8_0) {
+            if constexpr (mmvq_wide_type(type)) {
                 if (wide_warps) {
                     std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true);
                     mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, true>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1448,7 +1454,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 8: {
             constexpr int c_ncols_dst = 8;
-            if constexpr (type == GGML_TYPE_Q8_0) {
+            if constexpr (mmvq_wide_type(type)) {
                 if (wide_warps) {
                     std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, true);
                     mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, true>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,

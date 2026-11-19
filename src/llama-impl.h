@@ -2,6 +2,9 @@
 
 #include "ggml.h" // for ggml_log_level
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -52,6 +55,39 @@ static inline dst_t llama_cast(src_t v) {
     } else {
         static_assert(std::is_same_v<dst_t, void>, "unsupported type combination");
     }
+}
+
+// LLAMA_HEAD2=N: two-stage output head with N exact candidates for each row (0 or unset: off). See llama_model::load_tensors.
+static inline int llama_head2_candidates() {
+    static const int n = [] {
+        const char * e = getenv("LLAMA_HEAD2");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    return n;
+}
+
+// LLAMA_HEAD2_TYPE=q4_0 | q3_k | q2_k | ...: the type of the stage-1 head (default q4_0). Unknown names give q4_0.
+static inline ggml_type llama_head2_type() {
+    static const ggml_type t = [] {
+        const char * e = getenv("LLAMA_HEAD2_TYPE");
+        if (e != nullptr) {
+            for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+                const char * name = ggml_type_name((ggml_type) i);
+                if (name == nullptr || !ggml_is_quantized((ggml_type) i)) {
+                    continue;
+                }
+                size_t k = 0;
+                while (name[k] && e[k] && tolower((unsigned char) name[k]) == tolower((unsigned char) e[k])) {
+                    ++k;
+                }
+                if (name[k] == 0 && e[k] == 0) {
+                    return (ggml_type) i;
+                }
+            }
+        }
+        return GGML_TYPE_Q4_0;
+    }();
+    return t;
 }
 
 static inline ggml_tensor * llama_mul_mat_hadamard(

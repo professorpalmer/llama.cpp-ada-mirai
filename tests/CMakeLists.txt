@@ -397,6 +397,7 @@ llama_build(test-batch-identity.cpp)
 
 # needs a GPU with CUDA VMM (prints SKIP without one), so build only
 llama_build(test-kv-tier.cpp)
+llama_build(test-cuda-gather-bench.cpp)
 
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
