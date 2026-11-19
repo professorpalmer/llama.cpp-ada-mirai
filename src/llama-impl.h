@@ -70,6 +70,9 @@ static inline int llama_head2_candidates() {
 static inline ggml_type llama_head2_type() {
     static const ggml_type t = [] {
         const char * e = getenv("LLAMA_HEAD2_TYPE");
+        if (e != nullptr && (e[0] == 'h' || e[0] == 'H') && e[1] == '2' && e[2] == 0) {
+            return GGML_TYPE_COUNT;   // "h2": the 2-bit layout of ggml-cuda/head2.cu (not a ggml type)
+        }
         if (e != nullptr) {
             for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
                 const char * name = ggml_type_name((ggml_type) i);

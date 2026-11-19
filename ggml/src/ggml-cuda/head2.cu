@@ -1,5 +1,7 @@
 #include "head2.cuh"
 #include "mmvq.cuh"
+#include "quantize.cuh"
+#include "vecdotq.cuh"
 
 #include <atomic>
 #include <mutex>
@@ -34,7 +36,7 @@ void ggml_backend_cuda_head2_register(const void * q8_data, const void * q4_data
     g_head2.push_back({ q8_data, q4_data, (ggml_type) q1_type, err2_d, n_candidates });
     g_head2_n = (int) g_head2.size();
     GGML_LOG_INFO("%s: two-stage head: exact rows at %p (system RAM), stage 1 %s at %p (VRAM), %d candidates for each row\n",
-        __func__, q8_data, ggml_type_name((ggml_type) q1_type), q4_data, n_candidates);
+        __func__, q8_data, q1_type == GGML_TYPE_COUNT ? "h2 (2-bit)" : ggml_type_name((ggml_type) q1_type), q4_data, n_candidates);
 }
 
 void ggml_backend_cuda_head2_unregister(const void * q8_data) {
@@ -459,4 +461,183 @@ double ggml_backend_cuda_gather_bench(const void * src, size_t src_bytes, int ro
     CUDA_CHECK(cudaFree(start_d));
     CUDA_CHECK(cudaFree(dst_d));
     return ms > 0.0f ? (double) n_chunks*16.0*repeat/(ms*1e-3)/1e9 : 0.0;
+}
+
+// ---- stage 1 with the 2-bit layout "h2" ------------------------------------------------------------------------------
+
+// 4 warps = 4 rows of W1 for each CUDA block. Thread t of a warp takes blocks t, t + 32, ... of its row, in that order,
+// for each column; the warp sum is a fixed shuffle tree. Nothing depends on the number of columns.
+static __global__ void k_head2_h2(const char * __restrict__ w1, const size_t row_bytes, const int n_blocks, const int n_rows,
+        const block_q8_1 * __restrict__ y, const int64_t stride_col_y, const int ncols, float * __restrict__ dst, const int64_t stride_col_dst) {
+    const int row = blockIdx.x*4 + threadIdx.x/32;
+    if (row >= n_rows) {
+        return;
+    }
+    const int lane = threadIdx.x % 32;
+    const char *  wr = w1 + (size_t) row*row_bytes;
+    const half *  sc = (const half *) wr;
+    const int  *  cd = (const int *) (wr + (size_t) n_blocks*sizeof(half));
+
+    float acc[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    for (int kb = lane; kb < n_blocks; kb += 32) {
+        const float dw = __half2float(sc[kb]);
+        const int   v0 = cd[2*kb + 0];
+        const int   v1 = cd[2*kb + 1];
+        for (int c = 0; c < ncols; ++c) {
+            const block_q8_1 * yb = y + c*stride_col_y + kb;
+            const int * u = (const int *) yb->qs;
+            int sumi = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                sumi = ggml_cuda_dp4a((v0 >> (2*i)) & 0x03030303, u[i],     sumi);
+                sumi = ggml_cuda_dp4a((v1 >> (2*i)) & 0x03030303, u[4 + i], sumi);
+            }
+            const float2 ds = __half22float2(yb->ds);
+            // dw * (d_y * sum(code * y) - 1.5 * sum(y)), each step rounded by itself (no contraction)
+            const float t = __fsub_rn(__fmul_rn(ds.x, (float) sumi), __fmul_rn(1.5f, ds.y));
+            acc[c] = __fadd_rn(acc[c], __fmul_rn(dw, t));
+        }
+    }
+    for (int c = 0; c < ncols; ++c) {
+        float v = acc[c];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, o, 32));
+        }
+        if (lane == 0) {
+            dst[c*stride_col_dst + row] = v;
+        }
+    }
+}
+
+void ggml_cuda_head2_stage1_h2(ggml_backend_cuda_context & ctx, const void * w1, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1);
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n      = src1->ne[0];
+    const int64_t n_cols = src1->ne[1];
+    const int     n_rows = (int) dst->ne[0];
+    GGML_ASSERT(n % 32 == 0 && n == GGML_PAD(n, MATRIX_ROW_PADDING));
+    const int     n_blocks  = (int) (n/32);
+    const size_t  row_bytes = GGML_CUDA_HEAD2_H2_ROW_BYTES(n);
+    const int64_t s11       = src1->nb[1]/sizeof(float);
+    const int64_t stride_d  = dst->nb[1]/sizeof(float);
+
+    // the per-32 int8 form of all columns, as the Q8_0 and Q4_0 matrix-vector kernels use it
+    ggml_cuda_pool_alloc<char> y(ctx.pool(), (size_t) n_cols*n_blocks*sizeof(block_q8_1));
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, y.get(), GGML_CUDA_Q8_1_AOS, n, s11, s11*n_cols, s11*n_cols,
+        n, n_cols, 1, 1, stream);
+
+    for (int64_t c0 = 0; c0 < n_cols; c0 += 8) {
+        const int m = (int) std::min<int64_t>(8, n_cols - c0);
+        k_head2_h2<<<(n_rows + 3)/4, 128, 0, stream>>>((const char *) w1, row_bytes, n_blocks, n_rows,
+            (const block_q8_1 *) y.get() + c0*n_blocks, n_blocks, m, (float *) dst->data + c0*stride_d, stride_d);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---- stage 1 with the stock Q2_K layout, one geometry ----------------------------------------------------------------
+
+#define HEAD2_Q2K_ROWS 4   // rows of W1 for each warp
+
+// 4 warps for each CUDA block, HEAD2_Q2K_ROWS rows for each warp. Unit = one int of qs of a 256-weight block (16 weights),
+// 16 units for each block. Lane t takes the units t, t + 32, ... of its rows in that order; for each unit the int8 hidden
+// data of each column is loaded once and used for the 4 rows. The column count is a loop bound only.
+static __global__ void k_head2_q2k(const block_q2_K * __restrict__ w1, const int n_sb, const int n_rows,
+        const block_q8_1 * __restrict__ y, const int64_t stride_col_y, const int ncols, float * __restrict__ dst, const int64_t stride_col_dst) {
+    const int row0 = (blockIdx.x*4 + threadIdx.x/32)*HEAD2_Q2K_ROWS;
+    if (row0 >= n_rows) {
+        return;
+    }
+    const int lane    = threadIdx.x % 32;
+    const int n_units = n_sb*QI2_K;
+
+    float acc[HEAD2_Q2K_ROWS][8];
+#pragma unroll
+    for (int r = 0; r < HEAD2_Q2K_ROWS; ++r) {
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+
+    for (int u = lane; u < n_units; u += 32) {
+        const int kb  = u / QI2_K;
+        const int iqs = u % QI2_K;
+        const int bq8_offset   = QR2_K*(iqs/QI8_1);
+        const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1)/(QI8_1/2);
+
+        int     v[HEAD2_Q2K_ROWS];
+        half2   dm[HEAD2_Q2K_ROWS];
+        const uint8_t * sc[HEAD2_Q2K_ROWS];
+#pragma unroll
+        for (int r = 0; r < HEAD2_Q2K_ROWS; ++r) {
+            const int row = min(row0 + r, n_rows - 1);
+            const block_q2_K * b = w1 + (size_t) row*n_sb + kb;
+            v[r]  = get_int_b4(b->qs, iqs);
+            dm[r] = b->dm;
+            sc[r] = b->scales + scale_offset;
+        }
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            if (c >= ncols) {
+                break;
+            }
+            const block_q8_1 * yb = y + c*stride_col_y + (size_t) kb*(QK_K/QK8_1) + bq8_offset;
+            int   uu[QR2_K];
+            float d8[QR2_K];
+#pragma unroll
+            for (int i = 0; i < QR2_K; ++i) {
+                uu[i] = get_int_b4(yb[i].qs, iqs % QI8_1);
+                d8[i] = __low2float(yb[i].ds);
+            }
+#pragma unroll
+            for (int r = 0; r < HEAD2_Q2K_ROWS; ++r) {
+                acc[r][c] += vec_dot_q2_K_q8_1_impl_mmvq(v[r], uu, sc[r], dm[r], d8);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < HEAD2_Q2K_ROWS; ++r) {
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            if (c >= ncols) {
+                break;
+            }
+            float s = acc[r][c];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                s += __shfl_xor_sync(0xffffffff, s, o, 32);
+            }
+            if (lane == 0 && row0 + r < n_rows) {
+                dst[c*stride_col_dst + row0 + r] = s;
+            }
+        }
+    }
+}
+
+void ggml_cuda_head2_stage1_q2k(ggml_backend_cuda_context & ctx, const void * w1, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1);
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n      = src1->ne[0];
+    const int64_t n_cols = src1->ne[1];
+    const int     n_rows = (int) dst->ne[0];
+    GGML_ASSERT(n % QK_K == 0 && n == GGML_PAD(n, MATRIX_ROW_PADDING));
+    const int     n_sb     = (int) (n/QK_K);
+    const int     n_blk8   = (int) (n/QK8_1);
+    const int64_t s11      = src1->nb[1]/sizeof(float);
+    const int64_t stride_d = dst->nb[1]/sizeof(float);
+
+    ggml_cuda_pool_alloc<char> y(ctx.pool(), (size_t) n_cols*n_blk8*sizeof(block_q8_1));
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, y.get(), GGML_CUDA_Q8_1_AOS, n, s11, s11*n_cols, s11*n_cols,
+        n, n_cols, 1, 1, stream);
+
+    const int rows_per_block = 4*HEAD2_Q2K_ROWS;
+    for (int64_t c0 = 0; c0 < n_cols; c0 += 8) {
+        const int m = (int) std::min<int64_t>(8, n_cols - c0);
+        k_head2_q2k<<<(n_rows + rows_per_block - 1)/rows_per_block, 128, 0, stream>>>((const block_q2_K *) w1, n_sb, n_rows,
+            (const block_q8_1 *) y.get() + c0*n_blk8, n_blk8, m, (float *) dst->data + c0*stride_d, stride_d);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }

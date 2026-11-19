@@ -896,6 +896,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     if (head_w) {
         cur = build_lora_mm(head_w, cur, head_s);
+        // LLAMA_HEAD2_DRAFT=1: with a two-stage head (LLAMA_HEAD2) the MTP draft graph takes stage-1 logits only (a draft
+        // token is a guess that the target verifies). Off by default: +1.0 % decode on MTP 3 + lookup (2026-11-19).
+        if (cur->op == GGML_OP_MUL_MAT && cur->src[0] == head_w && llama_head2_candidates() > 0) {
+            static const bool draft_stage1 = [] { const char * e = getenv("LLAMA_HEAD2_DRAFT"); return e != nullptr && atoi(e) != 0; }();
+            if (draft_stage1) {
+                ggml_mul_mat_set_hint(cur, GGML_HINT_HEAD_DRAFT);
+            }
+        }
         cb(cur, "result_output", -1);
         res->t_logits = cur;
         ggml_build_forward_expand(gf, cur);

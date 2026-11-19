@@ -40,6 +40,19 @@ double ggml_backend_cuda_gather_bench(const void * src, size_t src_bytes, int ro
 bool ggml_cuda_head2_find(const ggml_tensor * src0, ggml_cuda_head2_entry * out);
 bool ggml_cuda_head2_check_enabled();
 
+// Stage 1 for the 2-bit layout "h2" (type1 == GGML_TYPE_COUNT): dst = W1 . src1 for all tokens and all columns.
+// Row of W1 (n = n_embd, a multiple of 32; n/32 blocks): n/32 fp16 scales, then for each block 2 ints of codes. Weight
+// 4 i + b of a 16-weight group is in byte b of its int, bits 2 i and 2 i + 1; value = scale x (code - 1.5).
+// One kernel for 1 to 8 columns with one geometry (one warp for a row) and the per-32 int8 form of the hidden rows, so
+// a column has the same bits for every column count; more columns run in chunks of 8.
+#define GGML_CUDA_HEAD2_H2_ROW_BYTES(n) ((size_t) (n)/32*10)
+void ggml_cuda_head2_stage1_h2(ggml_backend_cuda_context & ctx, const void * w1, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Stage 1 for a Q2_K first stage (the stock block layout): the same idea as h2, one kernel and one geometry for 1 to 8
+// columns (more columns in chunks of 8), the per-32 int8 form of the hidden rows, 4 rows of W1 for each warp so one load
+// of a hidden block serves 4 rows. The dot product is the stock one of the 1-column Q2_K kernel (vec_dot_q2_K_q8_1).
+void ggml_cuda_head2_stage1_q2k(ggml_backend_cuda_context & ctx, const void * w1, const ggml_tensor * src1, ggml_tensor * dst);
+
 // Stage 2 on dst, which holds the stage-1 logits of src1's columns.
 // exact != nullptr (check mode): the single-pass logits of the same columns, in the layout of dst.
 void ggml_cuda_head2_refine(ggml_backend_cuda_context & ctx, const ggml_cuda_head2_entry & h, const ggml_tensor * src0,

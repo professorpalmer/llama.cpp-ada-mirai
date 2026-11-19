@@ -454,6 +454,7 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_HEAD_DRAFT       = 2, // MUL_MAT with an output head for a draft token: a two-stage head may stop after stage 1
     };
 
     // model file types

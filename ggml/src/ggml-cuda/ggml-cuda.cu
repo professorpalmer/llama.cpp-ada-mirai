@@ -2861,10 +2861,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (!g_head2_bypass && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
             && ggml_cuda_head2_find(src0, &h2)) {
         ggml_tensor src0_s1 = *src0;
-        src0_s1.type     = h2.type1;
+        const ggml_type type1_g = h2.type1 == GGML_TYPE_COUNT ? GGML_TYPE_Q4_0 : h2.type1;   // the h2 layout does not use src0_s1
+        src0_s1.type     = type1_g;
         src0_s1.data     = (void *) h2.q4;
-        src0_s1.nb[0]    = ggml_type_size(h2.type1);
-        src0_s1.nb[1]    = ggml_row_size(h2.type1, ne00);
+        src0_s1.nb[0]    = ggml_type_size(type1_g);
+        src0_s1.nb[1]    = ggml_row_size(type1_g, ne00);
         src0_s1.nb[2]    = src0_s1.nb[1]*ne01;
         src0_s1.nb[3]    = src0_s1.nb[2];
         src0_s1.view_src = nullptr;
@@ -2873,13 +2874,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // Batch-invariant mode: Q8_0 and Q4_0 have the same bits for 1 to 8 columns. The other stage-1 types do not: for
         // 5 to 8 columns they take another kernel, with another int8 form of the hidden rows (Q2_K: values up to 1.6
         // apart from the 1-to-4-column kernel, test-batch-identity 2026-11-19). They run in chunks of 4 columns.
-        // Two ways to keep a row's bits: the matrix-matrix kernel for every column count (default; one launch, and the
-        // speed of the stock 5-to-8-column path), or chunks of 4 columns of the matrix-vector kernel
-        // (GGML_CUDA_HEAD2_S1=chunk4; two launches for 8 rows: DFlash 7 decode -11 % against the exact head).
-        static const bool s1_chunk4 = [] { const char * e = getenv("GGML_CUDA_HEAD2_S1"); return e != nullptr && strcmp(e, "chunk4") == 0; }();
+        // Ways to keep a row's bits with a type other than Q8_0 / Q4_0: our one-geometry Q2_K kernel (default for Q2_K,
+        // head2.cu), the matrix-matrix kernel for every column count (GGML_CUDA_HEAD2_S1=mmq; DFlash 7 decode -6.7 %), or
+        // chunks of 4 columns of the matrix-vector kernel (GGML_CUDA_HEAD2_S1=chunk4; -11 %).
+        static const char * s1_env = getenv("GGML_CUDA_HEAD2_S1");
+        static const bool s1_chunk4 = s1_env != nullptr && strcmp(s1_env, "chunk4") == 0;
+        static const bool s1_mmq    = s1_env != nullptr && strcmp(s1_env, "mmq") == 0;
         const bool s1_other = ggml_cuda_batch_invariant() && ne11 <= GGML_CUDA_BATCH_INVARIANT_MAX_ROWS
             && h2.type1 != GGML_TYPE_Q8_0 && h2.type1 != GGML_TYPE_Q4_0;
-        if (s1_other && !s1_chunk4) {
+        if (h2.type1 == GGML_TYPE_COUNT) {
+            // the 2-bit layout of head2.cu: its own kernel, one launch for each 8 columns, a row's bits for every batch
+            ggml_cuda_head2_stage1_h2(ctx, h2.q4, src1, dst);
+        } else if (h2.type1 == GGML_TYPE_Q2_K && !s1_chunk4 && !s1_mmq && ne00 % 256 == 0) {
+            ggml_cuda_head2_stage1_q2k(ctx, h2.q4, src1, dst);
+        } else if (s1_other && !s1_chunk4) {
             ggml_cuda_mul_mat_q(ctx, &src0_s1, src1, nullptr, &dst_s1);
         } else if (s1_other && ne11 > 4) {
             for (int64_t c0 = 0; c0 < ne11; c0 += 4) {
@@ -2902,6 +2910,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             }
         } else {
             ggml_cuda_mul_mat(ctx, &src0_s1, src1, &dst_s1);
+        }
+
+        // a draft head (GGML_HINT_HEAD_DRAFT, the MTP draft graph): stage 1 is the result
+        if (hint == GGML_HINT_HEAD_DRAFT) {
+            return;
         }
 
         ggml_cuda_pool_alloc<float> exact(ctx.pool());
