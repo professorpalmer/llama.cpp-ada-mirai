@@ -204,6 +204,8 @@ struct llama_context {
 
     // the bytes of state_seq_save_file in host memory (background saves): size, then the bytes
     size_t state_seq_save_size(llama_seq_id seq_id, llama_pos pos_min, size_t n_token_count);
+    // the state of one sequence through any writer (background saves in place)
+    size_t state_seq_write_io(llama_io_write_i & io, llama_seq_id seq_id) { return state_seq_write_data(io, seq_id, 0); }
     size_t state_seq_save_buffer(llama_seq_id seq_id, uint8_t * dst, size_t size, const llama_token * tokens,
                                  size_t n_token_count, llama_pos pos_min);
 

@@ -5,6 +5,8 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <condition_variable>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -237,7 +239,22 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // background saves (llama_state_seq_save_job_*): a writer thread reads the cells of seq_id with pos <= pmax in
+    // place. Until unpin(), every operation that could move, free or overwrite those cells (clear, seq_rm / seq_cp /
+    // seq_keep / seq_add / seq_div on that range, a K-shift, a stream copy, a state read) waits; so a save never holds
+    // a mixed state, and new tokens (they take empty cells) never wait.
+    void pin(llama_seq_id seq_id, llama_pos pmax);
+    void unpin();
+
 private:
+    mutable std::mutex              pin_mtx;
+    mutable std::condition_variable pin_cv;
+    int          pin_n    = 0;
+    llama_seq_id pin_seq  = -1;
+    llama_pos    pin_pmax = -1;
+    // wait while a pin covers [p0, p1) of seq_id (seq_id -1: any sequence; p1 < 0: to the end)
+    void pin_wait(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const char * why) const;
+
     const llama_model & model;
     const llama_hparams & hparams;
 

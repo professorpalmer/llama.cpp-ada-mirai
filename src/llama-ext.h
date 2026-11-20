@@ -243,6 +243,19 @@ LLAMA_API size_t llama_state_seq_save_size_from(struct llama_context * ctx, llam
 LLAMA_API size_t llama_state_seq_save_buffer_from(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id,
                                                   llama_pos pos_min, const llama_token * tokens, size_t n_token_count);
 
+// background saves, in place (server: save with "async"). begin (the thread that runs the context, between decodes):
+// copies everything except the attention K/V rows (the recurrent state, the cell metadata, the tokens) into host memory
+// and pins the sequence's K/V cells (llama_kv_cache::pin: operations that would change them wait). write (any thread):
+// writes the save file, reading the pinned K/V rows in place through a 64 MiB buffer; the same bytes as
+// llama_state_seq_save_file_from. end: unpins and frees (always call it, after write or instead of it).
+struct llama_state_save_job;
+LLAMA_API struct llama_state_save_job * llama_state_seq_save_job_begin(struct llama_context * ctx, llama_seq_id seq_id,
+                                                                       llama_pos pos_min, const llama_token * tokens,
+                                                                       size_t n_token_count);
+LLAMA_API size_t llama_state_seq_save_job_write(struct llama_state_save_job * job, const char * filepath);
+LLAMA_API size_t llama_state_seq_save_job_host_bytes(const struct llama_state_save_job * job);   // copied before the reply
+LLAMA_API void   llama_state_seq_save_job_end(struct llama_state_save_job * job);
+
 // like llama_state_seq_load_file, with flags (LLAMA_STATE_SEQ_FLAGS_APPEND)
 LLAMA_API size_t llama_state_seq_load_file_ext(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id,
                                                llama_token * tokens_out, size_t n_token_capacity,

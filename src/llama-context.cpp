@@ -4501,6 +4501,151 @@ size_t llama_state_seq_save_file_from(llama_context * ctx, const char * filepath
     }
 }
 
+// ---- background saves, in place -------------------------------------------------------------------------------------
+struct llama_state_save_job {
+    struct seg {
+        std::vector<uint8_t> bytes;        // plain bytes, or a tensor range copied at begin
+        ggml_tensor *        t    = nullptr;   // a K/V range read in place by write
+        size_t               off  = 0;
+        size_t               size = 0;
+    };
+    std::vector<uint8_t> head;             // magic, version, token count, tokens
+    std::vector<seg>     segs;
+    llama_kv_cache *     pinned = nullptr;
+    size_t               n_host = 0;       // bytes copied at begin
+    size_t               n_total = 0;
+};
+
+namespace {
+class llama_io_write_job : public llama_io_write_i {
+public:
+    explicit llama_io_write_job(llama_state_save_job & job) : job(job) {}
+
+    void write(const void * src, size_t size) override {
+        if (job.segs.empty() || job.segs.back().t != nullptr) {
+            job.segs.emplace_back();
+        }
+        auto & b = job.segs.back().bytes;
+        b.insert(b.end(), (const uint8_t *) src, (const uint8_t *) src + size);
+        job.n_host += size;
+        n += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        const bool kv = strncmp(tensor->name, "cache_k_", 8) == 0 || strncmp(tensor->name, "cache_v_", 8) == 0;
+        llama_state_save_job::seg s;
+        if (kv) {
+            s.t = tensor;
+            s.off = offset;
+            s.size = size;
+        } else {
+            s.bytes.resize(size);
+            ggml_backend_tensor_get(tensor, s.bytes.data(), offset, size);
+            job.n_host += size;
+        }
+        job.segs.push_back(std::move(s));
+        n += size;
+    }
+
+    size_t n_bytes() override {
+        return n;
+    }
+
+private:
+    llama_state_save_job & job;
+    size_t n = 0;
+};
+}
+
+llama_state_save_job * llama_state_seq_save_job_begin(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_min, const llama_token * tokens, size_t n_token_count) {
+    ctx->synchronize();
+
+    auto job = std::make_unique<llama_state_save_job>();
+    try {
+        const uint32_t h[3] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, (uint32_t) n_token_count };
+        job->head.resize(sizeof(h) + sizeof(llama_token) * n_token_count);
+        memcpy(job->head.data(), h, sizeof(h));
+        if (n_token_count > 0) {
+            memcpy(job->head.data() + sizeof(h), tokens, sizeof(llama_token) * n_token_count);
+        }
+        job->n_host = job->head.size();
+
+        llama_io_write_job io(*job);
+        io.pos_min = pos_min;
+        ctx->state_seq_write_io(io, seq_id);
+        job->n_total = job->head.size() + io.n_bytes();
+
+        llama_memory_i * mem = ctx->get_memory();
+        llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
+        if (!kv) {
+            if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+                kv = hyb->get_mem_attn();
+            }
+        }
+        bool deferred = false;
+        for (auto & s : job->segs) {
+            deferred = deferred || s.t != nullptr;
+        }
+        if (deferred && !kv) {
+            throw std::runtime_error("K/V rows to read in place, but no attention cache to pin");
+        }
+        if (deferred) {
+            kv->pin(seq_id, mem->seq_pos_max(seq_id));
+            job->pinned = kv;
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error preparing a background save: %s\n", __func__, err.what());
+        return nullptr;
+    }
+    return job.release();
+}
+
+size_t llama_state_seq_save_job_write(llama_state_save_job * job, const char * filepath) {
+    if (!job) {
+        return 0;
+    }
+    try {
+        llama_file file(filepath, "wb");
+        file.write_raw(job->head.data(), job->head.size());
+        std::vector<uint8_t> buf;
+        const size_t chunk = 64u << 20;
+        for (auto & s : job->segs) {
+            if (!s.t) {
+                file.write_raw(s.bytes.data(), s.bytes.size());
+                continue;
+            }
+            buf.resize(std::min(chunk, s.size));
+            for (size_t o = 0; o < s.size; o += chunk) {
+                const size_t len = std::min(chunk, s.size - o);
+                ggml_backend_tensor_get(s.t, buf.data(), s.off + o, len);
+                file.write_raw(buf.data(), len);
+            }
+        }
+        const size_t n = file.tell();
+        if (n != job->n_total) {
+            throw std::runtime_error(format("wrote %zu bytes, expected %zu", n, job->n_total));
+        }
+        return n;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error writing a background save: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_save_job_host_bytes(const llama_state_save_job * job) {
+    return job ? job->n_host : 0;
+}
+
+void llama_state_seq_save_job_end(llama_state_save_job * job) {
+    if (!job) {
+        return;
+    }
+    if (job->pinned) {
+        job->pinned->unpin();
+    }
+    delete job;
+}
+
 size_t llama_state_seq_save_size_from(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_min, size_t n_token_count) {
     ctx->synchronize();
 

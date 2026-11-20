@@ -399,7 +399,44 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+void llama_kv_cache::pin(llama_seq_id seq_id, llama_pos pmax) {
+    std::lock_guard<std::mutex> lock(pin_mtx);
+    GGML_ASSERT(pin_n == 0 && "one background save at a time");
+    pin_n    = 1;
+    pin_seq  = seq_id;
+    pin_pmax = pmax;
+}
+
+void llama_kv_cache::unpin() {
+    {
+        std::lock_guard<std::mutex> lock(pin_mtx);
+        pin_n = 0;
+        pin_seq = -1;
+        pin_pmax = -1;
+    }
+    pin_cv.notify_all();
+}
+
+void llama_kv_cache::pin_wait(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const char * why) const {
+    std::unique_lock<std::mutex> lock(pin_mtx);
+    auto covered = [&]() {
+        if (pin_n == 0) {
+            return false;
+        }
+        if (seq_id >= 0 && seq_id != pin_seq) {
+            return false;
+        }
+        const llama_pos a = std::max<llama_pos>(0, p0);
+        return a <= pin_pmax && (p1 < 0 || p1 > a);
+    };
+    if (covered()) {
+        LLAMA_LOG_WARN("%s: %s waits for a background save of seq %d (cells up to pos %d)\n", __func__, why, pin_seq, pin_pmax);
+        pin_cv.wait(lock, [&]() { return !covered(); });
+    }
+}
+
 void llama_kv_cache::clear(bool data) {
+    pin_wait(-1, 0, -1, "clear");
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -413,6 +450,7 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    pin_wait(seq_id, p0, p1, "seq_rm");
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -482,6 +520,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    pin_wait(seq_id_dst, p0, p1, "seq_cp");
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -574,6 +613,14 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    {
+        std::unique_lock<std::mutex> lock(pin_mtx);
+        const bool other_pinned = pin_n > 0 && pin_seq != seq_id;
+        lock.unlock();
+        if (other_pinned) {
+            pin_wait(-1, 0, -1, "seq_keep");
+        }
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -601,6 +648,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    pin_wait(seq_id, p0, p1, "seq_add");
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -651,6 +699,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    pin_wait(seq_id, p0, p1, "seq_div");
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -851,6 +900,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
+    }
+
+    if (do_shift || !sc_info.empty()) {
+        pin_wait(-1, 0, -1, "update (shift / stream copy)");
     }
 
     bool updated = false;
@@ -2401,6 +2454,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    pin_wait(seq_id, 0, -1, "state_read");
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
