@@ -2598,16 +2598,19 @@ private:
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
 
                     if (task.slot_action.async) {
-                        // background save: copy now (device to host), write later
+                        // background save, in place: copy now only what the next request can change (recurrent state,
+                        // cell metadata, tokens; the draft context's state in full) and pin the target's K/V cells; the
+                        // writer thread reads the K/V rows in place (llama_state_seq_save_job_*)
                         const llama_token * toks = pos_min > 0 ? delta.data() : reinterpret_cast<const llama_token *>(packed.data());
                         const size_t        ntok = pos_min > 0 ? delta.size() : packed.size() / sizeof(llama_token);
-                        const size_t n_main = llama_state_seq_save_size_from(ctx_tgt, slot->id, pos_min > 0 ? pos_min : 0, ntok);
-                        std::unique_ptr<uint8_t[]> buf_main(n_main ? new (std::nothrow) uint8_t[n_main] : nullptr);
-                        size_t got_main = buf_main ? llama_state_seq_save_buffer_from(ctx_tgt, buf_main.get(), n_main, slot->id,
-                                                                                      pos_min > 0 ? pos_min : 0, toks, ntok) : 0;
+                        llama_state_save_job * job = llama_state_seq_save_job_begin(ctx_tgt, slot->id, pos_min > 0 ? pos_min : 0, toks, ntok);
+                        if (!job) {
+                            send_error(task, "Unable to save slot (background save)", ERROR_TYPE_SERVER);
+                            break;
+                        }
                         size_t n_dft = 0, got_dft = 0;
                         std::unique_ptr<uint8_t[]> buf_dft;
-                        if (ctx_dft && got_main) {
+                        if (ctx_dft) {
                             n_dft = llama_state_seq_save_size_from(ctx_dft, slot->id, 0, 0);
                             buf_dft.reset(n_dft ? new (std::nothrow) uint8_t[n_dft] : nullptr);
                             got_dft = buf_dft ? llama_state_seq_save_buffer_from(ctx_dft, buf_dft.get(), n_dft, slot->id, 0, nullptr, 0) : 0;
@@ -2615,24 +2618,19 @@ private:
                                 SRV_WRN("slot %d: draft context state not copied for %s\n", slot->id, filename.c_str());
                             }
                         }
-                        if (got_main == 0) {
-                            send_error(task, "Unable to save slot (host copy)", ERROR_TYPE_SERVER);
-                            break;
-                        }
+                        const size_t got_main = llama_state_seq_save_job_host_bytes(job);
                         const double t_copy_ms = (ggml_time_us() - t_start) / 1000.0;
                         {
                             std::lock_guard<std::mutex> lock(g_bg_save_mutex);
                             server_bg_save_status st;
-                            st.n_bytes   = got_main;
+                            st.n_bytes   = got_main + got_dft;
                             st.t_copy_ms = t_copy_ms;
                             g_bg_save_status[filename] = st;
                         }
                         // the draft sidecar first, then the main file: a main file under its final name has its sidecar
-                        g_bg_save_thread = std::thread([filename, filepath, got_main, got_dft,
-                                                        bm = std::move(buf_main), bd = std::move(buf_dft)]() {
+                        g_bg_save_thread = std::thread([filename, filepath, got_dft, job, bd = std::move(buf_dft)]() {
                             const int64_t t0 = ggml_time_us();
                             std::string err;
-                            bool ok = true;
                             if (bd && got_dft) {
                                 std::string e2;
                                 if (!server_bg_write_file(filepath + ".draft", bd.get(), got_dft, e2)) {
@@ -2642,11 +2640,28 @@ private:
                                 std::error_code ec;
                                 std::filesystem::remove(filepath + ".draft", ec);   // never pair an old sidecar with this save
                             }
-                            ok = server_bg_write_file(filepath, bm.get(), got_main, err);
+                            const std::string part = filepath + ".part";
+                            const size_t n = llama_state_seq_save_job_write(job, part.c_str());
+                            llama_state_seq_save_job_end(job);   // unpin the K/V cells
+                            bool ok = n > 0;
+                            std::error_code ec;
+                            if (ok) {
+                                std::filesystem::rename(part, filepath, ec);
+                                if (ec) {
+                                    ok = false;
+                                    err = "rename failed: " + ec.message();
+                                }
+                            } else {
+                                err = "write failed";
+                            }
+                            if (!ok) {
+                                std::filesystem::remove(part, ec);
+                            }
                             std::lock_guard<std::mutex> lock(g_bg_save_mutex);
                             auto & st = g_bg_save_status[filename];
                             st.state      = ok ? "done" : "failed";
                             st.error      = err;
+                            st.n_bytes    = n;
                             st.t_write_ms = (ggml_time_us() - t0) / 1000.0;
                             if (g_bg_save_status.size() > 256) {   // keep the table small: drop finished entries
                                 for (auto it = g_bg_save_status.begin(); it != g_bg_save_status.end(); ) {
