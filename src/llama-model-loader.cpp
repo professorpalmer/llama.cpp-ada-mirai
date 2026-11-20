@@ -1129,10 +1129,23 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 // find the first buffer type in the list that can use the tensor
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list, const char * suffix = nullptr) {
     GGML_ASSERT(!buft_list->empty());
+    // a Mirai S weight meant for a GPU must not drop to the CPU kernels: an engine whose GPU backend has no Mirai S
+    // kernels (GGML_CUDA_MIRAI=OFF) refuses the file at load, with a clear message
+    bool gpu_in_list = false;
+    if (ggml_is_mirai_s(tensor->type)) {
+        for (const auto & cur : *buft_list) {
+            gpu_in_list = gpu_in_list || (cur.first && ggml_backend_dev_type(cur.first) == GGML_BACKEND_DEVICE_TYPE_GPU);
+        }
+    }
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
         if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev, suffix)) {
+            if (gpu_in_list && (!cur_dev || ggml_backend_dev_type(cur_dev) != GGML_BACKEND_DEVICE_TYPE_GPU)) {
+                throw std::runtime_error(format("tensor '%s' is a Mirai S weight (type %s), and the GPU backend of this engine has "
+                    "no Mirai S kernels (built with GGML_CUDA_MIRAI=OFF): this engine does not serve Mirai S files",
+                    tensor->name, ggml_type_name(tensor->type)));
+            }
             return cur_buft;
         }
     }

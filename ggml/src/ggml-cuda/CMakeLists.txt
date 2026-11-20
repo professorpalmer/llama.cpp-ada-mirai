@@ -103,6 +103,11 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    if (NOT GGML_CUDA_MIRAI)
+        # standalone engine without the Mirai S kernels: the MIRAI ops are not supported on CUDA
+        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX ".*/mirai-s\\.cu$")
+        add_compile_definitions(GGML_CUDA_NO_MIRAI)
+    endif()
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
