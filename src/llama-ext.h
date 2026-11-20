@@ -235,6 +235,14 @@ LLAMA_API bool llama_model_dspark_get_markov(const struct llama_model * model,
 LLAMA_API size_t llama_state_seq_save_file_from(struct llama_context * ctx, const char * filepath, llama_seq_id seq_id,
                                                 llama_pos pos_min, const llama_token * tokens, size_t n_token_count);
 
+// background saves (server): the bytes that llama_state_seq_save_file_from writes (pos_min 0 = a full save), in host
+// memory. llama_state_seq_save_size_from gives the size; llama_state_seq_save_buffer_from copies the state (device to
+// host) and returns the bytes written (0 on error). A writer thread then puts the buffer in a file.
+LLAMA_API size_t llama_state_seq_save_size_from(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_min,
+                                                size_t n_token_count);
+LLAMA_API size_t llama_state_seq_save_buffer_from(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id,
+                                                  llama_pos pos_min, const llama_token * tokens, size_t n_token_count);
+
 // like llama_state_seq_load_file, with flags (LLAMA_STATE_SEQ_FLAGS_APPEND)
 LLAMA_API size_t llama_state_seq_load_file_ext(struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id,
                                                llama_token * tokens_out, size_t n_token_capacity,

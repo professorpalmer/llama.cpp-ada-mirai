@@ -168,6 +168,7 @@ struct server_task {
         std::string filepath;
         int32_t pos_min = 0;    // save: write only the cells at or after this position (a delta save)
         bool    append  = false; // restore: add the file's cells after the slot's cells (the file is a delta save)
+        bool    async   = false; // save: copy the state to host memory, reply, write the file in a background thread
     };
     slot_action slot_action;
 
@@ -523,6 +524,7 @@ struct server_task_result_slots : server_task_result {
 struct server_task_result_slot_save_load : server_task_result {
     std::string filename;
     bool is_save; // true = save, false = load
+    bool pending = false; // a background save: the file is written after this reply (action "save_status")
 
     size_t n_tokens;
     size_t n_bytes;
