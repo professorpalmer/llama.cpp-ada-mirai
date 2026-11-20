@@ -202,6 +202,11 @@ struct llama_context {
                 size_t   n_token_count,
              llama_pos   pos_min = 0);
 
+    // the bytes of state_seq_save_file in host memory (background saves): size, then the bytes
+    size_t state_seq_save_size(llama_seq_id seq_id, llama_pos pos_min, size_t n_token_count);
+    size_t state_seq_save_buffer(llama_seq_id seq_id, uint8_t * dst, size_t size, const llama_token * tokens,
+                                 size_t n_token_count, llama_pos pos_min);
+
     //
     // perf
     //

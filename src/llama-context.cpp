@@ -3470,6 +3470,35 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return res;
 }
 
+size_t llama_context::state_seq_save_size(llama_seq_id seq_id, llama_pos pos_min, size_t n_token_count) {
+    llama_io_write_dummy io(false);
+    io.pos_min = pos_min;
+    state_seq_write_data(io, seq_id, 0);
+    return sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes();
+}
+
+size_t llama_context::state_seq_save_buffer(llama_seq_id seq_id, uint8_t * dst, size_t size, const llama_token * tokens,
+                                            size_t n_token_count, llama_pos pos_min) {
+    const size_t hdr = sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count;
+    if (size < hdr) {
+        throw std::runtime_error("save buffer too small for the header");
+    }
+    const uint32_t h[3] = { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, (uint32_t) n_token_count };
+    memcpy(dst, h, sizeof(h));
+    if (n_token_count > 0) {
+        memcpy(dst + sizeof(h), tokens, sizeof(llama_token) * n_token_count);
+    }
+    size_t n = 0;
+    {
+        // the host writer copies the tensor rows in its destructor (ggml_backend_tensor_get)
+        llama_io_write_host io(dst + hdr, size - hdr);
+        io.pos_min = pos_min;
+        state_seq_write_data(io, seq_id, 0);
+        n = io.n_bytes();
+    }
+    return hdr + n;
+}
+
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
@@ -4468,6 +4497,28 @@ size_t llama_state_seq_save_file_from(llama_context * ctx, const char * filepath
         return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count, pos_min);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_save_size_from(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_min, size_t n_token_count) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_size(seq_id, pos_min, n_token_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error sizing the sequence save: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_save_buffer_from(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos pos_min, const llama_token * tokens, size_t n_token_count) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_buffer(seq_id, dst, size, tokens, n_token_count, pos_min);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error copying the sequence save: %s\n", __func__, err.what());
         return 0;
     }
 }

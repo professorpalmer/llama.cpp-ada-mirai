@@ -27,6 +27,9 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <map>
+#include <mutex>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -818,6 +821,53 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
+// Background slot saves ("async": true in a slot save request). The main loop copies the slot state (and the draft
+// context's sidecar) into host memory, replies with "pending": true, and this thread writes the files: <file>.part,
+// then a rename to <file>, the draft sidecar first, so a file under its final name is always complete. A stop in the
+// middle of a write leaves only .part files. One write at a time: a new save, a restore and the server's end wait for
+// the write in progress. Status by file name: POST /slots/<id>?action=save_status {"filename": ...}.
+struct server_bg_save_status {
+    std::string state = "pending";   // pending | done | failed
+    size_t      n_bytes    = 0;
+    double      t_copy_ms  = 0.0;
+    double      t_write_ms = 0.0;
+    std::string error;
+};
+static std::mutex                                    g_bg_save_mutex;
+static std::map<std::string, server_bg_save_status>  g_bg_save_status;
+static std::thread                                   g_bg_save_thread;
+
+static void server_bg_save_join() {
+    if (g_bg_save_thread.joinable()) {
+        g_bg_save_thread.join();
+    }
+}
+
+static bool server_bg_write_file(const std::string & path, const uint8_t * data, size_t n, std::string & err) {
+    const std::string part = path + ".part";
+    {
+        std::ofstream f(part, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            err = "cannot open " + part;
+            return false;
+        }
+        f.write((const char *) data, (std::streamsize) n);
+        f.flush();
+        if (!f) {
+            err = "write failed: " + part;
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(part, path, ec);
+    if (ec) {
+        err = "rename failed: " + ec.message();
+        std::filesystem::remove(part, ec);
+        return false;
+    }
+    return true;
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -843,6 +893,7 @@ public:
     }
 
     ~server_context_impl() {
+        server_bg_save_join();   // a background save in progress finishes its files
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -2518,6 +2569,8 @@ private:
                         break;
                     }
 
+                    server_bg_save_join();   // one background write at a time (bounded host memory)
+
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -2543,6 +2596,78 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+
+                    if (task.slot_action.async) {
+                        // background save: copy now (device to host), write later
+                        const llama_token * toks = pos_min > 0 ? delta.data() : reinterpret_cast<const llama_token *>(packed.data());
+                        const size_t        ntok = pos_min > 0 ? delta.size() : packed.size() / sizeof(llama_token);
+                        const size_t n_main = llama_state_seq_save_size_from(ctx_tgt, slot->id, pos_min > 0 ? pos_min : 0, ntok);
+                        std::unique_ptr<uint8_t[]> buf_main(n_main ? new (std::nothrow) uint8_t[n_main] : nullptr);
+                        size_t got_main = buf_main ? llama_state_seq_save_buffer_from(ctx_tgt, buf_main.get(), n_main, slot->id,
+                                                                                      pos_min > 0 ? pos_min : 0, toks, ntok) : 0;
+                        size_t n_dft = 0, got_dft = 0;
+                        std::unique_ptr<uint8_t[]> buf_dft;
+                        if (ctx_dft && got_main) {
+                            n_dft = llama_state_seq_save_size_from(ctx_dft, slot->id, 0, 0);
+                            buf_dft.reset(n_dft ? new (std::nothrow) uint8_t[n_dft] : nullptr);
+                            got_dft = buf_dft ? llama_state_seq_save_buffer_from(ctx_dft, buf_dft.get(), n_dft, slot->id, 0, nullptr, 0) : 0;
+                            if (got_dft == 0) {
+                                SRV_WRN("slot %d: draft context state not copied for %s\n", slot->id, filename.c_str());
+                            }
+                        }
+                        if (got_main == 0) {
+                            send_error(task, "Unable to save slot (host copy)", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        const double t_copy_ms = (ggml_time_us() - t_start) / 1000.0;
+                        {
+                            std::lock_guard<std::mutex> lock(g_bg_save_mutex);
+                            server_bg_save_status st;
+                            st.n_bytes   = got_main;
+                            st.t_copy_ms = t_copy_ms;
+                            g_bg_save_status[filename] = st;
+                        }
+                        // the draft sidecar first, then the main file: a main file under its final name has its sidecar
+                        g_bg_save_thread = std::thread([filename, filepath, got_main, got_dft,
+                                                        bm = std::move(buf_main), bd = std::move(buf_dft)]() {
+                            const int64_t t0 = ggml_time_us();
+                            std::string err;
+                            bool ok = true;
+                            if (bd && got_dft) {
+                                std::string e2;
+                                if (!server_bg_write_file(filepath + ".draft", bd.get(), got_dft, e2)) {
+                                    SRV_WRN("background save: draft sidecar of %s not written: %s\n", filename.c_str(), e2.c_str());
+                                }
+                            } else {
+                                std::error_code ec;
+                                std::filesystem::remove(filepath + ".draft", ec);   // never pair an old sidecar with this save
+                            }
+                            ok = server_bg_write_file(filepath, bm.get(), got_main, err);
+                            std::lock_guard<std::mutex> lock(g_bg_save_mutex);
+                            auto & st = g_bg_save_status[filename];
+                            st.state      = ok ? "done" : "failed";
+                            st.error      = err;
+                            st.t_write_ms = (ggml_time_us() - t0) / 1000.0;
+                            if (g_bg_save_status.size() > 256) {   // keep the table small: drop finished entries
+                                for (auto it = g_bg_save_status.begin(); it != g_bg_save_status.end(); ) {
+                                    it = it->second.state != "pending" && it->first != filename ? g_bg_save_status.erase(it) : std::next(it);
+                                }
+                            }
+                        });
+
+                        auto res = std::make_unique<server_task_result_slot_save_load>();
+                        res->id       = task.id;
+                        res->id_slot  = id_slot;
+                        res->filename = filename;
+                        res->is_save  = true;
+                        res->pending  = true;
+                        res->n_tokens = slot->prompt.tokens.size();
+                        res->n_bytes  = got_main;
+                        res->t_ms     = t_copy_ms;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
                     const size_t nwrite = pos_min > 0
                         ? llama_state_seq_save_file_from(ctx_tgt, filepath.c_str(), slot->id, pos_min, delta.data(), delta.size())
                         : llama_state_seq_save_file(
@@ -2592,6 +2717,8 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    server_bg_save_join();   // never read a file that a background save is still writing
 
                     const int64_t t_start = ggml_time_us();
 
@@ -4672,6 +4799,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
         { "slot_save_delta",             meta.slot_save_delta },   // slot save takes "pos_min", restore "append" (delta saves)
+        { "slot_save_async",             true },                   // slot save takes "async": true (background write, action "save_status")
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },
@@ -4855,6 +4983,24 @@ void server_routes::init_routes() {
         }
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
+        }
+        if (action == "save_status") {   // a background save: pending | done | failed | unknown (no task, no wait)
+            const json request_data = json::parse(req.body);
+            const std::string filename = json_value(request_data, "filename", std::string());
+            json out = { { "filename", filename }, { "state", "unknown" } };
+            std::lock_guard<std::mutex> lock(g_bg_save_mutex);
+            auto it = g_bg_save_status.find(filename);
+            if (it != g_bg_save_status.end()) {
+                out["state"]      = it->second.state;
+                out["n_written"]  = it->second.n_bytes;
+                out["copy_ms"]    = it->second.t_copy_ms;
+                out["write_ms"]   = it->second.t_write_ms;
+                if (!it->second.error.empty()) {
+                    out["error"] = it->second.error;
+                }
+            }
+            res->ok(out);
+            return res;
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
@@ -5365,6 +5511,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
         task.slot_action.pos_min  = json_value(request_data, "pos_min", 0);
+        task.slot_action.async    = json_value(request_data, "async", false);
         rd.post_task(std::move(task));
     }
 
