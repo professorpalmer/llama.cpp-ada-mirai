@@ -300,7 +300,14 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
 
 // loop message controller: (1 - tanh(F h))*cur + tanh(G h)*message, h = D [rms(cur); rms(message)]; module: q, k, v, mlp
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const llama_layer & layer, int module) {
-    ggml_tensor * h = ggml_concat(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), ggml_reshape_3d(ctx0, message, n_embd, 1, n_tokens), 1);
+    // the fused op (MoE agent's INKLING_LOOP_GATE) for decode and drafter batches; the chain (cuBLAS) is faster for prefill.
+    // The op takes F16 or F32 weights only; other types keep the chain.
+    const ggml_type wt = layer.loop_down[module]->type;
+    if (inkling_fused(8) && n_tokens <= 8 && (wt == GGML_TYPE_F16 || wt == GGML_TYPE_F32) &&
+        layer.loop_gain[module]->type == wt && layer.loop_forget[module]->type == wt) {
+        return ggml_inkling_loop_gate(ctx0, cur, message, layer.loop_down[module], layer.loop_gain[module], layer.loop_forget[module], 1e-6f);
+    }
+    ggml_tensor * h =ggml_concat(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), ggml_reshape_3d(ctx0, message, n_embd, 1, n_tokens), 1);
     h = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, 1e-6f), 2*n_embd, n_tokens);
     h = build_lora_mm(layer.loop_down[module], h);
 
