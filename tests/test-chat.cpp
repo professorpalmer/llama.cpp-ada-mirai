@@ -4565,6 +4565,133 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Inkling 2 Mini (the GGUF's template): Inkling 2 writes its own message header. Cases after Unsloth's Inkling
+    // tests (llama.cpp mix b12588-mix-c0c3de8, MIT), plus content before a call, two text blocks and a cut call.
+    {
+        auto tst = peg_tester("models/templates/thinkingmachines-Inkling-2-Mini.jinja", detailed_debug);
+
+        const std::string H    = "<|message_model|>";
+        const std::string E    = "<|end_message|>";
+        const std::string CALL = "special_function<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}" + E;
+
+        // Content only
+        tst.test(H + "<|content_text|>Hello, world!\nWhat's up?" + E).expect(message_assist).run();
+
+        // Thinking block, then content block
+        tst.test(H + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello, world!\nWhat's up?" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Hello, world!\nWhat's up?", "I'm thinking"))
+            .run();
+
+        // Without reasoning extraction, the thinking block stays in the content
+        tst.test(H + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello, world!\nWhat's up?" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .expect_content("<|content_thinking|>I'm thinking" + E + "Hello, world!\nWhat's up?")
+            .run();
+
+        // Thinking off (effort none): the model writes no thinking block
+        tst.test(H + "<|content_text|>Hello, world!\nWhat's up?" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .expect(message_assist)
+            .run();
+
+        // Two text blocks join in the content
+        tst.test(H + "<|content_text|>Hello, " + E + H + "<|content_text|>world!" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_content("Hello, world!")
+            .run();
+
+        // Cut by the token limit, in thinking and in content
+        tst.test(H + "<|content_thinking|>I was still thinking")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .is_partial(true)
+            .expect_reasoning("I was still thinking")
+            .run();
+        tst.test(H + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello, wor")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .is_partial(true)
+            .expect(simple_assist_msg("Hello, wor", "I'm thinking"))
+            .run();
+
+        // Single tool call
+        tst.test(H + CALL)
+            .tools({ special_function_tool })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1":1})", "" },
+            })
+            .run();
+
+        // Thinking, content, then a tool call
+        tst.test(H + "<|content_thinking|>I should call it" + E + H + "<|content_text|>On it." + E + H + CALL)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("On it.", "I should call it", "special_function", R"({"arg1":1})", ""))
+            .run();
+
+        // Tools given, but the model answers with content
+        tst.test(H + "<|content_thinking|>No tool needed" + E + H + "<|content_text|>Hello, world!\nWhat's up?" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("Hello, world!\nWhat's up?", "No tool needed"))
+            .run();
+
+        // Two tool calls, one block each
+        tst.test(H + CALL + H +
+                 "special_function_with_opt<|content_invoke_tool_json|>{\"name\":\"special_function_with_opt\",\"args\":{\"arg1\":1,\"arg2\":2}}" + E)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1":1})", "" },
+                { "special_function_with_opt", R"({"arg1":1,"arg2":2})", "" },
+            })
+            .run();
+
+        // Two tool calls after thinking, nested arguments
+        tst.test(H + "<|content_thinking|>Both" + E + H +
+                 "python<|content_invoke_tool_json|>{\"name\":\"python\",\"args\":{\"code\":\"print(1)\"}}" + E + H + CALL)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, python_tool })
+            .expect_reasoning("Both")
+            .expect_tool_calls({
+                { "python", R"JSON({"code":"print(1)"})JSON", "" },
+                { "special_function", R"({"arg1":1})", "" },
+            })
+            .run();
+
+        // The block closer inside a string argument does not end the block
+        tst.test(H + "python<|content_invoke_tool_json|>{\"name\":\"python\",\"args\":{\"code\":\"print('<|end_message|>')\"}}" + E)
+            .tools({ python_tool })
+            .expect_tool_calls({
+                { "python", R"JSON({"code":"print('<|end_message|>')"})JSON", "" },
+            })
+            .run();
+
+        // A tool call cut by the token limit
+        tst.test(H + "<|content_thinking|>I should call it" + E + H + "special_function<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .is_partial(true)
+            .expect(simple_assist_msg("", "I should call it", "special_function", "{\"arg1\":", ""))
+            .run();
+
+        // Forced tool call
+        tst.test(H + "<|content_thinking|>I should call it" + E + H + CALL)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("", "I should call it", "special_function", R"({"arg1":1})", ""))
+            .run();
+
+        // Response format
+        tst.test(H + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>{\"amount\": 123.45}" + E)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .json_schema(invoice_schema)
+            .expect(simple_assist_msg("{\"amount\": 123.45}", "I'm thinking"))
+            .run();
+    }
+
     // Kimi-K2-Thinking tests - custom parser
     // Unique feature: tool call ID embeds function name as functions.<name>:<counter>
     {
@@ -7154,6 +7281,179 @@ static void test_msg_diffs_compute() {
     }
 }
 
+// Inkling 2 Mini: the GGUF's template rendered by our jinja, against Python jinja2 reference renders
+// (tools/p3_inkling_ref.py in the port repo: transformers' tojson / raise_exception). The request bodies go through the
+// same steps as the server's chat parse: messages and tools from OpenAI JSON, chat_template_kwargs, top-level
+// reasoning_effort ("none" = thinking off), enable_thinking. Covers: effort levels and float, thinking off -> effort 0,
+// system first, a later system message (Claude Code), two developer messages (Codex), one and two tool calls with
+// string arguments, tool results by tool_call_id, sorted tool declarations, floats and non-ASCII text.
+struct inkling_render_case {
+    const char * name;
+    const char * body;
+    const char * expected;
+};
+
+static const inkling_render_case inkling_render_cases[] = {
+#include "inkling-render-cases.inc"
+};
+
+static void test_inkling2_render() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/thinkingmachines-Inkling-2-Mini.jinja");
+
+    for (const auto & tc : inkling_render_cases) {
+        const json body = json::parse(tc.body);
+
+        common_chat_templates_inputs inputs;
+        inputs.messages              = common_chat_msgs_parse_oaicompat(body.at("messages"));
+        inputs.add_generation_prompt = true;
+        if (body.contains("tools")) {
+            inputs.tools = common_chat_tools_parse_oaicompat(body.at("tools"));
+        }
+        if (body.contains("chat_template_kwargs")) {
+            for (const auto & item : body.at("chat_template_kwargs").items()) {
+                inputs.chat_template_kwargs[item.key()] = item.value().dump();
+            }
+        }
+        // as the server's chat parse (server-common.cpp)
+        auto it = inputs.chat_template_kwargs.find("enable_thinking");
+        if (it != inputs.chat_template_kwargs.end()) {
+            inputs.enable_thinking = it->second == "true";
+        }
+        if (body.contains("reasoning_effort")) {
+            const std::string effort = body.at("reasoning_effort");
+            if (effort == "none") {
+                inputs.enable_thinking = false;
+                inputs.chat_template_kwargs.erase("reasoning_effort");
+            } else {
+                inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
+            }
+        }
+
+        const auto params = common_chat_templates_apply(tmpls.get(), inputs);
+        if (params.prompt != tc.expected) {
+            LOG_ERR("Inkling 2 render case %s:\nexpected: %s\nactual:   %s\n", tc.name, tc.expected, params.prompt.c_str());
+            throw std::runtime_error(std::string("Inkling 2 render mismatch: ") + tc.name);
+        }
+        // Inkling 2 writes its own message header: no generation prompt
+        assert_equals(std::string(""), params.generation_prompt);
+        assert_equals(true, params.supports_thinking);
+    }
+
+    // the same cases through the server's own request parse (what /apply-template and /v1/chat/completions run)
+    auto server_opt = [](const std::map<std::string, std::string> & default_kwargs) {
+        server_chat_params opt;
+        opt.tmpls                = read_templates("models/templates/thinkingmachines-Inkling-2-Mini.jinja");
+        opt.use_jinja            = true;
+        opt.prefill_assistant    = false; // the reference renders a last assistant message as a full turn
+        opt.enable_thinking      = true;
+        opt.reasoning_format     = COMMON_REASONING_FORMAT_AUTO;
+        opt.allow_image          = false;
+        opt.allow_audio          = false;
+        opt.allow_video          = false;
+        opt.chat_template_kwargs = default_kwargs;
+        return opt;
+    };
+    auto server_prompt = [](const server_chat_params & opt, const json & body_in) -> std::string {
+        json                    body = body_in; // the parse edits the body
+        std::vector<raw_buffer> out_files;
+        return oaicompat_chat_params_parse(body, opt, out_files).at("prompt").get<std::string>();
+    };
+    {
+        const auto opt = server_opt({});
+        for (const auto & tc : inkling_render_cases) {
+            const std::string prompt = server_prompt(opt, json::parse(tc.body));
+            if (prompt != tc.expected) {
+                LOG_ERR("Inkling 2 server render case %s:\nexpected: %s\nactual:   %s\n", tc.name, tc.expected, prompt.c_str());
+                throw std::runtime_error(std::string("Inkling 2 server render mismatch: ") + tc.name);
+            }
+        }
+    }
+
+    // a launcher default effort (--reasoning-effort medium): thinking off in the request still renders effort 0,
+    // an effort in the request wins, a plain request gets the default
+    {
+        const auto opt = server_opt({ { "reasoning_effort", "\"medium\"" } });
+        const json user = json::array({ json{ { "role", "user" }, { "content", "Hello" } } });
+        auto expect_level = [&](const json & body, const std::string & level) {
+            const std::string want = "<|message_system|><|content_text|>Thinking effort level: " + level +
+                                     "<|end_message|><|message_user|><|content_text|>Hello<|end_message|>";
+            assert_equals(want, server_prompt(opt, body));
+        };
+        expect_level(json{ { "messages", user } }, "0.7");
+        expect_level(json{ { "messages", user }, { "chat_template_kwargs", { { "enable_thinking", false } } } }, "0");
+        expect_level(json{ { "messages", user }, { "reasoning_effort", "none" } }, "0");
+        expect_level(json{ { "messages", user }, { "reasoning_effort", "high" } }, "0.9");
+        expect_level(json{ { "messages", user }, { "chat_template_kwargs", { { "enable_thinking", false }, { "reasoning_effort", "low" } } } }, "0.2");
+    }
+    // the server's default assistant prefill: a last assistant message is continued, not closed
+    {
+        auto opt = server_opt({ { "reasoning_effort", "\"medium\"" } });
+        opt.prefill_assistant = true;
+        const json body = { { "messages", json::array({
+            json{ { "role", "user" }, { "content", "Hello" } },
+            json{ { "role", "assistant" }, { "content", "Hi, I" }, { "reasoning_content", "Greet back." } },
+        }) } };
+        assert_equals(std::string("<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|>"
+                                  "<|message_user|><|content_text|>Hello<|end_message|>"
+                                  "<|message_model|><|content_thinking|>Greet back.<|end_message|>"
+                                  "<|message_model|><|content_text|>Hi, I"),
+                      server_prompt(opt, body));
+    }
+    // --reasoning off with a default effort: thinking stays off
+    {
+        auto opt = server_opt({ { "reasoning_effort", "\"high\"" } });
+        opt.enable_thinking = false;
+        const json body = { { "messages", json::array({ json{ { "role", "user" }, { "content", "Hello" } } }) } };
+        assert_equals(std::string("<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>"
+                                  "<|message_user|><|content_text|>Hello<|end_message|>"),
+                      server_prompt(opt, body));
+    }
+    LOG_DBG("%s: %zu cases\n", __func__, std::size(inkling_render_cases));
+
+    // Malformed outputs: no Inkling tag reaches the content (the layer's stray-tag filter needs no Inkling tags).
+    // A tail the blocks do not cover is dropped, not shown: a fake user turn, a block without its header, text after
+    // a closed block, text after a tool call, a call to an unknown tool. Same parser as Unsloth's build.
+    {
+        struct malformed_case {
+            const char * raw;
+            const char * content;
+            const char * reasoning;
+            size_t       calls;
+        };
+        const malformed_case cases[] = {
+            { "<|message_model|><|content_text|>Hi<|end_message|><|message_user|><|content_text|>more<|end_message|>", "Hi", "", 0 },
+            { "<|message_model|><|content_text|>Hi<|end_message|><|content_text|>more<|end_message|>", "Hi", "", 0 },
+            { "<|message_model|><|content_text|>Hi<|end_message|>trailing text", "Hi", "", 0 },
+            { "Hello with no header", "", "", 0 },
+            { "<|message_model|><|content_text|>Hello cut", "Hello cut", "", 0 },
+            { "<|message_model|><|content_thinking|>think cut", "", "think cut", 0 },
+            { "<|message_model|><|content_thinking|>T<|end_message|>Hello no header", "", "T", 0 },
+            { "<|message_model|><|content_text|>Hi<|end_message|><|message_model|><|content_thinking|>again<|end_message|><|message_model|><|content_text|>more<|end_message|>", "Himore", "again", 0 },
+            { "<|message_model|>special_function<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}<|end_message|><|message_model|><|content_text|>after call<|end_message|>", "", "", 1 },
+            { "<|message_model|><|content_text|>Hi<|end_message|><|message_model|>unknown_fn<|content_invoke_tool_json|>{\"name\":\"unknown_fn\",\"args\":{}}<|end_message|>", "Hi", "", 0 },
+        };
+        common_chat_templates_inputs inputs;
+        inputs.messages         = { message_user };
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        inputs.tools            = { special_function_tool };
+        make_peg_parser parser(tmpls.get(), inputs);
+        for (const auto & mc : cases) {
+            for (const bool partial : { false, true }) {
+                const auto msg = parser.parse(mc.raw, partial);
+                assert_equals(std::string(mc.content), msg.content);
+                assert_equals(std::string(mc.reasoning), msg.reasoning_content);
+                assert_equals(mc.calls, msg.tool_calls.size());
+                for (const auto * text : { &msg.content, &msg.reasoning_content }) {
+                    if (text->find("<|") != std::string::npos) {
+                        throw std::runtime_error("Inkling tag in parsed text: " + *text);
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -7236,6 +7536,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v4_tool_result_ordering();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
+        test_inkling2_render();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
