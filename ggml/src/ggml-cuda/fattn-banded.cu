@@ -119,12 +119,10 @@ static __global__ void flash_attn_ext_banded_f32(
     const int64_t   pq  = pos_kv ? pos_q[(ib % pos_q_ne1)*n_q + iq] : 0;
 
     for (int64_t ik = 0; ik < n_kv; ++ik) {
-        const int64_t dist = pkv ? (pkv[ik] < 0 ? -1 : pq - pkv[ik]) : iq + q_offset - ik;
-        if (window > 0) {
-            // implicit mask (ggml_flash_attn_ext_banded_set_window): visible iff 0 <= dist < window
-            if (dist < 0 || dist >= window) {
-                continue;
-            }
+        int dist;
+        // implicit mask (ggml_flash_attn_ext_banded_set_window) and positions: fattn_banded_visible
+        if (!fattn_banded_visible(pkv ? (int) pq : (int) (iq + q_offset), pkv ? pkv[ik] : (int) ik, window, dist)) {
+            continue;
         }
         if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
                 uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
@@ -285,12 +283,10 @@ static __global__ void flash_attn_ext_banded_f32_split(
     const int64_t   pq  = pos_kv ? pos_q[(ib % pos_q_ne1)*n_q + iq] : 0;
 
     for (int64_t ik = ik0 + warp; ik < ik1; ik += NW) {
-        const int64_t dist = pkv ? (pkv[ik] < 0 ? -1 : pq - pkv[ik]) : iq + q_offset - ik;
-        if (window > 0) {
-            // implicit mask (ggml_flash_attn_ext_banded_set_window): visible iff 0 <= dist < window
-            if (dist < 0 || dist >= window) {
-                continue;
-            }
+        int dist;
+        // implicit mask (ggml_flash_attn_ext_banded_set_window) and positions: fattn_banded_visible
+        if (!fattn_banded_visible(pkv ? (int) pq : (int) (iq + q_offset), pkv ? pkv[ik] : (int) ik, window, dist)) {
+            continue;
         }
         if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
                 uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
@@ -796,9 +792,8 @@ static __global__ void flash_attn_ext_banded_mma(
                     s = -INFINITY;
                 } else if (flag == 4) {
                     if (iq_r[r] < n_q) {
-                        const int32_t pk   = pkv[ik];
-                        const int64_t dist = pq_r[r] - pk;
-                        if (pk < 0 || dist < 0 || dist >= window) {
+                        int dist;
+                        if (!fattn_banded_visible((int) pq_r[r], pkv[ik], window, dist)) {
                             s = -INFINITY;
                         } else if (dist < rel_extent) {
                             s += fattn_banded_load(r_base + uint64_t(dist)*r_nb0 + uint64_t(iq_r[r])*r_nb2, type_rel);
@@ -1083,6 +1078,10 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     }
     // implicit window (op_params[4] > 0) and a mask tensor together: not supported
     if (ggml_get_op_params_i32(dst, 4) > 0 && m) {
+        return false;
+    }
+    // the distances are int32 (fattn_banded_visible)
+    if (k->ne[1] > INT32_MAX/2) {
         return false;
     }
     // token positions: I32, contiguous, one per query / cell, with the implicit window
