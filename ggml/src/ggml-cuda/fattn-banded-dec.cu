@@ -594,7 +594,7 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
         __syncwarp();
     }
 
-    // per-query sinks (KV split 0 only): an extra logit with a zero value, in the denominator only. Warp c % nwarps
+    // per-query sinks (KV split 0 only): an extra logit with a zero value, in the denominator only. Warp jh % nwarps
     // takes column c; the loop runs over compile-time column indices so the per-column state stays in registers.
     if (p.sinks && blockIdx.y == 0) {
 #pragma unroll
@@ -602,7 +602,10 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
             const int jq = c / ncols2;
             const int jh = c % ncols2;
             const int iq = ic0 + jq;
-            if (c % nwarps != warp || (ncols1 > 1 && iq >= p.n_q)) {
+            // the warp that adds the sink of column c depends only on its Q head in the group (jh), never on the query's
+            // place in the tile (jq): a query must get the same arithmetic alone and inside a verify batch (the sink
+            // lands in one warp's partial sum, and the cross-warp sum below rounds by warp)
+            if ((jh % nwarps) != warp || (ncols1 > 1 && iq >= p.n_q)) {
                 continue;
             }
             const float sink = p.sinks[(head0 + jh) + iq*p.sink_s1 + sequence*p.sink_s2];
