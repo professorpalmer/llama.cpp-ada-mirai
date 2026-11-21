@@ -322,6 +322,15 @@ int main(int argc, char ** argv) {
     const bool do_invariant = mode == "--invariant";
     const bool do_prefill   = mode == "--prefill" || mode == "--prefill-bench";
     const bool prefill_time = mode == "--prefill-bench";
+    if (do_prefill) {
+        // the two paths differ only by GGML_ESCHA_MOE_PREFILL, which a CUDA graph capture does not see: a replay of the
+        // other path's graph would compare a path with itself
+#ifdef _WIN32
+        _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
+#else
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+#endif
+    }
 
     ggml_context * ctx_data = nullptr;
     gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_data };
