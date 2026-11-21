@@ -278,7 +278,7 @@ struct banded_dec_v_piece<GGML_TYPE_Q8_0> {
     }
 };
 
-template<int D, int ncols1, int ncols2, ggml_type type_KV>
+template<int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
 __launch_bounds__(4*WARP_SIZE, 1)
 static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
 #ifdef FLASH_ATTN_AVAILABLE
@@ -286,7 +286,7 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
     constexpr int ncols       = ncols1*ncols2;
     constexpr int nwarps      = 4;
     constexpr int nthreads    = nwarps*WARP_SIZE;          // = cells per tile
-    constexpr bool Q_q8_1 = type_KV != GGML_TYPE_F16;
+    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16;
     // threads per K row: quantized K at head size 128 takes 8 threads x 16 values (4 cells per warp step, 3 shuffles
     // per reduction); otherwise D/4 threads x 4 values
     constexpr int nthreads_KQ = Q_q8_1 && D == 128 ? 8 : (D/4 < WARP_SIZE ? D/4 : WARP_SIZE);
@@ -480,7 +480,7 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
         constexpr int cells_vg  = GGML_CUDA_BANDED_DEC_VG > 0 ? GGML_CUDA_BANDED_DEC_VG : 8; // cells per V group
         constexpr int n_pre_V   = cells_vg/V_cols_per_iter; // V pieces per group
         constexpr int n_vgroups = WARP_SIZE/cells_vg;
-        banded_dec_v_piece<type_KV> vp[n_vgroups][n_pre_V];
+        banded_dec_v_piece<type_V> vp[n_vgroups][n_pre_V];
 #pragma unroll
         for (int i1 = 0; i1 < n_pre_V; ++i1) {
             const int k = warp*WARP_SIZE + i1*V_cols_per_iter + (nthreads_V == WARP_SIZE ? 0 : lane / nthreads_V);
@@ -500,7 +500,7 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
         const int cell_w = k_VKQ_0 + warp*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (lane & ~(nthreads_KQ - 1)));
 #pragma unroll
         for (int i0 = 0; i0 < nthreads_KQ; i0 += n_pre) {
-            banded_dec_k_piece<type_KV, VPL> kp[n_pre];
+            banded_dec_k_piece<type_K, VPL> kp[n_pre];
 #pragma unroll
             for (int i1 = 0; i1 < n_pre; ++i1) {
                 if (cell_w + i0 + i1 < p.n_kv) { // uniform over the nthreads_KQ threads of the cell
@@ -710,7 +710,7 @@ static __global__ void flash_attn_ext_banded_vec_merge(
     dst[row*D + tid] = den == 0.0f ? 0.0f : num/den;
 }
 
-template<int D, int ncols1, int ncols2, ggml_type type_KV>
+template<int D, int ncols1, int ncols2, ggml_type type_K, ggml_type type_V>
 static void banded_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
@@ -764,7 +764,7 @@ static void banded_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int ntiles_KV = (int) ((n_kv_vis + 4*WARP_SIZE - 1) / (4*WARP_SIZE));
 
     const dim3 block_dim(WARP_SIZE, 4, 1);
-    const auto kernel = flash_attn_ext_banded_vec<D, ncols1, ncols2, type_KV>;
+    const auto kernel = flash_attn_ext_banded_vec<D, ncols1, ncols2, type_K, type_V>;
 
     // KV split as launch_fattn (fattn-common.cuh). Batch-invariant mode: the split depends on neither the number of
     // queries nor the KV length, so a query gives the same bits alone and in a verify batch with a longer view.
@@ -821,36 +821,47 @@ static void banded_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 }
 
-template<int D, int ncols2, ggml_type type_KV>
+template<int D, int ncols2, ggml_type type_K, ggml_type type_V>
 static void banded_dec_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t n_q = dst->src[0]->ne[1];
     if (n_q == 1) {
-        banded_dec_launch<D, 1, ncols2, type_KV>(ctx, dst);
+        banded_dec_launch<D, 1, ncols2, type_K, type_V>(ctx, dst);
     } else if (n_q == 2) {
-        banded_dec_launch<D, 2, ncols2, type_KV>(ctx, dst);
+        banded_dec_launch<D, 2, ncols2, type_K, type_V>(ctx, dst);
     } else {
-        banded_dec_launch<D, 4, ncols2, type_KV>(ctx, dst);
+        banded_dec_launch<D, 4, ncols2, type_K, type_V>(ctx, dst);
     }
 }
 
-template<int D, ggml_type type_KV>
+template<int D, ggml_type type_K, ggml_type type_V>
 static void banded_dec_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int gqa = dst->src[0]->ne[2] / dst->src[1]->ne[2];
     if (gqa % 3 == 0) {
-        banded_dec_switch_ncols1<D, 3, type_KV>(ctx, dst);
+        banded_dec_switch_ncols1<D, 3, type_K, type_V>(ctx, dst);
     } else {
-        banded_dec_switch_ncols1<D, 1, type_KV>(ctx, dst);
+        banded_dec_switch_ncols1<D, 1, type_K, type_V>(ctx, dst);
     }
 }
 
 template<int D>
 static void banded_dec_switch_type(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    switch (dst->src[1]->type) {
-        case GGML_TYPE_F16:  banded_dec_switch_ncols2<D, GGML_TYPE_F16 >(ctx, dst); break;
-        case GGML_TYPE_Q8_0: banded_dec_switch_ncols2<D, GGML_TYPE_Q8_0>(ctx, dst); break;
-        case GGML_TYPE_Q4_0: banded_dec_switch_ncols2<D, GGML_TYPE_Q4_0>(ctx, dst); break;
-        default: GGML_ABORT("banded decode: unsupported K/V type");
+    const ggml_type tk = dst->src[1]->type;
+    const ggml_type tv = dst->src[2]->type;
+    if (tk == tv) {
+        switch (tk) {
+            case GGML_TYPE_F16:  banded_dec_switch_ncols2<D, GGML_TYPE_F16,  GGML_TYPE_F16 >(ctx, dst); return;
+            case GGML_TYPE_Q8_0: banded_dec_switch_ncols2<D, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst); return;
+            case GGML_TYPE_Q4_0: banded_dec_switch_ncols2<D, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst); return;
+            default: break;
+        }
+    } else if constexpr (D == 128) {
+        // mixed K/V (the "more context in VRAM" cache): K q8_0, V q4_0, head size 128 only
+        if (tk == GGML_TYPE_Q8_0 && tv == GGML_TYPE_Q4_0) {
+            banded_dec_switch_ncols2<D, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
+            return;
+        }
     }
+    GGML_ABORT("banded decode: unsupported K/V types");
 }
 
 // GGML_CUDA_BANDED_DEC=0: banded ops of 1-32 query rows take the f16/bf16/f32-only kernels of fattn-banded.cu instead
@@ -884,10 +895,15 @@ bool ggml_cuda_flash_attn_ext_banded_dec_supported(int device, const ggml_tensor
     if (!q || !k || !v || !rel || q->type != GGML_TYPE_F32) {
         return false;
     }
+    // band bias from its factors (ggml_flash_attn_ext_banded_set_rel_factors, src[8]): not read by this kernel yet
+    if (dst->src[8] != nullptr) {
+        return false;
+    }
     if (q->ne[1] < 1 || q->ne[1] > ggml_cuda_banded_dec_max_q(k->type)) {
         return false;
     }
-    if (k->type != v->type || (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_Q4_0)) {
+    // K/V type pairs: the list shared with the prefill kernel (fattn-banded.cuh); a mixed pair only at head size 128
+    if (!fattn_banded_kv_pair_ok(k->type, v->type) || (k->type != v->type && q->ne[0] != 128)) {
         return false;
     }
     if (rel->type != GGML_TYPE_F32 && rel->type != GGML_TYPE_F16 && rel->type != GGML_TYPE_BF16) {
