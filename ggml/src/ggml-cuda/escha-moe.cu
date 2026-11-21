@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "escha-moe.cuh"
 #include "escha-gemv.cuh"
+#include "escha-moe-prefill.cuh"
 #include "mmid.cuh"
 #include "mma.cuh"
 #include <cuda_pipeline.h>
@@ -406,6 +407,10 @@ void ggml_cuda_op_escha_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(rin->type == GGML_TYPE_F16 && rout->type == GGML_TYPE_F16 && lut->type == GGML_TYPE_F16);
     GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
 
+    // batches of more than 8 tokens: the prefill kernel (escha-moe-prefill.cu), the same bits per row as the GEMV path
+    if (ids->ne[1] > 8 && ggml_cuda_escha_moe_prefill(ctx, dst)) {
+        return;
+    }
     // the exllamav3 GEMV kernel with the expert of each row (escha-gemv.cu); the block kernels below are the fallback
     if (ggml_cuda_escha_moe_gemv(ctx, dst)) {
         return;

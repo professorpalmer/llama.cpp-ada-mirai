@@ -258,11 +258,70 @@ static bool check_invariant(const escha_case & c, ggml_backend_t backend, uint32
     return bad == 0;
 }
 
+static void set_prefill_env(const char * v) {
+#ifdef _WIN32
+    _putenv_s("GGML_ESCHA_MOE_PREFILL", v);
+#else
+    setenv("GGML_ESCHA_MOE_PREFILL", v, 1);
+#endif
+}
+
+// Prefill kernel (escha-moe-prefill.cu, batches of more than 8 tokens) against the routed GEMV path (8-row chunks,
+// GGML_ESCHA_MOE_PREFILL=0), which --invariant ties to the 1-token path: the same bits for every value. With --bench
+// also the time of both paths. The tokens of the case repeat up to the batch size.
+static bool check_prefill(const escha_case & c, ggml_backend_t backend, uint32_t ic, bool timing) {
+    const int64_t row = c.yref->ne[0]*c.yref->ne[1];   // floats per token
+    bool ok = true;
+    for (const int64_t nt : { (int64_t) 9, (int64_t) 64, (int64_t) 200, (int64_t) 512, (int64_t) 1024 }) {
+        ggml_init_params ip = { 64u*1024*1024 + (size_t) (ggml_nbytes(c.x) + ggml_nbytes(c.yref))/c.ids->ne[1]*(nt + 8), nullptr, false };
+        ggml_context * ctx = ggml_init(ip);
+        const escha_case sc = sub_case(ctx, c, 0, nt);
+
+        set_prefill_env("0");
+        const std::vector<float> ref = run_case(sc, backend);
+        if (timing) {
+            printf("  gemv    ");
+            bench(sc, backend, ic);
+        }
+        set_prefill_env("1");
+        const std::vector<float> got = run_case(sc, backend);
+        if (timing) {
+            printf("  prefill ");
+            bench(sc, backend, ic);
+        }
+
+        int64_t bad = 0;
+        for (int64_t i = 0; i < nt*row; ++i) {
+            bad += memcmp(&got[i], &ref[i], sizeof(float)) != 0;
+        }
+        // rows per expert of this batch
+        std::vector<int> cnt(c.code->ne[3], 0);
+        for (int64_t t = 0; t < nt; ++t) {
+            for (int64_t s = 0; s < sc.ids->ne[0]; ++s) {
+                cnt[((const int32_t *) ((const char *) sc.ids->data + t*sc.ids->nb[1]))[s]]++;
+            }
+        }
+        int used = 0, mx = 0;
+        for (const int v : cnt) {
+            used += v > 0;
+            mx = std::max(mx, v);
+        }
+        printf("case %u  prefill  %4" PRId64 " tokens (experts used %d, rows per used expert mean %.1f max %d): against the GEMV path  %s (%" PRId64 " of %" PRId64 " values differ)\n",
+               ic, nt, used, used ? (double) (nt*sc.ids->ne[0])/used : 0.0, mx, bad ? "FAIL" : "bit-identical", bad, nt*row);
+        ok &= bad == 0;
+        ggml_free(ctx);
+    }
+    set_prefill_env("1");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const char * path = argc > 1 ? argv[1] : DEFAULT_CASES;
     const std::string mode = argc > 2 ? argv[2] : "";
     const bool do_bench     = mode == "--bench";
     const bool do_invariant = mode == "--invariant";
+    const bool do_prefill   = mode == "--prefill" || mode == "--prefill-bench";
+    const bool prefill_time = mode == "--prefill-bench";
 
     ggml_context * ctx_data = nullptr;
     gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_data };
@@ -314,6 +373,9 @@ int main(int argc, char ** argv) {
             all_ok &= score("cuda", ic, K, IC, OC, run_case(c, gpu), c.yref);
             if (do_invariant) {
                 all_ok &= check_invariant(c, gpu, ic);
+            }
+            if (do_prefill) {
+                all_ok &= check_prefill(c, gpu, ic, prefill_time);
             }
             if (do_bench) {
                 bench(c, gpu, ic);
