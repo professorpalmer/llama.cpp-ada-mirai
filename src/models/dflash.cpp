@@ -652,13 +652,20 @@ void llama_model_dflash::graph<false>::build_inkling2(const llama_model & model,
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     res->t_embd = cur;
 
-    auto * base = build_lora_mm(target->output, cur, target->output_s);
-    inkling2_f32_acc(base);
     if (block > (int64_t) hparams.dflash_block_size) {
-        res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0));
+        // only graph reserve sends a token batch longer than a block (drafts are blocks of dflash_block_size; the
+        // injection is an embd batch): logits of the first block rows only, so the draft compute buffer does not hold
+        // 201k logits for every row of a ubatch (512 rows: 412 MB)
+        const int64_t n_rows = hparams.dflash_block_size;
+        auto * rows = ggml_view_2d(ctx0, cur, n_embd, n_rows, cur->nb[1], 0);
+        auto * base = build_lora_mm(target->output, rows, target->output_s);
+        res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_rows, base->nb[1], 0));
         ggml_build_forward_expand(gf, res->t_logits);
         return;
     }
+
+    auto * base = build_lora_mm(target->output, cur, target->output_s);
+    inkling2_f32_acc(base);
 
     // the chain: row i reads the first maximum of row i - 1 (row 1: the anchor), the head's state and its context
     auto * state  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
