@@ -10954,6 +10954,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // banded FA prefill, Inkling 2 Mini global layers (24 Q heads, 8 K/V heads, extent 1024, causal, per-query sinks):
+    // the quantized K/V kernel against the f16 one at the same shape
+    for (int64_t n_kv : { 4096, 16384, 32768, }) {
+        for (int64_t n_q : { 512, 1024, }) {
+            for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+            }
+        }
+    }
+
     for (int col : {8192, 16384, 32768, 65536, 131072, 262144, 524288}) {
         for (int rows : {1, 4, 16}){
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {col, rows, 1, 1}, false,  false,  GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
