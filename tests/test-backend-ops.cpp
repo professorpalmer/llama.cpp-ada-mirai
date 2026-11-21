@@ -2479,6 +2479,9 @@ struct test_situ : public test_case {
         return "SITU";
     }
 
+    // the chain mode compares the final output only (its inner nodes are differences near 0)
+    bool run_whole_graph() override { return chain != 0; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * g;
         ggml_tensor * u;
@@ -9079,8 +9082,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
-                if (op == GGML_GLU_OP_SWIGLU_OAI) {
-                    // SWIGLU_OAI is handled separately
+                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SITU) {
+                    // SWIGLU_OAI and SITU (split form with its parameters only) are handled separately
                     continue;
                 }
 
