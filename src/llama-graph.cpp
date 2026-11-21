@@ -1297,7 +1297,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
             *t = nullptr;
         }
     }
-
+    // the conv state is stored with a plain copy (build_conv_state_store), so the row-write input stays unused
+    if (inp_rs->s_write_rows && !inp_rs->s_write_rows->buffer) {
+        inp_rs->s_write_rows = nullptr;
+    }
     llm_graph_input_mem_hybrid_iswa::set_input(ubatch);
 
     const auto * attn_ctx = mctx->get_attn();
@@ -2499,6 +2502,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 GGML_ASSERT(has_gate);
                 const float beta = hparams.situ_beta;
                 const float lb   = hparams.situ_linear_beta;
+
+                // the fused gate_up path gives row views; this tree's scale needs contiguous rows (Inkling 2)
+                if (!ggml_is_contiguous(cur)) {
+                    cur = ggml_cont(ctx0, cur);
+                }
+                if (!ggml_is_contiguous(up)) {
+                    up = ggml_cont(ctx0, up);
+                }
 
                 ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
                 act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));

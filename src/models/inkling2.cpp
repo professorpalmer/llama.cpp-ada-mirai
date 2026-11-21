@@ -747,4 +747,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    // this tree's model graphs expand their own output (Unsloth's tree does it in llama_model::build_graph)
+    ggml_build_forward_expand(gf, cur);
 }
