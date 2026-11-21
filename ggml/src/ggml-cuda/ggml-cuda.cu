@@ -6237,10 +6237,22 @@ static void ggml_cuda_memory_guard(const int device) {
 #endif
         GGML_LOG_INFO("%s: this process: %.0f MiB dedicated (budget %.0f MiB), %.0f MiB in system RAM (%.0f MiB by design)\n",
             __func__, dedicated*mib, budget*mib, shared*mib, by_design*mib);
+        // A spill needs both: more GPU-visible system RAM than the engine put there (pinned host buffers that are not tier
+        // runs also count there, so not every excess is a spill) AND dedicated memory at its limit (the budget, or the
+        // launcher's ceiling), which is when the driver moves blocks out. Excess with room left in dedicated memory is
+        // only reported.
+        const uint64_t slack = (uint64_t) 256 << 20;
+        const bool at_limit = (budget > 0 && dedicated + slack >= budget) || (ceiling > 0 && dedicated + slack >= ceiling);
         if (shared > by_design + ((uint64_t) 512 << 20)) {
-            GGML_LOG_WARN("%s: spill at load: %.0f MiB of GPU memory are in system RAM, %.0f MiB by design. Dedicated memory is full "
-                "(%.0f MiB of a %.0f MiB budget): prompt reads will be much slower. Use fewer K/V cells in VRAM or a larger margin.\n",
-                __func__, shared*mib, by_design*mib, dedicated*mib, budget*mib);
+            if (at_limit) {
+                GGML_LOG_WARN("%s: spill at load: %.0f MiB of GPU memory are in system RAM, %.0f MiB by design. Dedicated memory is full "
+                    "(%.0f MiB of a %.0f MiB budget): prompt reads will be much slower. Use fewer K/V cells in VRAM or a larger margin.\n",
+                    __func__, shared*mib, by_design*mib, dedicated*mib, budget*mib);
+            } else {
+                GGML_LOG_INFO("%s: %.0f MiB of host memory are GPU-visible (%.0f MiB of them tier runs); dedicated memory has room "
+                    "(%.0f MiB of a %.0f MiB budget), so this is not a spill (pinned host buffers)\n",
+                    __func__, shared*mib, by_design*mib, dedicated*mib, budget*mib);
+            }
         }
         return;
     }
