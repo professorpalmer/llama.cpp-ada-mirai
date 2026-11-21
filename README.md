@@ -1,35 +1,25 @@
-# llama.cpp for Mirai S on 12 GB Ada
+# Kintsugi-27B engine
 
-This is [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) with two sets of changes on top:
+This source is the engine of [Kintsugi-27B](https://github.com/professorpalmer/Kintsugi-27B). It is a fork of
+llama.cpp. The release bundle runs it with its own launcher and tool layer, which are in the Kintsugi-27B repo. This
+source adds:
 
-1. **The serving patches** from [bonsai-ada-surgery](https://github.com/professorpalmer/bonsai-ada-surgery) (also
-   open as PrismML PRs #319-#323): the tiered KV cache (`--kv-vram-cells`: a VRAM head and a pinned-host tail in one
-   CUDA address range, copy-engine staging), MTP drafting at every depth (`--spec-draft-window`,
-   `--spec-draft-n-max-tail`), harness-proofing (`--reasoning-effort-allow/-fallback`, `--reasoning-max-tokens-floor`),
-   batch-invariant kernels (`GGML_CUDA_BATCH_INVARIANT`), per-op GPU timing (`GGML_CUDA_OP_TIMING`).
-2. **Mirai S** (Mirai Labs' Qwen3.8-27B-S, in alesha-pro's GGUF conversion
-   [alesha-pro/Qwen3.8-27B-S-mirai-GGUF](https://huggingface.co/alesha-pro/Qwen3.8-27B-S-mirai-GGUF)):
-   Mirai Labs' trellis codec, as alesha-pro ported it to ggml in [alesha-pro/llama.cpp-mirai-s](https://github.com/alesha-pro/llama.cpp-mirai-s)
-   (ggml types 90-93 with CPU and CUDA kernels, model-wide rotation tensors and per-row scales, the split attention
-   gate, the graph hook), checked greedy token-for-token against that fork; then the prefill work done here:
-   `GGML_MIRAI_PREFILL_PLANES=ffn` (one int8 activation plane for the FFN matmuls of prompt-sized batches, +18%
-   prefill at KL 0.00028), the packed 1-bit KQ mask (`--kq-mask-packed`, read natively by the tensor-core attention
-   kernel), and the level-decode chunk bounded by its buffer footprint (`GGML_MIRAI_LEVELS_MIB`).
+- **Escha W2 / EXL3 trellis weights**: the dense Escha op (`ggml_escha_mul_mat`, CPU and CUDA), the exllamav3 CUDA
+  GEMV kernels (`ggml/src/ggml-cuda/exl3`), a tensor-core prefill, and a fast int8 read of long prompts
+  (`GGML_ESCHA_PREFILL=i8`; `recon` = the exact read).
+- **Tiered K/V cache** (`--kv-vram-cells N`): the first N cells of each K/V tensor are in VRAM, the other cells are in
+  pinned system RAM, in one CUDA address range. A copy-engine staging buffer reads the system-RAM part when a sequence
+  gets that deep. The attention kernels do not change.
+- **Two-stage output head** (`LLAMA_HEAD2=N`): a small q4_0 copy of the output head in VRAM reads all rows; the exact
+  Q8_0 rows in system RAM score the N best candidates of each row again.
+- **Drafting**: the model's own MTP head at every depth (`--spec-type draft-mtp`, `--spec-draft-window`,
+  `--spec-draft-n-max-tail`), and lookup drafting from the prompt (`ngram-mod`).
+- **Batch-invariant kernels** (`GGML_CUDA_BATCH_INVARIANT=1`): the output for a token does not change with the batch
+  that it runs in.
+- **Settings for agent harnesses**: `--reasoning-effort-allow`, `--reasoning-effort-fallback`,
+  `--reasoning-max-tokens-floor`.
 
-3. **Control-vector projection** (`--cvec-mode project`, from alesha-pro): llama.cpp's control vector applied as
-   `h -= |d| (h.v) v` after every layer in its range instead of `h += d`. A unit direction at scale 1.0 is removed
-   from the residual stream. With the refusal direction published next to the weights this is a run-time
-   abliteration for trellis codes that cannot be edited; layers without a direction in the file are left alone, and
-   without the flag nothing changes (greedy identity re-checked).
-
-Build like any llama.cpp with `-DGGML_CUDA=ON`; the product launcher, measurements and receipts live in
-[mirai-s-ada](https://github.com/professorpalmer/mirai-s-ada). The fork's original README is `README-upstream.md`;
-licenses: MIT throughout (the ggml authors, PrismML, alesha-pro; notices preserved). The model and the Mirai S codec
-are Mirai Labs' (base model Qwen3.8-27B by Qwen). The planar activation layout and the batch-invariant mode are
-sudoingX's ([PrismML PR #218](https://github.com/PrismML-Eng/llama.cpp/pull/218)), kept with their authorship. Not
-affiliated with any of them.
-
-## Build notes: the Kintsugi-27B engine
+## Build notes
 
 The Kintsugi-27B release engine is this source built without the Mirai S kernels (`GGML_CUDA_MIRAI=OFF`; the loader
 then refuses Mirai S files with a clear message). Release flags:
@@ -49,3 +39,25 @@ cmake --build build --target llama-server llama-perplexity test-backend-ops
   `GGML_CUDA_HOSTMEM_FORCE=host|numa|pinned` ("pinned" = no host type: the stop message).
 - The Windows bundle carries the CUDA 13 runtime, which needs a 580+ driver; a CUDA 12.x build (12.2 or newer) runs on
   older drivers.
+
+## Where it comes from
+
+- **llama.cpp** by the ggml authors and all its contributors (ggml-org, MIT). The upstream README is
+  `README-upstream.md`.
+- **PrismML's fork** ([PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp), MIT) is the direct base.
+- **The Mirai S port** by alesha-pro ([alesha-pro/llama.cpp-mirai-s](https://github.com/alesha-pro/llama.cpp-mirai-s))
+  of Mirai Labs' trellis codec is in this source. The Kintsugi build leaves its kernels out (`GGML_CUDA_MIRAI=OFF`).
+  alesha-pro also gave the control-vector projection mode (`--cvec-mode project`).
+- **Ajay9o9 (AjHomelab), llama.cpp-escha**: his commits are the base of the Escha op (CPU and CUDA), with his
+  authorship kept.
+- **turboderp (exllamav3)**: the EXL3 trellis codec and the CUDA GEMV kernels in `ggml/src/ggml-cuda/exl3` (MIT; the
+  licence is in that folder).
+- **Escha Labs**: the Escha W2 format.
+- **sudoingX**: the batch-invariant mode and the planar activation layout.
+
+The full list of credits is `CREDITS.md` in the [Kintsugi-27B repo](https://github.com/professorpalmer/Kintsugi-27B).
+
+## Licence
+
+MIT, the same as llama.cpp: see `LICENSE`. The licences of third-party code are in `licenses/`, in `vendor/`, and in
+`ggml/src/ggml-cuda/exl3/LICENSE`. No person or company named here endorses or sponsors this project.
