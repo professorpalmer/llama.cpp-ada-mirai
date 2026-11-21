@@ -379,7 +379,12 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
     // covers 1-32 rows) and f16 / q8_0 / q4_0 K/V, with the implicit window instead of a mask tensor.
     // LLAMA_INKLING_MASKED=1 restores Unsloth's choice (dense for ubatches of 32 rows or fewer, the F16 mask tensor).
     static const bool masked = [] { const char * e = getenv("LLAMA_INKLING_MASKED"); return e && atoi(e) != 0; }();
-    inp->banded = cparams.flash_attn && (!masked || n_tokens > n_tokens_banded_min);
+    // Ubatches of 32 rows or fewer (decode) stay on the dense path for now: the banded view of the contiguous cells
+    // grows by one cell per token, so the decode graph could not be reused and was rebuilt every token (rig, ef60e363c:
+    // decode 23 tok/s at 4k). Op E (cell positions over the padded view, a multiple of 256) lifts this.
+    // LLAMA_INKLING_BANDED_DECODE=1 forces the banded op at decode (measurements).
+    static const bool banded_decode = [] { const char * e = getenv("LLAMA_INKLING_BANDED_DECODE"); return e && atoi(e) != 0; }();
+    inp->banded = cparams.flash_attn && ((!masked && banded_decode) || n_tokens > n_tokens_banded_min);
     for (int i = 0; i < 2 && inp->banded; ++i) {
         inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
     }
