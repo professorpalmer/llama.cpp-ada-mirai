@@ -77,7 +77,8 @@ static __global__ void flash_attn_ext_banded_f32(
         uint64_t r_nb1,
         uint64_t r_nb2,
         uint64_t r_nb3,
-        int64_t rel_ne3) {
+        int64_t rel_ne3,
+        int32_t window) {
     constexpr int values_per_lane = D / WARP_SIZE;
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
     static_assert(D % WARP_SIZE == 0, "head dimension must be divisible by warp size");
@@ -109,6 +110,13 @@ static __global__ void flash_attn_ext_banded_f32(
     const int64_t q_offset = n_kv - n_q;
 
     for (int64_t ik = 0; ik < n_kv; ++ik) {
+        if (window > 0) {
+            // implicit mask (ggml_flash_attn_ext_banded_set_window): visible iff 0 <= dist < window
+            const int64_t dist = iq + (n_kv - n_q) - ik;
+            if (dist < 0 || dist >= window) {
+                continue;
+            }
+        }
         if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
                 uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
                 uint64_t(ib % mask_ne3)*m_nb3)) == -INFINITY) {
@@ -229,7 +237,8 @@ static __global__ void flash_attn_ext_banded_f32_split(
         uint64_t r_nb1,
         uint64_t r_nb2,
         uint64_t r_nb3,
-        int64_t rel_ne3) {
+        int64_t rel_ne3,
+        int32_t window) {
     constexpr int values_per_lane = D / WARP_SIZE;
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
 
@@ -259,6 +268,13 @@ static __global__ void flash_attn_ext_banded_f32_split(
     const int64_t ik1 = ik0 + chunk < n_kv ? ik0 + chunk : n_kv;
 
     for (int64_t ik = ik0 + warp; ik < ik1; ik += NW) {
+        if (window > 0) {
+            // implicit mask (ggml_flash_attn_ext_banded_set_window): visible iff 0 <= dist < window
+            const int64_t dist = iq + (n_kv - n_q) - ik;
+            if (dist < 0 || dist >= window) {
+                continue;
+            }
+        }
         if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
                 uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
                 uint64_t(ib % mask_ne3)*m_nb3)) == -INFINITY) {
@@ -595,7 +611,8 @@ static __global__ void flash_attn_ext_banded_mma(
         uint64_t r_nb3,
         int64_t rel_ne3,
         int64_t sinks_s1,
-        int64_t sinks_s2) {
+        int64_t sinks_s2,
+        int32_t window) {
 #ifdef FATTN_BANDED_MMA_AVAILABLE
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
     static_assert(type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q4_0 || type_KV == GGML_TYPE_Q8_0, "unsupported K/V type");
@@ -626,12 +643,27 @@ static __global__ void flash_attn_ext_banded_mma(
     const int64_t ih_kv = ih / (n_head_q / n_head_kv);
 
     const int64_t n_kt     = (n_kv + BK - 1)/BK;
-    const int64_t kt_begin = ic*tiles_per_chunk;
-    const int64_t kt_end   = kt_begin + tiles_per_chunk < n_kt ? kt_begin + tiles_per_chunk : n_kt;
+    const int64_t q_offset = n_kv - n_q;
+
+    // implicit mask (window > 0, ggml_flash_attn_ext_banded_set_window): the block's queries [iq_b0, iq_b1] see the
+    // cells [iq_b0 + q_offset - window + 1, iq_b1 + q_offset]; K/V tiles outside that range are not visited
+    const int64_t iq_b0 = qt*BQ;
+    const int64_t iq_b1 = (qt*BQ + BQ < n_q ? qt*BQ + BQ : n_q) - 1;
+    int64_t kt_lo = 0;
+    int64_t kt_hi = n_kt;
+    if (window > 0) {
+        const int64_t c_lo = iq_b0 + q_offset - int64_t(window) + 1;
+        const int64_t c_hi = iq_b1 + q_offset;
+        kt_lo = c_lo > 0 ? c_lo/BK : 0;
+        kt_hi = c_hi < 0 ? 0 : (c_hi/BK + 1 < n_kt ? c_hi/BK + 1 : n_kt);
+    }
+    const int64_t kt_c0    = ic*tiles_per_chunk;
+    const int64_t kt_c1    = kt_c0 + tiles_per_chunk < n_kt ? kt_c0 + tiles_per_chunk : n_kt;
+    const int64_t kt_begin = kt_c0 > kt_lo ? kt_c0 : kt_lo;
+    const int64_t kt_end   = kt_c1 < kt_hi ? kt_c1 : kt_hi;
 
     const int64_t iq_w = qt*BQ + warp*16;
     const int64_t iq_r[2] = {iq_w + g, iq_w + g + 8};
-    const int64_t q_offset = n_kv - n_q;
 
     const char * k_base = k + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
     const char * v_base = v + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
@@ -678,6 +710,19 @@ static __global__ void flash_attn_ext_banded_mma(
         return kt;
     };
 
+    // 0: no visible cell (skipped by next_tile), 1: all visible, 2: read the mask tensor, 3: implicit window per cell
+    auto tile_flag = [&](const int64_t kt) {
+        if (f_base) {
+            return int(f_base[kt]);
+        }
+        if (window <= 0) {
+            return 1;
+        }
+        const int64_t d_min = iq_b0 + q_offset - (kt*BK + BK - 1);
+        const int64_t d_max = iq_b1 + q_offset - kt*BK;
+        return d_min >= 0 && d_max < window ? 1 : 3;
+    };
+
     // S = Q K^T of the tile in K_s (cells kv0 ...), band bias, mask, online softmax (fp32); P to f16 in P_a, O rescaled
     auto score_tile = [&](const int64_t kv0, const int flag) {
         float S[BK/8][4];
@@ -722,6 +767,11 @@ static __global__ void flash_attn_ext_banded_mma(
                     }
                     if (flag == 2) {
                         s += __half2float(*(const half *) (m_base + uint64_t(iq_r[r])*m_nb1 + uint64_t(ik)*sizeof(half)));
+                    } else if (flag == 3) {
+                        const int64_t dist = iq_r[r] + q_offset - ik;
+                        if (dist < 0 || dist >= window) {
+                            s = -INFINITY;
+                        }
                     }
                 }
                 S[j][e] = s;
@@ -811,7 +861,7 @@ static __global__ void flash_attn_ext_banded_mma(
         }
         while (kt < kt_end) {
             const int64_t kv0     = kt*BK;
-            const int     flag    = f_base ? f_base[kt] : 1;
+            const int     flag    = tile_flag(kt);
             const int64_t kt_next = next_tile(kt + 1);
 
             __syncthreads(); // K_s holds tile kt; every warp is done with V_s of the previous tile
@@ -839,7 +889,7 @@ static __global__ void flash_attn_ext_banded_mma(
 
         while (kt < kt_end) {
             const int64_t kv0  = kt*BK;
-            const int     flag = f_base ? f_base[kt] : 1;
+            const int     flag = tile_flag(kt);
 
             fattn_banded_mma_wait<1>(); // K tile landed, V may still be in flight
             __syncthreads();
@@ -911,7 +961,7 @@ static __global__ void flash_attn_ext_banded_mma(
 #else
     GGML_UNUSED_VARS(q, k, v, mask, flags, rel, sinks, dst, part, scale, type_rel, n_q, n_kv, n_head_q, n_head_kv,
         n_chunks, tiles_per_chunk, rel_extent, mask_ne2, mask_ne3, q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3,
-        v_nb1, v_nb2, v_nb3, m_nb1, m_nb2, m_nb3, r_nb0, r_nb1, r_nb2, r_nb3, rel_ne3, sinks_s1, sinks_s2);
+        v_nb1, v_nb2, v_nb3, m_nb1, m_nb2, m_nb3, r_nb0, r_nb1, r_nb2, r_nb3, rel_ne3, sinks_s1, sinks_s2, window);
     NO_DEVICE_CODE;
 #endif // FATTN_BANDED_MMA_AVAILABLE
 }
@@ -977,6 +1027,10 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     }
     const ggml_tensor * sinks = dst->src[4];
     if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float))) {
+        return false;
+    }
+    // implicit window (op_params[4] > 0) and a mask tensor together: not supported
+    if (ggml_get_op_params_i32(dst, 4) > 0 && m) {
         return false;
     }
     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
@@ -1101,6 +1155,10 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
         to_f16(v, v_f16, v_data, v_nb);
     }
 
+    // implicit mask (ggml_flash_attn_ext_banded_set_window): no mask tensor, no tile flags
+    const int32_t window = ggml_get_op_params_i32(dst, 4);
+    GGML_ASSERT(window <= 0 || m == nullptr);
+
     const int nw = n_q >= 64 ? 4 : (n_q >= 32 ? 2 : 1);
     const int bq = nw*16;
     const int64_t n_qt = (n_q + bq - 1)/bq;
@@ -1154,7 +1212,7 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
         m ? m->ne[2] : 1, m ? m->ne[3] : 1, q->nb[1], q->nb[2], q->nb[3], \
         k_nb[1], k_nb[2], k_nb[3], v_nb[1], v_nb[2], v_nb[3], \
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
-        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2)
+        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2, window)
     FATTN_BANDED_MMA_SWITCH(LAUNCH_BANDED_MMA)
 #undef LAUNCH_BANDED_MMA
     CUDA_CHECK(cudaGetLastError());
@@ -1184,6 +1242,7 @@ static void fattn_banded_warp_launch(ggml_backend_cuda_context & ctx, ggml_tenso
     const ggml_tensor * m   = dst->src[3];
     const ggml_tensor * rel = dst->src[6];
     const ggml_tensor * sinks = dst->src[4];
+    const int32_t window = ggml_get_op_params_i32(dst, 4);
 
     {
         constexpr int split_warps   = 4;
@@ -1213,7 +1272,7 @@ static void fattn_banded_warp_launch(ggml_backend_cuda_context & ctx, ggml_tenso
                 q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
                 v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
                 m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
-                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3]); \
+                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], window); \
             flash_attn_ext_banded_f32_merge<DD><<<mblocks, mthreads, 0, stream>>>( \
                 part.get(), (float *) dst->data, n_rows, q->ne[2], q->ne[1], n_chunks, \
                 sinks ? (const float *) sinks->data : nullptr, \
@@ -1246,7 +1305,7 @@ static void fattn_banded_warp_launch(ggml_backend_cuda_context & ctx, ggml_tenso
         sinks ? (const float *) sinks->data : nullptr, \
         sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0, \
         sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0, \
-        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3])
+        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], window)
 
     if (q->ne[0] == 64) {
         LAUNCH_BANDED(64);
