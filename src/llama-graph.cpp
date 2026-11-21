@@ -2405,9 +2405,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (gate_up_exps) {
-        // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+    const bool escha_gate_up = escha && escha->gate_up.active();
+
+    if (gate_up_exps || escha_gate_up) {
+        // merged gate_up path: one mul_mat_id (or one escha_moe), then split into gate and up views
+        // the escha code holds any per-expert scale already, so a scale tensor must not come with it
+        GGML_ASSERT(!escha_gate_up || up_exps_s == nullptr);
+        ggml_tensor * gate_up = escha_gate_up
+            ? build_escha_mm_id(*escha, escha->gate_up, cur, selected_experts)
+            : build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2460,7 +2466,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    const bool has_gate = gate_exps || gate_up_exps || (escha && escha->gate.active());
+    const bool has_gate = gate_exps || gate_up_exps || escha_gate_up || (escha && escha->gate.active());
 
     switch (type_op) {
         case LLM_FFN_SILU:
