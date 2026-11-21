@@ -3049,6 +3049,42 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // Batch-invariant mode, small float weights shared by every column (Inkling's rel-position table against
+    // [16, n_head, n_tokens], MoE routers): all ne11*ne12*ne13 columns as groups of 8 in one MMVF launch (the group as
+    // the channel, src0 broadcast) plus a tail of fewer than 8, so each column has the bits of the 1-8 column kernel
+    // whatever the token count. Inner calls have ne11 == 8 or a tail with ne12 == 1, so they do not come back here.
+    if (ggml_cuda_batch_invariant() && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
+            && ne02 == 1 && ne03 == 1 && src0->ne[1] <= 2048 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && ne11 != 8 && (ne11 > 8 || ne12*ne13 > 1)
+            && (ne12*ne13 > 1 ? ne12*ne13 : ne11) <= GGML_CUDA_BATCH_INVARIANT_MAX_ROWS) {   // tokens: decode and verify, not prefill
+        const int64_t n_cols = ne11*ne12*ne13;
+        const int64_t n_grp  = n_cols/8;
+        const int64_t n_tail = n_cols - 8*n_grp;
+        if (n_grp > 0) {
+            ggml_tensor src1_g = *src1;
+            src1_g.ne[1] = 8; src1_g.ne[2] = n_grp; src1_g.ne[3] = 1;
+            src1_g.nb[2] = src1_g.nb[1]*8; src1_g.nb[3] = src1_g.nb[2]*n_grp;
+            ggml_tensor dst_g = *dst;
+            dst_g.ne[1] = 8; dst_g.ne[2] = n_grp; dst_g.ne[3] = 1;
+            dst_g.nb[2] = dst_g.nb[1]*8; dst_g.nb[3] = dst_g.nb[2]*n_grp;
+            dst_g.src[1] = &src1_g;
+            ggml_cuda_mul_mat(ctx, src0, &src1_g, &dst_g);
+        }
+        if (n_tail > 0) {
+            ggml_tensor src1_t = *src1;
+            src1_t.ne[1] = n_tail; src1_t.ne[2] = 1; src1_t.ne[3] = 1;
+            src1_t.nb[2] = src1_t.nb[1]*n_tail; src1_t.nb[3] = src1_t.nb[2];
+            src1_t.data  = (char *) src1->data + 8*n_grp*src1->nb[1];
+            ggml_tensor dst_t = *dst;
+            dst_t.ne[1] = n_tail; dst_t.ne[2] = 1; dst_t.ne[3] = 1;
+            dst_t.nb[2] = dst_t.nb[1]*n_tail; dst_t.nb[3] = dst_t.nb[2];
+            dst_t.data  = (char *) dst->data + 8*n_grp*dst->nb[1];
+            dst_t.src[1] = &src1_t;
+            ggml_cuda_mul_mat(ctx, src0, &src1_t, &dst_t);
+        }
+        return;
+    }
+
     // Batch-invariant mode: a batch of 9 to GGML_CUDA_BATCH_INVARIANT_MAX_ROWS columns runs as chunks of 8 columns.
     // Each column then takes the kernels of a batch of 1 to 8 columns (mmvf, mmvq), so it has the same bits alone and in the batch.
     if (ggml_cuda_batch_invariant() && ne11 > 8 && ne11 <= GGML_CUDA_BATCH_INVARIANT_MAX_ROWS

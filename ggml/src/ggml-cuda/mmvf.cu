@@ -803,6 +803,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                // batch-invariant mode keeps the small 2D F32 matrices (MoE routers, residual queries) on MMVF for 1 to 8
+                // columns, as for F16 / BF16: a token's router logits then have the same bits alone and in a verify batch
+                if (ggml_cuda_batch_invariant() && src0_ne[1] <= 2048 && src0_ne[2]*src0_ne[3] == 1) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
                 }
