@@ -987,10 +987,6 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
         return false;
     }
-    // the kernels of this file read the mask tensor only, not the implicit window (ggml_flash_attn_ext_banded_set_window)
-    if (ggml_get_op_params_i32(dst, 4) != 0) {
-        return false;
-    }
 
     const ggml_tensor * q   = dst->src[0];
     const ggml_tensor * k   = dst->src[1];
