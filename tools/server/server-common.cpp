@@ -1321,6 +1321,21 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // Inkling: the template has no thinking switch, its reasoning_effort is the switch (an unset effort renders 0.9).
+    // Thinking off (enable_thinking false from this request or from --reasoning off, or reasoning_effort "none") with
+    // no reasoning_effort in THIS request: the server's default effort (--reasoning-effort, default kwargs) does not
+    // reach the template, so a launcher default like "medium" cannot turn the request back into thinking at 0.7.
+    // chat.cpp then renders it as effort "none". An effort in the request itself always wins.
+    if (!inputs.enable_thinking && common_chat_templates_effort_is_thinking_switch(opt.tmpls.get())) {
+        const bool request_effort = chat_template_kwargs_object.contains("reasoning_effort") ||
+                                    (body.contains("reasoning_effort") && body.at("reasoning_effort").is_string() &&
+                                     body.at("reasoning_effort").get<std::string>() != "none" &&
+                                     !body.at("reasoning_effort").get<std::string>().empty());
+        if (!request_effort) {
+            inputs.chat_template_kwargs.erase("reasoning_effort");
+        }
+    }
+
     // --reasoning-effort-allow: an effort word the chat template does not accept (from the request or from
     // chat_template_kwargs) becomes --reasoning-effort-fallback instead of reaching the template. Bonsai 2's
     // template raises on "high", which Cline, Kilo and Open WebUI send: HTTP 500 on every request.
