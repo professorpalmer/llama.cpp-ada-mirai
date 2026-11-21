@@ -11,11 +11,12 @@
 // splits of ceil(k_slices / 8) slices; a row's result is 0 + p0 + ... + p7 over the splits in order, then T128 and rout.
 // That path runs 8 rows per block (A rows 8-15 of the MMA are zero) and so decodes every tile once per 8 rows.
 //
-// Here a block has one expert, 128 output columns and up to 64 rows of that expert (4 MMA row fragments of 16 rows,
+// Here a block has one expert, 128 output columns and up to 16*RF rows of that expert (RF MMA row fragments of 16 rows,
 // both A halves live). A warp has 32 columns (2 n-tiles) and walks the 8 k-splits one after the other with the same
 // slice ranges, the same fold cadence and the same split order, decodes each tile once and runs it on all row
-// fragments. A row's sums do not depend on the other rows of an MMA, so every row is the same bits as through the
-// 1-token path (test-escha-moe --invariant and --prefill check it). Decode work drops by up to 8x.
+// fragments. The A slices of the block go through a cp.async ring in shared memory, shared by the 4 warps, and reach
+// the MMAs by ldmatrix: the same fp16 values as the GEMV's direct loads. A row's sums do not depend on the other rows
+// of an MMA, so every row is the same bits as through the 1-token path (test-escha-moe --invariant and --prefill).
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -47,9 +48,18 @@ union half_uint16 {
 static constexpr int ESCHA_PF_S    = 8;   // k-splits
 static constexpr int ESCHA_PF_WNT  = 2;   // n-tiles per warp
 static constexpr int ESCHA_PF_FOLD = 4;   // fp16 -> fp32 fold cadence of WNT 2
-static constexpr int ESCHA_PF_PF   = 4;   // prefetch ring depth of WNT 2 (latency only)
-static constexpr int ESCHA_PF_RF   = 4;   // row fragments of 16 rows per block
-static constexpr int ESCHA_PF_ROWS = 16*ESCHA_PF_RF;
+// latency only
+static constexpr int ESCHA_PF_PF   = 4;   // prefetch ring depth (B in registers, A in shared memory)
+static constexpr int ESCHA_PF_AST  = 24;  // halves per A row in shared memory (16 used): ldmatrix without bank conflicts
+
+// GGML_ESCHA_MOE_PREFILL_RF=2|4: row fragments of 16 rows per block (default 4)
+static int escha_prefill_rf() {
+    static const int rf = [] {
+        const char * e = getenv("GGML_ESCHA_MOE_PREFILL_RF");
+        return e != nullptr && atoi(e) == 2 ? 2 : 4;
+    }();
+    return rf;
+}
 
 // xh[row] = f16(T128(x[row] * rin[expert of row])), row = token*n_ids + slot: escha_gemv_had_in_routed of escha-gemv.cu
 static __global__ void escha_prefill_had_in_routed(
@@ -75,24 +85,47 @@ static __global__ void escha_prefill_had_in_routed(
     had_fh_r_128_inner<true, false>(x_row + blk*128, xh + (int64_t) row*IC + blk*128, rin + (int64_t) e*IC + blk*128, ESCHA_PREFILL_RS);
 }
 
-// one work item for each chunk of up to ESCHA_PF_ROWS compact rows of an expert (the items write different rows)
+// one work item for each chunk of up to `rows` compact rows of an expert (the items write different rows)
 static __global__ void escha_prefill_build_work(
         const int32_t * __restrict__ bounds,
         int4          * __restrict__ work,
         int32_t       * __restrict__ n_work,
-        const int n_expert) {
+        const int n_expert, const int rows) {
     for (int e = blockIdx.x*blockDim.x + threadIdx.x; e < n_expert; e += gridDim.x*blockDim.x) {
         const int lo = bounds[e];
         const int hi = bounds[e + 1];
-        for (int s = lo; s < hi; s += ESCHA_PF_ROWS) {
-            work[atomicAdd(n_work, 1)] = make_int4(e, s, min(ESCHA_PF_ROWS, hi - s), 0);
+        for (int s = lo; s < hi; s += rows) {
+            work[atomicAdd(n_work, 1)] = make_int4(e, s, min(rows, hi - s), 0);
         }
     }
 }
 
+static __device__ __forceinline__ void escha_pf_cp_async_16(void * dst, const void * src, const bool valid) {
+#ifdef CP_ASYNC_AVAILABLE
+    const unsigned int d = (unsigned int) __cvta_generic_to_shared(dst);
+    const int n = valid ? 16 : 0;   // 0: the 16 bytes are zero-filled
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" : : "r"(d), "l"(src), "r"(n));
+#else
+    *(int4 *) dst = valid ? *(const int4 *) src : make_int4(0, 0, 0, 0);
+#endif
+}
+
+static __device__ __forceinline__ void escha_pf_cp_async_commit() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+
+template <int n>
+static __device__ __forceinline__ void escha_pf_cp_async_wait() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" : : "n"(n));
+#endif
+}
+
 // grid: [items][size_n/128] in one dimension, 128 threads = 4 warps = 4 column groups of 32 columns
-template <int bits>
-static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
+template <int bits, int RF>
+static __global__ void __launch_bounds__(128, RF == 4 ? 2 : 4) escha_moe_prefill_kernel(
         const half     * __restrict__ xh,
         const uint16_t * __restrict__ B_all,
         const half     * __restrict__ rout_all,
@@ -107,8 +140,8 @@ static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
     constexpr int WNT  = ESCHA_PF_WNT;
     constexpr int PF   = ESCHA_PF_PF;
     constexpr int FOLD = ESCHA_PF_FOLD;
-    constexpr int RF   = ESCHA_PF_RF;
-    constexpr int ROWS = ESCHA_PF_ROWS;
+    constexpr int AST  = ESCHA_PF_AST;
+    constexpr int ROWS = 16*RF;
     constexpr int G    = 4;
     constexpr int cb   = 1;   // mcg
 
@@ -118,6 +151,8 @@ static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
     constexpr int LSTRIDE = TWO_PER_LOAD ? 2*TWORDS : TWORDS;    // uint32 per load (lanes < LSTRIDE load)
     static_assert(bits == 2 || bits == 3, "2 and 3 bpw only");
     static_assert(G*WNT*16 == 128, "a block has one Hadamard block of the output");
+    static_assert(RF == 2 || RF == 4, "2 or 4 row fragments");
+    static_assert(2*ROWS <= 32*G, "one 16-byte copy per thread per A slice");
 
     const int n_cb = size_n/128;
     const int item = blockIdx.x/n_cb;
@@ -137,6 +172,7 @@ static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
 
     const int warp = threadIdx.x/32;   // column group
     const int lane = threadIdx.x%32;
+    const int g    = lane >> 2;
 
     const int ntiles  = size_n/16;
     const int kslices = size_k/16;
@@ -144,22 +180,14 @@ static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
 
     const uint32_t * B32 = (const uint32_t *) B;
     const size_t slice_stride = (size_t) ntiles*TWORDS;   // uint32 per k-slice row
-    const half2 * A2 = (const half2 *) xh;
     const half2 hzero = __half2half2(__ushort_as_half(0));
 
-    // A rows of this lane: fragment rf has rows rf*16 + lane/4 (MMA a0 / a2) and rf*16 + lane/4 + 8 (a1 / a3)
-    const int g = lane >> 2;
-    int  a_row[RF][2];
-    bool a_ok[RF][2];
-#pragma unroll
-    for (int rf = 0; rf < RF; ++rf) {
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int r = rf*16 + g + 8*h;
-            a_ok[rf][h]  = r < size_m;
-            a_row[rf][h] = a_ok[rf][h] ? ids_dst[r_s + r] : 0;
-        }
-    }
+    // A copies: thread t < 2*ROWS copies 16 bytes (8 k values) of row t/2 for each k-slice; rows past size_m are zeros
+    const bool   cp_on  = threadIdx.x < 2*ROWS;
+    const int    cp_row = threadIdx.x/2;
+    const int    cp_h   = threadIdx.x%2;
+    const bool   cp_ok  = cp_on && cp_row < size_m;
+    const half * cp_src = xh + (cp_ok ? (size_t) ids_dst[r_s + cp_row]*size_k : 0) + cp_h*8;
 
     // per-lane extraction constants (as escha_gemv_kernel)
     int x_src_a = 0, x_src_b = 0;
@@ -181,6 +209,13 @@ static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
 
     // the running row sums over the splits, in split order (the GEMV's sum = 0 + sh_red[0] + ... + sh_red[S-1])
     __shared__ __align__(16) float sh_sum[ROWS][128];
+    // the A ring: PF k-slices of ROWS rows x 16 k
+    __shared__ __align__(16) half  sh_a[PF][ROWS][AST];
+
+    // ldmatrix x4 address of this lane in a 16-row fragment: matrices (rows 0-7, k 0-7), (rows 8-15, k 0-7),
+    // (rows 0-7, k 8-15), (rows 8-15, k 8-15) = the m16n8k16 A registers a0, a1, a2, a3
+    const int lm_row = (lane & 7) + ((lane >> 3) & 1)*8;
+    const int lm_col = (lane >> 4)*8;
 
     const int group = bx*G + warp;
     const int c0    = warp*WNT*16 + 2*(lane & 3);   // first column of this lane in the block's 128
@@ -188,6 +223,20 @@ static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
     for (int ksp = 0; ksp < S; ++ksp) {
         const int ks0 = ksp*chunk;
         const int myn = max(0, min(chunk, kslices - ks0));
+
+        // every warp is done with the A ring of the last split
+        __syncthreads();
+
+        auto a_issue = [&](const int i, const int slot) {
+            if (cp_on && i < myn) {
+                escha_pf_cp_async_16(&sh_a[slot][cp_row][cp_h*8], cp_ok ? cp_src + (size_t) (ks0 + i)*16 : xh, cp_ok);
+            }
+            escha_pf_cp_async_commit();
+        };
+#pragma unroll
+        for (int d = 0; d < PF - 1; ++d) {
+            a_issue(d, d);
+        }
 
         const uint32_t * bp = B32 + (size_t) ks0*slice_stride + group*WNT*TWORDS + lane;
         auto ld_b = [&] (int i, int l) -> uint32_t {
@@ -232,6 +281,11 @@ static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
                     break;
                 }
 
+                // A slice i (slot d) has landed for every thread; every warp is done with slice i - 1 (slot d - 1)
+                escha_pf_cp_async_wait<PF - 2>();
+                __syncthreads();
+                a_issue(i + PF - 1, (d + PF - 1)%PF);
+
                 uint32_t bw[LOADS];
 #pragma unroll
                 for (int l = 0; l < LOADS; ++l) {
@@ -261,16 +315,18 @@ static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
                     }
                 }
 
-                // A fragments: lane covers rows g and g + 8 of each fragment, k pairs (2(lane%4), +1) and (+8, +9)
-                const size_t a_col = (size_t) (ks0 + i)*8 + (lane & 3);
 #pragma unroll
                 for (int rf = 0; rf < RF; ++rf) {
                     if (rf < n_rf) {
+                        uint32_t a[4];
+                        const unsigned int addr = (unsigned int) __cvta_generic_to_shared(&sh_a[d][rf*16 + lm_row][lm_col]);
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                            : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
                         FragB a01, a23;
-                        a01[0] = a_ok[rf][0] ? A2[(size_t) a_row[rf][0]*(size_k/2) + a_col]     : hzero;
-                        a01[1] = a_ok[rf][1] ? A2[(size_t) a_row[rf][1]*(size_k/2) + a_col]     : hzero;
-                        a23[0] = a_ok[rf][0] ? A2[(size_t) a_row[rf][0]*(size_k/2) + a_col + 4] : hzero;
-                        a23[1] = a_ok[rf][1] ? A2[(size_t) a_row[rf][1]*(size_k/2) + a_col + 4] : hzero;
+                        a01[0] = *(const half2 *) &a[0];
+                        a01[1] = *(const half2 *) &a[1];
+                        a23[0] = *(const half2 *) &a[2];
+                        a23[1] = *(const half2 *) &a[3];
 #pragma unroll
                         for (int t = 0; t < WNT; ++t) {
                             exl3_gemv_ns::mma_ab_h(a01, a23, fb[t][0], ch[rf][t][0]);
@@ -298,8 +354,9 @@ static __global__ void __launch_bounds__(128, 3) escha_moe_prefill_kernel(
                 }
             }
         }
+        escha_pf_cp_async_wait<0>();
 
-        // add this split's partial to the row sums (a lane owns its elements: no barrier between the splits)
+        // add this split's partial to the row sums (a lane owns its elements)
 #pragma unroll
         for (int rf = 0; rf < RF; ++rf) {
             if (rf < n_rf) {
@@ -345,6 +402,13 @@ static bool escha_prefill_enabled() {
     return e == nullptr || atoi(e) != 0;
 }
 
+// GGML_ESCHA_MOE_PREFILL_MIN=n: batches of fewer than n tokens stay on the GEMV path (more warps per row there).
+// Read at every call (tests). Default: see ggml_cuda_escha_moe_prefill.
+static int escha_prefill_min_tokens(const int def) {
+    const char * e = getenv("GGML_ESCHA_MOE_PREFILL_MIN");
+    return e != nullptr ? atoi(e) : def;
+}
+
 bool ggml_cuda_escha_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * code = dst->src[0];
     const ggml_tensor * rin  = dst->src[1];
@@ -362,7 +426,8 @@ bool ggml_cuda_escha_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int n_rows   = n_ids*n_tokens;
     const int n_x      = x->ne[1];
 
-    if (!escha_prefill_enabled() || n_tokens <= 8 || (K != 2 && K != 3) || IC%128 != 0 || OC%128 != 0) {
+    if (!escha_prefill_enabled() || n_tokens <= 8 || n_tokens < escha_prefill_min_tokens(9) ||
+            (K != 2 && K != 3) || IC%128 != 0 || OC%128 != 0) {
         return false;
     }
     // the GEMV environment switches keep their meaning: GGML_ESCHA_MOE_GEMV=0 means the block kernels for every batch
@@ -394,12 +459,15 @@ bool ggml_cuda_escha_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * 
         n_expert, n_tokens, n_ids, n_x, (int) (ids->nb[1]/ggml_element_size(ids)), 1, /*write_inverse =*/ false, stream);
     CUDA_CHECK(cudaGetLastError());
 
+    const int rf   = escha_prefill_rf();
+    const int rows = 16*rf;
+
     // an expert can end with a part chunk, so the item count has a bound only
-    const int n_items = (n_rows + ESCHA_PF_ROWS - 1)/ESCHA_PF_ROWS + n_expert;
+    const int n_items = (n_rows + rows - 1)/rows + n_expert;
     ggml_cuda_pool_alloc<int4>    work(ctx.pool(), n_items);
     ggml_cuda_pool_alloc<int32_t> n_work(ctx.pool(), 1);
     CUDA_CHECK(cudaMemsetAsync(n_work.get(), 0, sizeof(int32_t), stream));
-    escha_prefill_build_work<<<1, 256, 0, stream>>>(bounds.get(), work.get(), n_work.get(), n_expert);
+    escha_prefill_build_work<<<1, 256, 0, stream>>>(bounds.get(), work.get(), n_work.get(), n_expert, rows);
     CUDA_CHECK(cudaGetLastError());
 
     auto launch = [&](auto kernel) {
@@ -408,9 +476,9 @@ bool ggml_cuda_escha_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * 
             IC, OC, n_ids, dst->nb[1], dst->nb[2], ids_dst.get(), work.get(), n_work.get());
     };
     if (K == 2) {
-        launch(escha_moe_prefill_kernel<2>);
+        if (rf == 4) { launch(escha_moe_prefill_kernel<2, 4>); } else { launch(escha_moe_prefill_kernel<2, 2>); }
     } else {
-        launch(escha_moe_prefill_kernel<3>);
+        if (rf == 4) { launch(escha_moe_prefill_kernel<3, 4>); } else { launch(escha_moe_prefill_kernel<3, 2>); }
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
