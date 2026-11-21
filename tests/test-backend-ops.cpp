@@ -7351,6 +7351,12 @@ struct test_flash_attn_ext_banded_large : public test_flash_attn_ext_banded_sink
             ggml_type kv_type, int sinks, float q_range)
         : test_flash_attn_ext_banded_sinks(d, n_head, n_head_kv, n_q, n_kv, rel_extent, 1, kv_type, GGML_TYPE_F32, sinks), q_range(q_range) {}
 
+    // q4_0 K: the CUDA dot subtracts 8 x the fp32 sum of Q per block (q8_1), the CPU dot 8 x the sum of the quantized Q
+    // (q8_0); with logits of +-30 that difference alone moves the softmax by about 1e-3 NMSE (q8_0 and f16 K: no such term)
+    double max_nmse_err() override {
+        return kv_type == GGML_TYPE_Q4_0 ? 2e-3 : test_flash_attn_ext_banded_sinks::max_nmse_err();
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         test_flash_attn_ext_banded_sinks::initialize_tensors(ctx);
         init_tensor_uniform(ggml_get_tensor(ctx, "q"), -q_range, q_range);

@@ -13,6 +13,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "fattn-banded.cuh"
+#include "fattn-banded-dec.cuh"
 #include "fattn.cuh"
 #include "fattn-mma-f16.cuh"
 
@@ -966,9 +967,10 @@ static __global__ void flash_attn_ext_banded_mma(
 #endif // FATTN_BANDED_MMA_AVAILABLE
 }
 
-// Unsloth's decode kernels below take n_tok <= 32 until the decode kernel (fattn-banded-dec.cu) replaces that branch of
-// ggml_cuda_flash_attn_ext_banded; quantized K/V with n_tok <= 32 is reported unsupported until then.
-static constexpr int64_t fattn_banded_dec_max_q = 32;
+// n_tok <= 32 (decode, verify batches) with f16 / q8_0 / q4_0 K/V is the decode kernel's (fattn-banded-dec.cu). Unsloth's
+// small-batch kernels below keep n_tok <= 32 with f32 / bf16 K/V, and f16 when the decode kernel is switched off
+// (GGML_CUDA_BANDED_DEC=0); quantized K/V with n_tok <= 32 is then unsupported.
+static constexpr int64_t fattn_banded_dec_max_q = GGML_CUDA_BANDED_DEC_MAX_Q;
 
 static bool fattn_banded_type_supported(ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
@@ -986,6 +988,10 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
 #else
     if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
         return false;
+    }
+    // 1-32 query rows with f16 / q8_0 / q4_0 K/V: the decode kernel
+    if (ggml_cuda_flash_attn_ext_banded_dec_supported(device, dst)) {
+        return true;
     }
 
     const ggml_tensor * q   = dst->src[0];
@@ -1373,8 +1379,11 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
         }
     }
 
-    if (q->ne[1] <= fattn_banded_dec_max_q) {
-        // decode (n_tok <= 32): replaced by the decode kernel (ggml_cuda_flash_attn_ext_banded_dec) at the merge
+    if (ggml_cuda_flash_attn_ext_banded_dec_supported(ctx.device, dst)) {
+        // decode and verify batches (n_tok <= 32) with f16 / q8_0 / q4_0 K/V
+        ggml_cuda_flash_attn_ext_banded_dec(ctx, dst);
+    } else if (q->ne[1] <= fattn_banded_dec_max_q) {
+        // n_tok <= 32 with f32 / bf16 K/V (or the decode kernel switched off): Unsloth's small-batch kernels
         if (sinks && fattn_banded_mma_usable(ctx.device, dst)) {
             fattn_banded_mma_launch(ctx, dst, scale, rel_extent);
         } else {
