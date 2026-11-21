@@ -1099,6 +1099,8 @@ static bool fattn_banded_kv_type_native(ggml_type type) {
     return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0;
 }
 
+static bool fattn_banded_mma_usable(const int device, const ggml_tensor * dst);
+
 bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * dst) {
 #if defined(GGML_USE_MUSA)
     GGML_UNUSED(device);
@@ -1522,6 +1524,27 @@ static int64_t fattn_banded_tier_stage_min_q() {
     return q;
 }
 
+// The band bias from its factors for a chunk of queries: rel[d + extent*(h + H*iq)] = sum over c = 0 .. d_rel-1 of
+// table[c, d] * rcur[c, h, iq0 + iq] as one fp32 fma chain in c order (the decode kernel computes the same chain, so a
+// query's bias has the same bits in both kernels). F16 tables are read as their exact fp32 values.
+template <typename T_table>
+static __global__ void fattn_banded_rel_from_factors(
+        const T_table * __restrict__ table, const float * __restrict__ rcur, float * __restrict__ rel,
+        const int64_t d_rel, const int64_t extent, const int64_t n_rows) {
+    const int64_t d   = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t row = blockIdx.y;   // h + H*iq of the chunk
+    if (d >= extent || row >= n_rows) {
+        return;
+    }
+    const T_table * t = table + d*d_rel;
+    const float   * r = rcur  + row*d_rel;
+    float sum = 0.0f;
+    for (int64_t c = 0; c < d_rel; ++c) {
+        sum = fmaf(ggml_cuda_cast<float>(t[c]), r[c], sum);
+    }
+    rel[row*extent + d] = sum;
+}
+
 // GGML_CUDA_BANDED_REL_CHUNK=n: queries per chunk when the band bias comes from its factors (default 256, rounded down
 // to a multiple of 64, at least 64)
 static int64_t fattn_banded_rel_chunk() {
@@ -1534,8 +1557,8 @@ static int64_t fattn_banded_rel_chunk() {
 }
 
 // The band bias from its factors (ggml_flash_attn_ext_banded_set_rel_factors): rel(d, h, q) = sum_c table[c, d] *
-// rcur[c, h, q]. Per chunk of queries the bias is built in pool scratch ([rel_extent, n_head, chunk] fp32, one fp32 GEMM
-// with k = d_rel), then the tensor-core kernel runs on that chunk with the whole op's tail rule (query offset) and the
+// rcur[c, h, q]. Per chunk of queries the bias is built in pool scratch ([rel_extent, n_head, chunk] fp32,
+// fattn_banded_rel_from_factors), then the tensor-core kernel runs on that chunk with the whole op's tail rule (query offset) and the
 // chunk's slices of the mask, sinks and positions. The [rel_extent, n_head, n_tok] tensor is never materialised.
 static void fattn_banded_factored_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale) {
     const ggml_tensor * q     = dst->src[0];
@@ -1554,32 +1577,20 @@ static void fattn_banded_factored_launch(ggml_backend_cuda_context & ctx, ggml_t
     const int64_t n_kv   = k->ne[1];
     const int64_t chunk  = std::min(n_q, fattn_banded_rel_chunk());
 
-    const float * T = (const float *) table->data;
-    ggml_cuda_pool_alloc<float> t32(ctx.pool());
-    if (table->type == GGML_TYPE_F16) {
-        t32.alloc(d_rel*extent);
-        ggml_get_to_fp32_cuda(GGML_TYPE_F16)(table->data, t32.get(), d_rel*extent, stream);
-        T = t32.get();
-    }
     ggml_cuda_pool_alloc<float> relc(ctx.pool(), extent*H*chunk);
-
-    cublasHandle_t handle = ctx.cublas_handle();
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
-    const float one  = 1.0f;
-    const float zero = 0.0f;
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    const auto compute_type = CUBLAS_COMPUTE_32F;
-#else
-    const auto compute_type = CUBLAS_COMPUTE_32F_PEDANTIC;   // fp32 products and sums, no TF32
-#endif
 
     for (int64_t iq0 = 0; iq0 < n_q; iq0 += chunk) {
         const int64_t nc = std::min(chunk, n_q - iq0);
 
-        // relc[d + extent*(h + H*iq)] = sum_c T[c + d_rel*d] * rcur[c + d_rel*(h + H*(iq0 + iq))]
-        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) extent, (int) (H*nc), (int) d_rel, &one,
-            T, CUDA_R_32F, (int) d_rel, (const float *) rcur->data + iq0*H*d_rel, CUDA_R_32F, (int) d_rel, &zero,
-            relc.get(), CUDA_R_32F, (int) extent, compute_type, CUBLAS_GEMM_DEFAULT));
+        // relc[d + extent*(h + H*iq)] = sum_c table[c + d_rel*d] * rcur[c + d_rel*(h + H*(iq0 + iq))]
+        const dim3 rb((extent + 127)/128, H*nc, 1);
+        const float * rc = (const float *) rcur->data + iq0*H*d_rel;
+        if (table->type == GGML_TYPE_F16) {
+            fattn_banded_rel_from_factors<half><<<rb, 128, 0, stream>>>((const half *) table->data, rc, relc.get(), d_rel, extent, H*nc);
+        } else {
+            fattn_banded_rel_from_factors<float><<<rb, 128, 0, stream>>>((const float *) table->data, rc, relc.get(), d_rel, extent, H*nc);
+        }
+        CUDA_CHECK(cudaGetLastError());
 
         ggml_tensor q_c = *q;
         q_c.ne[1] = nc;
