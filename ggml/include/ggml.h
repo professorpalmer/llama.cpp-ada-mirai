@@ -595,6 +595,7 @@ extern "C" {
         GGML_OP_ESCHA_MUL_MAT,
         GGML_OP_L2_CLIP,
         GGML_OP_INKLING_CONV,
+        GGML_OP_INKLING_MIX,
 
         GGML_OP_UNARY,
 
@@ -2418,6 +2419,19 @@ extern "C" {
             struct ggml_tensor  * past,
             struct ggml_tensor  * w,
             struct ggml_tensor  * dyn,
+            float                 scale);
+
+    // Inkling 2 depth mix in one op (the chain concat, rms_norm, repeat, mul_mat, soft_max_ext, cont(transpose), mul_mat):
+    //   r_i = rms_norm(states[i]) per token (eps), p[:, q] = softmax_i(scale * r_i . query[:, q]), out[:, q] = sum_i p[i, q] * r_i
+    //   states: n tensors [E, T] F32 (contiguous rows), in the order of the chain's concat; query: [E, nq] F32
+    //   result: [E, nq, T]
+#define GGML_INKLING_MIX_MAX_STATES 9
+    GGML_API struct ggml_tensor * ggml_inkling_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor ** states,
+            int                   n,
+            struct ggml_tensor  * query,
+            float                 eps,
             float                 scale);
 
     // Fill tensor a with constant c

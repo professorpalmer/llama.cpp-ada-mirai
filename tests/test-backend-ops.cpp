@@ -2224,6 +2224,70 @@ struct test_glu_split : public test_case {
     }
 };
 
+// GGML_OP_INKLING_MIX (Inkling 2 depth mix): n states [E, T] (one a view with a row stride when v = 1), query [E, nq].
+// mode 0: the op. mode 1: op - (the chain of mix()) + 1. mode 2: batch invariance: token 0 of the batch against token 0 alone
+struct test_inkling_mix : public test_case {
+    const int64_t E, T;
+    const int n, nq, v, mode;
+
+    std::string vars() override {
+        return VARS_TO_STR6(E, T, n, nq, v, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_MIX";
+    }
+
+    // the chain and invariance modes compare the final output only (their inner nodes are differences near 0)
+    bool run_whole_graph() override { return mode != 0; }
+
+    double max_nmse_err() override {
+        return mode == 2 ? 0.0 : 1e-6;
+    }
+
+    test_inkling_mix(int64_t E = 2304, int64_t T = 1, int n = 3, int nq = 1, int v = 0, int mode = 0)
+        : E(E), T(T), n(n), nq(nq), v(v), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        std::vector<ggml_tensor *> st(n);
+        for (int i = 0; i < n; ++i) {
+            if (v && i == n - 1) {
+                ggml_tensor * big = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E + 64, T);
+                st[i] = ggml_view_2d(ctx, big, E, T, big->nb[1], 0);
+            } else {
+                st[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+            }
+        }
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, nq);
+        const float scale = 1.0f/sqrtf((float) E);
+
+        ggml_tensor * out = ggml_inkling_mix(ctx, st.data(), n, query, 1e-6f, scale);
+        if (mode == 1) {
+            // mix(): states = concat(block, states) for the blocks; here the op's order is the chain's final order
+            ggml_tensor * states = ggml_reshape_3d(ctx, ggml_cont(ctx, st[n - 1]), E, 1, T);
+            for (int i = n - 2; i >= 0; --i) {
+                states = ggml_concat(ctx, ggml_reshape_3d(ctx, st[i], E, 1, T), states, 1);
+            }
+            states = ggml_rms_norm(ctx, states, 1e-6f);
+            ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, nq, T));
+            ggml_tensor * scores = ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, states, queries), nullptr, scale, 0.0f);
+            ggml_tensor * ref = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, out, ref), 1.0f, 1.0f);
+        } else if (mode == 2) {
+            std::vector<ggml_tensor *> s0(n);
+            for (int i = 0; i < n; ++i) {
+                s0[i] = ggml_view_2d(ctx, st[i], E, 1, st[i]->nb[1], 0);
+            }
+            ggml_tensor * alone = ggml_inkling_mix(ctx, s0.data(), n, query, 1e-6f, scale);
+            ggml_tensor * all0  = ggml_view_3d(ctx, out, E, nq, 1, out->nb[1], out->nb[2], 0);
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, ggml_cont(ctx, all0), alone), 1.0f, 1.0f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_INKLING_CONV (Inkling 2 short conv): cur [C, T, S] (a view of a wider tensor when v = 1), past [3, C, S] as a
 // view of a history tensor with other channels (as the graph has it), weights [4, C], dynamic taps or none.
 // mode 0: the op. mode 1: against the chain concat, ssm_conv, taps (mul, add), add, scale and the history view, + 1.
@@ -9052,6 +9116,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_l2_clip({ 16, 24, t}, true,  4.0f, 1, 2));
     }
 
+    // INKLING_MIX: 1 to 9 states, 1 and 3 queries; decode 1 and 8 tokens, prefill 512; a view; chain; invariance
+    for (int64_t t : {1, 8, 512}) {
+        for (int mode : {0, 1}) {
+            test_cases.emplace_back(new test_inkling_mix(2304, t, 1, 1, 0, mode));
+            test_cases.emplace_back(new test_inkling_mix(2304, t, 3, 1, 1, mode));
+            test_cases.emplace_back(new test_inkling_mix(2304, t, 6, 3, 0, mode));
+            test_cases.emplace_back(new test_inkling_mix(2304, t, 9, 1, 0, mode));
+        }
+    }
+    test_cases.emplace_back(new test_inkling_mix(2304, 8, 5, 3, 1, 2));
+    test_cases.emplace_back(new test_inkling_mix(2304, 512, 3, 1, 0, 2));
+
     // INKLING_CONV: K / V (1024 channels, 8 heads of dynamic taps on the global layers, none on the others), attention
     // output and MLP output (2304); decode 1 and 8 tokens, prefill 512; 1 and 2 sequences; views; chain; invariance
     for (int64_t t : {1, 8, 512}) {
@@ -11192,6 +11268,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // MoE combine: (experts x expert scale) x router weights, 8-way sum
     for (int n : {1, 512}) {
         test_cases.emplace_back(new test_moe_weighted_reduction(2304, 8, n, false, true));
+    }
+    // INKLING_MIX at 3 and 6 states, 1 and 512 tokens
+    for (int64_t t : {1, 512}) {
+        test_cases.emplace_back(new test_inkling_mix(2304, t, 3, 1, 0, 0));
+        test_cases.emplace_back(new test_inkling_mix(2304, t, 6, 3, 0, 0));
     }
     // INKLING_CONV at the MLP output shape, 1 and 512 tokens
     for (int64_t t : {1, 512}) {

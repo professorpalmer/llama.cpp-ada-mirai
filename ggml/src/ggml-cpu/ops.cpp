@@ -2401,6 +2401,70 @@ void ggml_compute_forward_inkling_conv(const ggml_compute_params * params, ggml_
     }
 }
 
+// ggml_compute_forward_inkling_mix
+// the steps of the chain: rms_norm of each state (ggml_float sum), dots, soft_max with the scale, the weighted sum
+
+void ggml_compute_forward_inkling_mix(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * query = dst->src[0];
+    const int   n     = ggml_get_op_params_i32(dst, 0);
+    const float eps   = ggml_get_op_params_f32(dst, 1);
+    const float scale = ggml_get_op_params_f32(dst, 2);
+
+    const int64_t E  = query->ne[0];
+    const int64_t nq = query->ne[1];
+    const int64_t T  = dst->ne[2];
+
+    const int64_t dt  = (T + params->nth - 1)/params->nth;
+    const int64_t it0 = dt*params->ith;
+    const int64_t it1 = MIN(it0 + dt, T);
+
+    std::vector<float> r((size_t) n*E);
+    std::vector<float> p((size_t) n);
+
+    for (int64_t t = it0; t < it1; ++t) {
+        for (int i = 0; i < n; ++i) {
+            const ggml_tensor * s = dst->src[1 + i];
+            const float * x = (const float *) ((const char *) s->data + t*s->nb[1]);
+            ggml_float sum = 0.0;
+            for (int64_t e = 0; e < E; ++e) {
+                sum += (ggml_float) (x[e]*x[e]);
+            }
+            const float mean = sum/E;
+            const float rs   = 1.0f/sqrtf(mean + eps);
+            for (int64_t e = 0; e < E; ++e) {
+                r[(size_t) i*E + e] = x[e]*rs;
+            }
+        }
+        for (int64_t q = 0; q < nq; ++q) {
+            const float * qv = (const float *) query->data + q*E;
+            float m = -INFINITY;
+            for (int i = 0; i < n; ++i) {
+                float d = 0.0f;
+                ggml_vec_dot_f32((int) E, &d, 0, &r[(size_t) i*E], 0, qv, 0, 1);
+                p[i] = d*scale;
+                m = MAX(m, p[i]);
+            }
+            ggml_float sum = 0.0;
+            for (int i = 0; i < n; ++i) {
+                p[i] = expf(p[i] - m);
+                sum += p[i];
+            }
+            const float inv = 1.0/sum;
+            for (int i = 0; i < n; ++i) {
+                p[i] *= inv;
+            }
+            float * y = (float *) ((char *) dst->data + t*dst->nb[2] + q*dst->nb[1]);
+            for (int64_t e = 0; e < E; ++e) {
+                float acc = 0.0f;
+                for (int i = 0; i < n; ++i) {
+                    acc += r[(size_t) i*E + e]*p[i];
+                }
+                y[e] = acc;
+            }
+        }
+    }
+}
+
 // ggml_compute_tri
 
 static void ggml_compute_forward_tri_f32(const ggml_compute_params * params, ggml_tensor * dst) {

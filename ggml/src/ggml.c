@@ -1139,6 +1139,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ESCHA_MUL_MAT",
     "L2_CLIP",
     "INKLING_CONV",
+    "INKLING_MIX",
 
     "UNARY",
 
@@ -1156,7 +1157,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1261,6 +1262,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "escha_mul_mat(code, x)",
     "l2_clip(x)",
     "inkling_conv(cur, past, w)",
+    "inkling_mix(states, query)",
 
     "unary(x)",
 
@@ -1278,7 +1280,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5458,6 +5460,40 @@ struct ggml_tensor * ggml_inkling_conv(
     result->src[1] = past;
     result->src[2] = w;
     result->src[3] = dyn;
+
+    return result;
+}
+
+// ggml_inkling_mix
+
+struct ggml_tensor * ggml_inkling_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor ** states,
+        int                   n,
+        struct ggml_tensor  * query,
+        float                 eps,
+        float                 scale) {
+    GGML_ASSERT(n >= 1 && n <= GGML_INKLING_MIX_MAX_STATES && n + 1 <= GGML_MAX_SRC);
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && ggml_is_contiguous(query) && query->ne[2] == 1 && query->ne[3] == 1);
+
+    const int64_t E = query->ne[0];
+    const int64_t T = states[0]->ne[1];
+    for (int i = 0; i < n; ++i) {
+        GGML_ASSERT(states[i]->type == GGML_TYPE_F32 && states[i]->nb[0] == sizeof(float));
+        GGML_ASSERT(states[i]->ne[0] == E && states[i]->ne[1] == T && states[i]->ne[2] == 1 && states[i]->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, query->ne[1], T);
+
+    ggml_set_op_params_i32(result, 0, n);
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_f32(result, 2, scale);
+
+    result->op     = GGML_OP_INKLING_MIX;
+    result->src[0] = query;
+    for (int i = 0; i < n; ++i) {
+        result->src[1 + i] = states[i];
+    }
 
     return result;
 }
