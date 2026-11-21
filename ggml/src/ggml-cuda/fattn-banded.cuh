@@ -23,6 +23,26 @@ static inline bool fattn_banded_kv_pair_ok(const ggml_type tk, const ggml_type t
                     : (tk == GGML_TYPE_Q8_0 && tv == GGML_TYPE_Q4_0);
 }
 
+// The band bias from its factors (ggml_flash_attn_ext_banded_set_rel_factors), one definition for every banded kernel:
+// sum over c = 0 .. d_rel-1 of table[c, d] * rcur_row[c] as one fp32 fma chain in c order from 0.0f. table: the F32 or
+// F16 table [d_rel, rel_extent] (t_nb1 bytes per distance d), an F16 value read as its exact fp32 value; rcur_row: the
+// d_rel factors of one (head, query).
+static __device__ __forceinline__ float fattn_banded_rel_bias(const char * table, const int table_type, const int64_t t_nb1,
+        const float * rcur_row, const int d_rel, const int d) {
+    const char * t = table + d*t_nb1;
+    float sum = 0.0f;
+    if (table_type == GGML_TYPE_F16) {
+        for (int c = 0; c < d_rel; ++c) {
+            sum = fmaf(__half2float(((const half *) t)[c]), rcur_row[c], sum);
+        }
+    } else {
+        for (int c = 0; c < d_rel; ++c) {
+            sum = fmaf(((const float *) t)[c], rcur_row[c], sum);
+        }
+    }
+    return sum;
+}
+
 static __device__ __forceinline__ bool fattn_banded_visible(const int pq, const int pk, const int window, int & dist) {
     dist = pq - pk;
     return pk >= 0 && (window <= 0 || (dist >= 0 && dist < window));

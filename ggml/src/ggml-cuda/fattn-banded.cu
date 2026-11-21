@@ -1524,25 +1524,17 @@ static int64_t fattn_banded_tier_stage_min_q() {
     return q;
 }
 
-// The band bias from its factors for a chunk of queries: rel[d + extent*(h + H*iq)] = sum over c = 0 .. d_rel-1 of
-// table[c, d] * rcur[c, h, iq0 + iq] as one fp32 fma chain in c order (the decode kernel computes the same chain, so a
-// query's bias has the same bits in both kernels). F16 tables are read as their exact fp32 values.
-template <typename T_table>
+// The band bias from its factors for a chunk of queries: rel[d + extent*(h + H*iq)] = fattn_banded_rel_bias (the same
+// function as the decode kernel's in-kernel bias, so a query's bias has the same bits in both kernels).
 static __global__ void fattn_banded_rel_from_factors(
-        const T_table * __restrict__ table, const float * __restrict__ rcur, float * __restrict__ rel,
-        const int64_t d_rel, const int64_t extent, const int64_t n_rows) {
+        const char * __restrict__ table, const int table_type, const int64_t t_nb1, const float * __restrict__ rcur,
+        float * __restrict__ rel, const int d_rel, const int64_t extent, const int64_t n_rows) {
     const int64_t d   = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     const int64_t row = blockIdx.y;   // h + H*iq of the chunk
     if (d >= extent || row >= n_rows) {
         return;
     }
-    const T_table * t = table + d*d_rel;
-    const float   * r = rcur  + row*d_rel;
-    float sum = 0.0f;
-    for (int64_t c = 0; c < d_rel; ++c) {
-        sum = fmaf(ggml_cuda_cast<float>(t[c]), r[c], sum);
-    }
-    rel[row*extent + d] = sum;
+    rel[row*extent + d] = fattn_banded_rel_bias(table, table_type, t_nb1, rcur + row*d_rel, d_rel, (int) d);
 }
 
 // GGML_CUDA_BANDED_REL_CHUNK=n: queries per chunk when the band bias comes from its factors (default 256, rounded down
@@ -1585,11 +1577,8 @@ static void fattn_banded_factored_launch(ggml_backend_cuda_context & ctx, ggml_t
         // relc[d + extent*(h + H*iq)] = sum_c table[c + d_rel*d] * rcur[c + d_rel*(h + H*(iq0 + iq))]
         const dim3 rb((extent + 127)/128, H*nc, 1);
         const float * rc = (const float *) rcur->data + iq0*H*d_rel;
-        if (table->type == GGML_TYPE_F16) {
-            fattn_banded_rel_from_factors<half><<<rb, 128, 0, stream>>>((const half *) table->data, rc, relc.get(), d_rel, extent, H*nc);
-        } else {
-            fattn_banded_rel_from_factors<float><<<rb, 128, 0, stream>>>((const float *) table->data, rc, relc.get(), d_rel, extent, H*nc);
-        }
+        fattn_banded_rel_from_factors<<<rb, 128, 0, stream>>>((const char *) table->data, (int) table->type, table->nb[1], rc,
+            relc.get(), (int) d_rel, extent, H*nc);
         CUDA_CHECK(cudaGetLastError());
 
         ggml_tensor q_c = *q;
