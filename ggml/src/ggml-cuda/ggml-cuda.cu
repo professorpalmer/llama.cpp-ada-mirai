@@ -72,6 +72,10 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/l2clip.cuh"
+#include "ggml-cuda/inkling-conv.cuh"
+#include "ggml-cuda/inkling-mix.cuh"
+#include "ggml-cuda/inkling-loop-gate.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #ifndef GGML_CUDA_NO_MIRAI
 #include "ggml-cuda/mirai-s.cuh"
@@ -3660,6 +3664,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
+            break;
+        case GGML_OP_L2_CLIP:
+            ggml_cuda_op_l2_clip(ctx, dst);
+            break;
+        case GGML_OP_INKLING_CONV:
+            ggml_cuda_op_inkling_conv(ctx, dst);
+            break;
+        case GGML_OP_INKLING_MIX:
+            ggml_cuda_op_inkling_mix(ctx, dst);
+            break;
+        case GGML_OP_INKLING_LOOP_GATE:
+            ggml_cuda_op_inkling_loop_gate(ctx, dst);
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
@@ -7653,7 +7669,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:
+        case GGML_OP_L2_CLIP:
+        case GGML_OP_INKLING_CONV:
         case GGML_OP_CUMSUM:
+            return true;
+        case GGML_OP_INKLING_MIX:
+            return op->src[0]->ne[1] <= 4;
+        case GGML_OP_INKLING_LOOP_GATE:
+            return op->src[2]->ne[1] <= 1024;
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:

@@ -2224,6 +2224,305 @@ struct test_glu_split : public test_case {
     }
 };
 
+// GGML_OP_INKLING_LOOP_GATE (Inkling 2 loop controller): cur, msg [E, T] (msg a view when v = 1), down [2E, R],
+// gain / forget [R, E], F16 or F32. mode 0: the op. mode 1: op - (the chain of control()) + 1. mode 2: batch invariance
+struct test_inkling_loop_gate : public test_case {
+    const ggml_type type;
+    const int64_t E, R, T;
+    const int v, mode;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, E, R, T, v, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_LOOP_GATE";
+    }
+
+    bool run_whole_graph() override { return mode != 0; }
+
+    double max_nmse_err() override {
+        return mode == 2 ? 0.0 : 5e-6;
+    }
+
+    test_inkling_loop_gate(ggml_type type = GGML_TYPE_F16, int64_t E = 2304, int64_t R = 64, int64_t T = 1, int v = 0, int mode = 0)
+        : type(type), E(E), R(R), T(T), v(v), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+        ggml_tensor * msg;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E + 32, T);
+            msg = ggml_view_2d(ctx, big, E, T, big->nb[1], 0);
+        } else {
+            msg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+        }
+        ggml_tensor * down   = ggml_new_tensor_2d(ctx, type, 2*E, R);
+        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, type, R, E);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, type, R, E);
+
+        ggml_tensor * out = ggml_inkling_loop_gate(ctx, cur, msg, down, gain, forget, 1e-6f);
+        if (mode == 1) {
+            ggml_tensor * h = ggml_concat(ctx, ggml_reshape_3d(ctx, cur, E, 1, T), ggml_reshape_3d(ctx, ggml_cont(ctx, msg), E, 1, T), 1);
+            h = ggml_reshape_2d(ctx, ggml_rms_norm(ctx, h, 1e-6f), 2*E, T);
+            h = ggml_mul_mat(ctx, down, h);
+            ggml_tensor * g = ggml_tanh(ctx, ggml_mul_mat(ctx, gain, h));
+            ggml_tensor * f = ggml_tanh(ctx, ggml_mul_mat(ctx, forget, h));
+            ggml_tensor * ref = ggml_add(ctx, ggml_mul(ctx, ggml_scale_bias(ctx, f, -1.0f, 1.0f), cur), ggml_mul(ctx, g, ggml_cont(ctx, msg)));
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, out, ref), 1.0f, 1.0f);
+        } else if (mode == 2) {
+            ggml_tensor * c0 = ggml_view_2d(ctx, cur, E, 1, cur->nb[1], 0);
+            ggml_tensor * m0 = ggml_view_2d(ctx, msg, E, 1, msg->nb[1], 0);
+            ggml_tensor * alone = ggml_inkling_loop_gate(ctx, c0, m0, down, gain, forget, 1e-6f);
+            ggml_tensor * all0  = ggml_view_2d(ctx, out, E, 1, out->nb[1], 0);
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, ggml_cont(ctx, all0), alone), 1.0f, 1.0f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // weights small enough that tanh stays off its flat ends
+            init_tensor_uniform(t, t->type == GGML_TYPE_F32 && t->ne[0] != 64 && t->ne[0] != 4608 ? -2.0f : -0.05f,
+                                   t->type == GGML_TYPE_F32 && t->ne[0] != 64 && t->ne[0] != 4608 ?  2.0f :  0.05f);
+        }
+    }
+};
+
+// GGML_OP_INKLING_MIX (Inkling 2 depth mix): n states [E, T] (one a view with a row stride when v = 1), query [E, nq].
+// mode 0: the op. mode 1: op - (the chain of mix()) + 1. mode 2: batch invariance: token 0 of the batch against token 0 alone
+struct test_inkling_mix : public test_case {
+    const int64_t E, T;
+    const int n, nq, v, mode;
+
+    std::string vars() override {
+        return VARS_TO_STR6(E, T, n, nq, v, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_MIX";
+    }
+
+    // the chain and invariance modes compare the final output only (their inner nodes are differences near 0)
+    bool run_whole_graph() override { return mode != 0; }
+
+    double max_nmse_err() override {
+        return mode == 2 ? 0.0 : 1e-6;
+    }
+
+    test_inkling_mix(int64_t E = 2304, int64_t T = 1, int n = 3, int nq = 1, int v = 0, int mode = 0)
+        : E(E), T(T), n(n), nq(nq), v(v), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        std::vector<ggml_tensor *> st(n);
+        for (int i = 0; i < n; ++i) {
+            if (v && i == n - 1) {
+                ggml_tensor * big = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E + 64, T);
+                st[i] = ggml_view_2d(ctx, big, E, T, big->nb[1], 0);
+            } else {
+                st[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+            }
+        }
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, nq);
+        const float scale = 1.0f/sqrtf((float) E);
+
+        ggml_tensor * out = ggml_inkling_mix(ctx, st.data(), n, query, 1e-6f, scale);
+        if (mode == 1) {
+            // mix(): states = concat(block, states) for the blocks; here the op's order is the chain's final order
+            ggml_tensor * states = ggml_reshape_3d(ctx, ggml_cont(ctx, st[n - 1]), E, 1, T);
+            for (int i = n - 2; i >= 0; --i) {
+                states = ggml_concat(ctx, ggml_reshape_3d(ctx, st[i], E, 1, T), states, 1);
+            }
+            states = ggml_rms_norm(ctx, states, 1e-6f);
+            ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, nq, T));
+            ggml_tensor * scores = ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, states, queries), nullptr, scale, 0.0f);
+            ggml_tensor * ref = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, out, ref), 1.0f, 1.0f);
+        } else if (mode == 2) {
+            std::vector<ggml_tensor *> s0(n);
+            for (int i = 0; i < n; ++i) {
+                s0[i] = ggml_view_2d(ctx, st[i], E, 1, st[i]->nb[1], 0);
+            }
+            ggml_tensor * alone = ggml_inkling_mix(ctx, s0.data(), n, query, 1e-6f, scale);
+            ggml_tensor * all0  = ggml_view_3d(ctx, out, E, nq, 1, out->nb[1], out->nb[2], 0);
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, ggml_cont(ctx, all0), alone), 1.0f, 1.0f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_INKLING_CONV (Inkling 2 short conv): cur [C, T, S] (a view of a wider tensor when v = 1), past [3, C, S] as a
+// view of a history tensor with other channels (as the graph has it), weights [4, C], dynamic taps or none.
+// mode 0: the op. mode 1: against the chain concat, ssm_conv, taps (mul, add), add, scale and the history view, + 1.
+// mode 2: batch invariance: the history of a T-step run against the same steps run one at a time (exact)
+struct test_inkling_conv : public test_case {
+    const int64_t C, T, S;
+    const int64_t heads;   // 0: no dynamic taps
+    const int v;
+    const int mode;
+
+    std::string vars() override {
+        return VARS_TO_STR6(C, T, S, heads, v, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_CONV";
+    }
+
+    // the chain and invariance modes compare the final output only (their inner nodes are differences near 0)
+    bool run_whole_graph() override { return mode != 0; }
+
+    double max_nmse_err() override {
+        return mode == 2 ? 0.0 : 1e-7;
+    }
+
+    test_inkling_conv(int64_t C = 1024, int64_t T = 1, int64_t S = 1, int64_t heads = 0, int v = 0, int mode = 0)
+        : C(C), T(T), S(S), heads(heads), v(v), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C + 32, T, S);
+            ggml_set_name(big, "big");
+            cur = ggml_view_3d(ctx, big, C, T, S, big->nb[1], big->nb[2], 0);
+        } else {
+            cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, T, S);
+            ggml_set_name(cur, "cur");
+        }
+        // the graph's history: [3, channels of all four convs, S], this conv at a channel offset
+        ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C + 64, S);
+        ggml_set_name(history, "history");
+        ggml_tensor * past = ggml_view_3d(ctx, history, 3, C, S, history->nb[1], history->nb[2], 32*history->nb[1]);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * dyn = nullptr;
+        if (heads > 0) {
+            dyn = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4*heads, T, S);
+            ggml_set_name(dyn, "dyn");
+        }
+        const float scale = 1.0f/sqrtf((heads > 0 ? 2 : 1)*4 + 1);
+
+        ggml_tensor * out = ggml_inkling_conv(ctx, cur, past, w, dyn, scale);
+        if (mode == 1) {
+            // the chain of convolve() (one sequence per S, T tokens each)
+            ggml_tensor * x = ggml_concat(ctx, past, ggml_transpose(ctx, cur), 0);
+            ggml_tensor * y = ggml_ssm_conv(ctx, x, w);
+            y = ggml_reshape_2d(ctx, y, C, T*S);
+            if (dyn) {
+                ggml_tensor * d = ggml_reshape_3d(ctx, dyn, 4, heads, T*S);
+                for (int64_t lag = 0; lag < 4; ++lag) {
+                    ggml_tensor * tap    = ggml_view_3d(ctx, d, 1, heads, T*S, d->nb[1], d->nb[2], lag*d->nb[0]);
+                    ggml_tensor * window = ggml_view_3d(ctx, x, T, C, S, x->nb[1], x->nb[2], (3 - lag)*x->nb[0]);
+                    window = ggml_cont(ctx, ggml_transpose(ctx, window));
+                    window = ggml_reshape_3d(ctx, window, C/heads, heads, T*S);
+                    y = ggml_add(ctx, y, ggml_reshape_2d(ctx, ggml_mul(ctx, window, tap), C, T*S));
+                }
+            }
+            y = ggml_scale(ctx, ggml_add(ctx, ggml_reshape_2d(ctx, ggml_cont(ctx, cur), C, T*S), y), scale);
+            ggml_tensor * hist = ggml_cont(ctx, ggml_view_3d(ctx, x, 3, C, S, x->nb[1], x->nb[2], T*x->nb[0]));
+            ggml_tensor * ref = ggml_concat(ctx, ggml_reshape_1d(ctx, y, C*T*S), ggml_reshape_1d(ctx, hist, 3*C*S), 0);
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, out, ref), 1.0f, 1.0f);
+        } else if (mode == 2) {
+            // the same steps one at a time: the history of step t feeds step t + 1
+            ggml_tensor * h = past;
+            ggml_tensor * outs = nullptr;
+            for (int64_t t = 0; t < T; ++t) {
+                ggml_tensor * ct = ggml_view_3d(ctx, cur, C, 1, S, cur->nb[1], cur->nb[2], t*cur->nb[1]);
+                ggml_tensor * dt = dyn ? ggml_view_3d(ctx, dyn, dyn->ne[0], 1, S, dyn->nb[1], dyn->nb[2], t*dyn->nb[1]) : nullptr;
+                ggml_tensor * r  = ggml_inkling_conv(ctx, ct, h, w, dt, scale);
+                ggml_tensor * ot = ggml_view_3d(ctx, r, C, 1, S, C*sizeof(float), C*sizeof(float), 0);
+                outs = outs ? ggml_concat(ctx, outs, ot, 1) : ggml_cont(ctx, ot);
+                h = ggml_view_3d(ctx, r, 3, C, S, 3*sizeof(float), 3*C*sizeof(float), C*S*sizeof(float));
+            }
+            ggml_tensor * full = ggml_view_3d(ctx, out, C, T, S, C*sizeof(float), C*T*sizeof(float), 0);
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, ggml_cont(ctx, full), outs), 1.0f, 1.0f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_L2_CLIP (Inkling 2 clips): x [D, H, T] (a view with a row stride when v = 1), scale [D, H] or none.
+// mode 0: the op. mode 1: op - (the chain mul, sqr, sum_rows, sqrt, scale_bias, fill, div, clamp, mul) + x, against the CPU.
+// mode 2: batch invariance: op(all rows)[token 0] - op(token 0 alone) + x[token 0]; must be exact (max NMSE 0)
+struct test_l2_clip : public test_case {
+    const std::array<int64_t, 3> ne;
+    const bool  with_scale;
+    const float th;
+    const int   v;
+    const int   mode;
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, with_scale, th, v, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "L2_CLIP";
+    }
+
+    // the chain and invariance modes compare the final output only (their inner nodes are differences near 0)
+    bool run_whole_graph() override { return mode != 0; }
+
+    double max_nmse_err() override {
+        return mode == 2 ? 0.0 : 1e-7;
+    }
+
+    test_l2_clip(std::array<int64_t, 3> ne = {128, 24, 1}, bool with_scale = true, float th = 25.0f, int v = 0, int mode = 0)
+        : ne(ne), with_scale(with_scale), th(th), v(v), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0] + 16, ne[1], ne[2]);
+            ggml_set_name(big, "big");
+            x = ggml_view_3d(ctx, big, ne[0], ne[1], ne[2], big->nb[1], big->nb[2], 0);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+            ggml_set_name(x, "x");
+        }
+        ggml_tensor * sc = nullptr;
+        if (with_scale) {
+            sc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(sc, "scale");
+        }
+
+        ggml_tensor * out = ggml_l2_clip(ctx, x, sc, th);
+        if (mode == 1) {
+            ggml_tensor * xc  = ggml_cont(ctx, x);
+            ggml_tensor * cur = sc ? ggml_mul(ctx, xc, sc) : xc;
+            ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
+            norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+            ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, th), norm);
+            ggml_tensor * ref = ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+            out = ggml_add(ctx, ggml_sub(ctx, out, ref), xc);
+        } else if (mode == 2) {
+            ggml_tensor * x0 = ggml_cont(ctx, ggml_view_3d(ctx, x, ne[0], ne[1], 1, x->nb[1], x->nb[2], 0));
+            ggml_tensor * alone = ggml_l2_clip(ctx, x0, sc, th);
+            ggml_tensor * all0  = ggml_view_3d(ctx, out, ne[0], ne[1], 1, out->nb[1], out->nb[2], 0);
+            out = ggml_add(ctx, ggml_sub(ctx, all0, alone), x0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "scale") == 0) {
+                init_tensor_uniform(t, 0.5f, 2.0f);
+            } else {
+                // rows below and above the threshold
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_GLU SITU (Inkling 2, Kimi-K3): gate and up as separate tensors (v = 0) or as the row views of one fused
 // gate_up tensor (v = 1, as the MoE path gives them). chain = 1: out = situ - (unfused chain) + gate, so a fused
 // kernel that drifts from the chain of scale / tanh / sigmoid / mul ops shows as an error against the CPU;
@@ -2246,6 +2545,9 @@ struct test_situ : public test_case {
         GGML_UNUSED(t);
         return "SITU";
     }
+
+    // the chain mode compares the final output only (its inner nodes are differences near 0)
+    bool run_whole_graph() override { return chain != 0; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * g;
@@ -8936,8 +9238,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
-                if (op == GGML_GLU_OP_SWIGLU_OAI) {
-                    // SWIGLU_OAI is handled separately
+                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SITU) {
+                    // SWIGLU_OAI and SITU (split form with its parameters only) are handled separately
                     continue;
                 }
 
@@ -8958,6 +9260,56 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_swiglu_oai(GGML_TYPE_F32, { 128, 2, 2, 2 }, v, alpha, limit));
             }
         }
+    }
+
+    // L2_CLIP: q (128 x 24 heads, scale), k (128 x 8, none), r (16 x 24, scale); decode 1 and 8 rows, prefill 512; views; chain; invariance
+    for (int64_t t : {1, 8, 512}) {
+        for (int mode : {0, 1}) {
+            test_cases.emplace_back(new test_l2_clip({128, 24, t}, true,  25.0f, 0, mode));
+            test_cases.emplace_back(new test_l2_clip({128,  8, t}, false, 25.0f, 1, mode));
+            test_cases.emplace_back(new test_l2_clip({ 16, 24, t}, true,   4.0f, 0, mode));
+        }
+    }
+    for (int64_t t : {8, 512}) {
+        test_cases.emplace_back(new test_l2_clip({128, 24, t}, true, 25.0f, 0, 2));
+        test_cases.emplace_back(new test_l2_clip({ 16, 24, t}, true,  4.0f, 1, 2));
+    }
+
+    // INKLING_LOOP_GATE: F16 (our file) and F32 weights; decode 1 and 8 tokens, prefill 512; a view; chain; invariance
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t t : {1, 8, 512}) {
+            for (int mode : {0, 1}) {
+                test_cases.emplace_back(new test_inkling_loop_gate(type, 2304, 64, t, t == 8, mode));
+            }
+        }
+        test_cases.emplace_back(new test_inkling_loop_gate(type, 2304, 64, 8, 1, 2));
+    }
+
+    // INKLING_MIX: 1 to 9 states, 1 and 3 queries; decode 1 and 8 tokens, prefill 512; a view; chain; invariance
+    for (int64_t t : {1, 8, 512}) {
+        for (int mode : {0, 1}) {
+            test_cases.emplace_back(new test_inkling_mix(2304, t, 1, 1, 0, mode));
+            test_cases.emplace_back(new test_inkling_mix(2304, t, 3, 1, 1, mode));
+            test_cases.emplace_back(new test_inkling_mix(2304, t, 6, 3, 0, mode));
+            test_cases.emplace_back(new test_inkling_mix(2304, t, 9, 1, 0, mode));
+        }
+    }
+    test_cases.emplace_back(new test_inkling_mix(2304, 8, 5, 3, 1, 2));
+    test_cases.emplace_back(new test_inkling_mix(2304, 512, 3, 1, 0, 2));
+
+    // INKLING_CONV: K / V (1024 channels, 8 heads of dynamic taps on the global layers, none on the others), attention
+    // output and MLP output (2304); decode 1 and 8 tokens, prefill 512; 1 and 2 sequences; views; chain; invariance
+    for (int64_t t : {1, 8, 512}) {
+        for (int mode : {0, 1}) {
+            test_cases.emplace_back(new test_inkling_conv(1024, t, 1, 8, 0, mode));
+            test_cases.emplace_back(new test_inkling_conv(1024, t, 1, 0, 1, mode));
+            test_cases.emplace_back(new test_inkling_conv(2304, t, 1, 0, 0, mode));
+        }
+        test_cases.emplace_back(new test_inkling_conv(1024, t, 2, 8, 1, 1));
+    }
+    for (int64_t t : {2, 5}) {
+        test_cases.emplace_back(new test_inkling_conv(1024, t, 1, 8, 0, 2));
+        test_cases.emplace_back(new test_inkling_conv(2304, t, 2, 0, 1, 2));
     }
 
     // SITU: separate gate / up and the fused gate_up row views; with and without the up cap; against the chain
@@ -11104,6 +11456,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // MoE combine: (experts x expert scale) x router weights, 8-way sum
     for (int n : {1, 512}) {
         test_cases.emplace_back(new test_moe_weighted_reduction(2304, 8, n, false, true));
+    }
+    // INKLING_LOOP_GATE (F16), 1 and 512 tokens
+    for (int64_t t : {1, 512}) {
+        test_cases.emplace_back(new test_inkling_loop_gate(GGML_TYPE_F16, 2304, 64, t, 0, 0));
+    }
+    // INKLING_MIX at 3 and 6 states, 1 and 512 tokens
+    for (int64_t t : {1, 512}) {
+        test_cases.emplace_back(new test_inkling_mix(2304, t, 3, 1, 0, 0));
+        test_cases.emplace_back(new test_inkling_mix(2304, t, 6, 3, 0, 0));
+    }
+    // INKLING_CONV at the MLP output shape, 1 and 512 tokens
+    for (int64_t t : {1, 512}) {
+        test_cases.emplace_back(new test_inkling_conv(2304, t, 1, 0, 0, 0));
+    }
+    // L2_CLIP at the q shape, 1 and 512 tokens
+    for (int64_t t : {1, 512}) {
+        test_cases.emplace_back(new test_l2_clip({128, 24, t}, true, 25.0f, 0, 0));
     }
     // SITU on the fused gate_up row views (1152 x 8 experts x n tokens)
     for (int n : {1, 512}) {

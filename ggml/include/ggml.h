@@ -593,6 +593,10 @@ extern "C" {
         GGML_OP_MIRAI_MUL_MAT,
         GGML_OP_ESCHA_MOE,
         GGML_OP_ESCHA_MUL_MAT,
+        GGML_OP_L2_CLIP,
+        GGML_OP_INKLING_CONV,
+        GGML_OP_INKLING_MIX,
+        GGML_OP_INKLING_LOOP_GATE,
 
         GGML_OP_UNARY,
 
@@ -2396,6 +2400,52 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             enum ggml_tri_type    type);
+
+    // y = v * clamp(threshold / (|v| + 1e-6), 0, 1) for each row (dim 0) of v = a * scale (Inkling 2 q, k and r clips)
+    // scale: NULL or F32 [a->ne[0], ...] that repeats to a. The rows of a need contiguous elements only
+    GGML_API struct ggml_tensor * ggml_l2_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * scale,
+            float                 threshold);
+
+    // Inkling 2 short conv (4 taps) with its history, in one op:
+    //   x = [past, cur] along time; out[c, t] = (cur[c, t] + sum_j w[j, c]*x[t + j][c] + sum_l dyn[l, head(c), t]*x[t + 3 - l][c]) * scale
+    //   cur  : [C, T, S] F32 (contiguous rows)    past : [3, C, S] F32 (time contiguous)
+    //   w    : [4, C] F32                         dyn  : NULL or [4*H, T, S] F32, H heads over C channels
+    //   result: 1D F32 [C*T*S + 3*C*S]: out [C, T, S], then the new history [3, C, S] (the last 3 steps of x)
+    GGML_API struct ggml_tensor * ggml_inkling_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * dyn,
+            float                 scale);
+
+    // Inkling 2 depth mix in one op (the chain concat, rms_norm, repeat, mul_mat, soft_max_ext, cont(transpose), mul_mat):
+    //   r_i = rms_norm(states[i]) per token (eps), p[:, q] = softmax_i(scale * r_i . query[:, q]), out[:, q] = sum_i p[i, q] * r_i
+    //   states: n tensors [E, T] F32 (contiguous rows), in the order of the chain's concat; query: [E, nq] F32
+    //   result: [E, nq, T]
+#define GGML_INKLING_MIX_MAX_STATES 9
+    GGML_API struct ggml_tensor * ggml_inkling_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor ** states,
+            int                   n,
+            struct ggml_tensor  * query,
+            float                 eps,
+            float                 scale);
+
+    // Inkling 2 loop message controller in one op (the chain concat, rms_norm, 3 mul_mat, 2 tanh, scale_bias, 2 mul, add):
+    //   h = down @ [rms(cur); rms(msg)], out = (1 - tanh(forget @ h))*cur + tanh(gain @ h)*msg
+    //   cur, msg: [E, T] F32 (contiguous rows); down: [2E, R]; gain, forget: [R, E]; weights F16 or F32
+    GGML_API struct ggml_tensor * ggml_inkling_loop_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * gain,
+            struct ggml_tensor  * forget,
+            float                 eps);
 
     // Fill tensor a with constant c
     GGML_API struct ggml_tensor * ggml_fill(

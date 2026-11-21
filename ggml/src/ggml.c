@@ -1137,6 +1137,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MIRAI_MUL_MAT",
     "ESCHA_MOE",
     "ESCHA_MUL_MAT",
+    "L2_CLIP",
+    "INKLING_CONV",
+    "INKLING_MIX",
+    "INKLING_LOOP_GATE",
 
     "UNARY",
 
@@ -1154,7 +1158,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1257,6 +1261,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "mirai_mul_mat(w, xq, scale)",
     "escha_moe(code, x, ids)",
     "escha_mul_mat(code, x)",
+    "l2_clip(x)",
+    "inkling_conv(cur, past, w)",
+    "inkling_mix(states, query)",
+    "inkling_loop_gate(cur, msg)",
 
     "unary(x)",
 
@@ -1274,7 +1282,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5394,6 +5402,136 @@ struct ggml_tensor * ggml_tri(
 
     result->op = GGML_OP_TRI;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_l2_clip
+
+struct ggml_tensor * ggml_l2_clip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * scale,
+        float                 threshold) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->nb[0] == sizeof(float));
+    if (scale) {
+        GGML_ASSERT(scale->type == GGML_TYPE_F32 && scale->nb[0] == sizeof(float));
+        GGML_ASSERT(scale->ne[0] == a->ne[0] && ggml_can_repeat(scale, a));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params_f32(result, 0, threshold);
+
+    result->op     = GGML_OP_L2_CLIP;
+    result->src[0] = a;
+    result->src[1] = scale;
+
+    return result;
+}
+
+// ggml_inkling_conv
+
+struct ggml_tensor * ggml_inkling_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * past,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * dyn,
+        float                 scale) {
+    const int64_t C = cur->ne[0];
+    const int64_t T = cur->ne[1];
+    const int64_t S = cur->ne[2];
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && past->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->ne[3] == 1 && cur->nb[0] == sizeof(float));
+    GGML_ASSERT(past->ne[0] == 3 && past->ne[1] == C && past->ne[2] == S && past->nb[0] == sizeof(float));
+    GGML_ASSERT(w->ne[0] == 4 && w->ne[1] == C && ggml_is_contiguous(w));
+    if (dyn) {
+        GGML_ASSERT(dyn->type == GGML_TYPE_F32 && dyn->nb[0] == sizeof(float));
+        GGML_ASSERT(dyn->ne[0] % 4 == 0 && C % (dyn->ne[0]/4) == 0 && dyn->ne[1] == T && dyn->ne[2] == S);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C*T*S + 3*C*S);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_INKLING_CONV;
+    result->src[0] = cur;
+    result->src[1] = past;
+    result->src[2] = w;
+    result->src[3] = dyn;
+
+    return result;
+}
+
+// ggml_inkling_mix
+
+struct ggml_tensor * ggml_inkling_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor ** states,
+        int                   n,
+        struct ggml_tensor  * query,
+        float                 eps,
+        float                 scale) {
+    GGML_ASSERT(n >= 1 && n <= GGML_INKLING_MIX_MAX_STATES && n + 1 <= GGML_MAX_SRC);
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && ggml_is_contiguous(query) && query->ne[2] == 1 && query->ne[3] == 1);
+
+    const int64_t E = query->ne[0];
+    const int64_t T = states[0]->ne[1];
+    for (int i = 0; i < n; ++i) {
+        GGML_ASSERT(states[i]->type == GGML_TYPE_F32 && states[i]->nb[0] == sizeof(float));
+        GGML_ASSERT(states[i]->ne[0] == E && states[i]->ne[1] == T && states[i]->ne[2] == 1 && states[i]->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, query->ne[1], T);
+
+    ggml_set_op_params_i32(result, 0, n);
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_f32(result, 2, scale);
+
+    result->op     = GGML_OP_INKLING_MIX;
+    result->src[0] = query;
+    for (int i = 0; i < n; ++i) {
+        result->src[1 + i] = states[i];
+    }
+
+    return result;
+}
+
+// ggml_inkling_loop_gate
+
+struct ggml_tensor * ggml_inkling_loop_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * msg,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * gain,
+        struct ggml_tensor  * forget,
+        float                 eps) {
+    const int64_t E = cur->ne[0];
+    const int64_t T = cur->ne[1];
+    const int64_t R = down->ne[1];
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && msg->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->nb[0] == sizeof(float) && msg->nb[0] == sizeof(float) && ggml_are_same_shape(cur, msg));
+    GGML_ASSERT(cur->ne[2] == 1 && cur->ne[3] == 1);
+    GGML_ASSERT(down->type == gain->type && down->type == forget->type);
+    GGML_ASSERT(down->type == GGML_TYPE_F16 || down->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(down) && ggml_is_contiguous(gain) && ggml_is_contiguous(forget));
+    GGML_ASSERT(down->ne[0] == 2*E && gain->ne[0] == R && gain->ne[1] == E && ggml_are_same_shape(gain, forget));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_INKLING_LOOP_GATE;
+    result->src[0] = cur;
+    result->src[1] = msg;
+    result->src[2] = down;
+    result->src[3] = gain;
+    result->src[4] = forget;
 
     return result;
 }
