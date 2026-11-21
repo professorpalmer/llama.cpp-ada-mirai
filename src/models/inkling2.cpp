@@ -32,6 +32,15 @@ static bool inkling_fused(int bit) {
     return (inkling_fused_mask() & bit) != 0;
 }
 
+// banded op: band bias from its factors (prefill agent's item 5) for n_tokens > 32; LLAMA_INKLING_REL_FACTORS=0 = off
+static bool inkling_rel_factors(int64_t n_tokens) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_INKLING_REL_FACTORS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on && n_tokens > 32;
+}
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -496,8 +505,15 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, nr, nkv, 1);
         ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, nr, nkv, 1);
         ggml_tensor * pm = masked ? ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, nr, nr, 1, 1) : nullptr;
-        ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, nr, 1);
+        const bool factors = inkling_rel_factors(n_tokens);
+        ggml_tensor * pr = factors ? nullptr : ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, nr, 1);
         ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
+        if (factors) {
+            // the real table type (F32 or F16) of the model; the probe's extent is 1
+            const ggml_type tt = model.layers[il].attn_rel_bias ? model.layers[il].attn_rel_bias->type : GGML_TYPE_F32;
+            ggml_flash_attn_ext_banded_set_rel_factors(op, ggml_new_tensor_2d(ctx0, tt, hparams.n_relative, 1),
+                    ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams.n_relative, nh, nr));
+        }
         if (!masked) {
             ggml_flash_attn_ext_banded_set_window(op, swa ? (int32_t) hparams.n_swa : INT32_MAX);
         }
@@ -692,9 +708,18 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                             mask->nb[1], mask->nb[2], mask->nb[3], 0));
                 }
                 // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
-                ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
-                rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
-                cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
+                // prefill (n_tokens > 32): the op builds the band bias from its factors (attn_rel_bias table, Rcur) per
+                // query chunk, so the [extent, n_head, n_tokens] bias (96 MiB at ub 1024) never exists in the compute
+                // buffer (prefill agent's item 5). Decode keeps the dense bias (tiny there).
+                // LLAMA_INKLING_REL_FACTORS=0 restores the dense bias everywhere (A/B).
+                if (inkling_rel_factors(n_tokens)) {
+                    cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, nullptr, 1.0f/sqrtf(n_embd_head), layer.attn_rel_bias->ne[1]);
+                    ggml_flash_attn_ext_banded_set_rel_factors(cur, layer.attn_rel_bias, ggml_is_contiguous(Rcur) ? Rcur : ggml_cont(ctx0, Rcur));
+                } else {
+                    ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
+                    rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
+                    cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
+                }
                 if (!masked) {
                     ggml_flash_attn_ext_banded_set_window(cur, is_swa ? (int32_t) hparams.n_swa : INT32_MAX);
                 }
