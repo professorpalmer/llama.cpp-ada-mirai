@@ -596,6 +596,7 @@ extern "C" {
         GGML_OP_L2_CLIP,
         GGML_OP_INKLING_CONV,
         GGML_OP_INKLING_MIX,
+        GGML_OP_INKLING_LOOP_GATE,
 
         GGML_OP_UNARY,
 
@@ -2433,6 +2434,18 @@ extern "C" {
             struct ggml_tensor  * query,
             float                 eps,
             float                 scale);
+
+    // Inkling 2 loop message controller in one op (the chain concat, rms_norm, 3 mul_mat, 2 tanh, scale_bias, 2 mul, add):
+    //   h = down @ [rms(cur); rms(msg)], out = (1 - tanh(forget @ h))*cur + tanh(gain @ h)*msg
+    //   cur, msg: [E, T] F32 (contiguous rows); down: [2E, R]; gain, forget: [R, E]; weights F16 or F32
+    GGML_API struct ggml_tensor * ggml_inkling_loop_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * gain,
+            struct ggml_tensor  * forget,
+            float                 eps);
 
     // Fill tensor a with constant c
     GGML_API struct ggml_tensor * ggml_fill(

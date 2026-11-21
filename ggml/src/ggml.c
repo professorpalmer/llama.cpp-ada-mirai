@@ -1140,6 +1140,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "L2_CLIP",
     "INKLING_CONV",
     "INKLING_MIX",
+    "INKLING_LOOP_GATE",
 
     "UNARY",
 
@@ -1157,7 +1158,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1263,6 +1264,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "l2_clip(x)",
     "inkling_conv(cur, past, w)",
     "inkling_mix(states, query)",
+    "inkling_loop_gate(cur, msg)",
 
     "unary(x)",
 
@@ -1280,7 +1282,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5494,6 +5496,42 @@ struct ggml_tensor * ggml_inkling_mix(
     for (int i = 0; i < n; ++i) {
         result->src[1 + i] = states[i];
     }
+
+    return result;
+}
+
+// ggml_inkling_loop_gate
+
+struct ggml_tensor * ggml_inkling_loop_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * msg,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * gain,
+        struct ggml_tensor  * forget,
+        float                 eps) {
+    const int64_t E = cur->ne[0];
+    const int64_t T = cur->ne[1];
+    const int64_t R = down->ne[1];
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && msg->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->nb[0] == sizeof(float) && msg->nb[0] == sizeof(float) && ggml_are_same_shape(cur, msg));
+    GGML_ASSERT(cur->ne[2] == 1 && cur->ne[3] == 1);
+    GGML_ASSERT(down->type == gain->type && down->type == forget->type);
+    GGML_ASSERT(down->type == GGML_TYPE_F16 || down->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(down) && ggml_is_contiguous(gain) && ggml_is_contiguous(forget));
+    GGML_ASSERT(down->ne[0] == 2*E && gain->ne[0] == R && gain->ne[1] == E && ggml_are_same_shape(gain, forget));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_INKLING_LOOP_GATE;
+    result->src[0] = cur;
+    result->src[1] = msg;
+    result->src[2] = down;
+    result->src[3] = gain;
+    result->src[4] = forget;
 
     return result;
 }

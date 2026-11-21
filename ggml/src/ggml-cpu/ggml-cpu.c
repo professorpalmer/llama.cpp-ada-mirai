@@ -2063,6 +2063,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_inkling_mix(params, tensor);
             } break;
+        case GGML_OP_INKLING_LOOP_GATE:
+            {
+                ggml_compute_forward_inkling_loop_gate(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {
@@ -2323,6 +2327,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_L2_CLIP:
         case GGML_OP_INKLING_CONV:
         case GGML_OP_INKLING_MIX:
+        case GGML_OP_INKLING_LOOP_GATE:
             {
                 n_tasks = n_threads;
             } break;

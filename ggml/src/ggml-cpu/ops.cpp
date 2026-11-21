@@ -2465,6 +2465,76 @@ void ggml_compute_forward_inkling_mix(const ggml_compute_params * params, ggml_t
     }
 }
 
+// ggml_compute_forward_inkling_loop_gate
+// the steps of the chain: rms_norm (ggml_float sums), the products (F16 weights: the activations rounded to F16 as the
+// CPU mul_mat does), tanh, 1 - forget, the products and the add
+
+static float inkling_dot_row(const ggml_tensor * w, int64_t row, const float * x, const ggml_fp16_t * x16, int64_t n) {
+    if (w->type == GGML_TYPE_F16) {
+        float d = 0.0f;
+        ggml_vec_dot_f16((int) n, &d, 0, (ggml_fp16_t *) ((const char *) w->data + row*w->nb[1]), 0, (ggml_fp16_t *) x16, 0, 1);
+        return d;
+    }
+    float d = 0.0f;
+    ggml_vec_dot_f32((int) n, &d, 0, (const float *) ((const char *) w->data + row*w->nb[1]), 0, x, 0, 1);
+    return d;
+}
+
+void ggml_compute_forward_inkling_loop_gate(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cur    = dst->src[0];
+    const ggml_tensor * msg    = dst->src[1];
+    const ggml_tensor * down   = dst->src[2];
+    const ggml_tensor * gain   = dst->src[3];
+    const ggml_tensor * forget = dst->src[4];
+    const float eps = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t E = cur->ne[0];
+    const int64_t T = cur->ne[1];
+    const int64_t R = down->ne[1];
+
+    const int64_t dt  = (T + params->nth - 1)/params->nth;
+    const int64_t it0 = dt*params->ith;
+    const int64_t it1 = MIN(it0 + dt, T);
+
+    std::vector<float> xn(2*E), h(R), keep(E), g(E);
+    std::vector<ggml_fp16_t> xn16(2*E), h16(R);
+
+    for (int64_t t = it0; t < it1; ++t) {
+        const float * c = (const float *) ((const char *) cur->data + t*cur->nb[1]);
+        const float * m = (const float *) ((const char *) msg->data + t*msg->nb[1]);
+        for (int j = 0; j < 2; ++j) {
+            const float * x = j == 0 ? c : m;
+            ggml_float sum = 0.0;
+            for (int64_t e = 0; e < E; ++e) {
+                sum += (ggml_float) (x[e]*x[e]);
+            }
+            const float mean = sum/E;
+            const float rs   = 1.0f/sqrtf(mean + eps);
+            for (int64_t e = 0; e < E; ++e) {
+                xn[j*E + e] = x[e]*rs;
+            }
+        }
+        for (int64_t i = 0; i < 2*E; ++i) {
+            xn16[i] = GGML_CPU_FP32_TO_FP16(xn[i]);
+        }
+        for (int64_t r = 0; r < R; ++r) {
+            h[r] = inkling_dot_row(down, r, xn.data(), xn16.data(), 2*E);
+        }
+        for (int64_t r = 0; r < R; ++r) {
+            h16[r] = GGML_CPU_FP32_TO_FP16(h[r]);
+        }
+        float * y = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t e = 0; e < E; ++e) {
+            const float gv = tanhf(inkling_dot_row(gain,   e, h.data(), h16.data(), R));
+            const float fv = tanhf(inkling_dot_row(forget, e, h.data(), h16.data(), R));
+            const float kp = -1.0f*fv + 1.0f;
+            const float a  = kp*c[e];
+            const float b  = gv*m[e];
+            y[e] = a + b;
+        }
+    }
+}
+
 // ggml_compute_tri
 
 static void ggml_compute_forward_tri_f32(const ggml_compute_params * params, ggml_tensor * dst) {

@@ -2224,6 +2224,73 @@ struct test_glu_split : public test_case {
     }
 };
 
+// GGML_OP_INKLING_LOOP_GATE (Inkling 2 loop controller): cur, msg [E, T] (msg a view when v = 1), down [2E, R],
+// gain / forget [R, E], F16 or F32. mode 0: the op. mode 1: op - (the chain of control()) + 1. mode 2: batch invariance
+struct test_inkling_loop_gate : public test_case {
+    const ggml_type type;
+    const int64_t E, R, T;
+    const int v, mode;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, E, R, T, v, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING_LOOP_GATE";
+    }
+
+    bool run_whole_graph() override { return mode != 0; }
+
+    double max_nmse_err() override {
+        return mode == 2 ? 0.0 : 5e-6;
+    }
+
+    test_inkling_loop_gate(ggml_type type = GGML_TYPE_F16, int64_t E = 2304, int64_t R = 64, int64_t T = 1, int v = 0, int mode = 0)
+        : type(type), E(E), R(R), T(T), v(v), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+        ggml_tensor * msg;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E + 32, T);
+            msg = ggml_view_2d(ctx, big, E, T, big->nb[1], 0);
+        } else {
+            msg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+        }
+        ggml_tensor * down   = ggml_new_tensor_2d(ctx, type, 2*E, R);
+        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, type, R, E);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, type, R, E);
+
+        ggml_tensor * out = ggml_inkling_loop_gate(ctx, cur, msg, down, gain, forget, 1e-6f);
+        if (mode == 1) {
+            ggml_tensor * h = ggml_concat(ctx, ggml_reshape_3d(ctx, cur, E, 1, T), ggml_reshape_3d(ctx, ggml_cont(ctx, msg), E, 1, T), 1);
+            h = ggml_reshape_2d(ctx, ggml_rms_norm(ctx, h, 1e-6f), 2*E, T);
+            h = ggml_mul_mat(ctx, down, h);
+            ggml_tensor * g = ggml_tanh(ctx, ggml_mul_mat(ctx, gain, h));
+            ggml_tensor * f = ggml_tanh(ctx, ggml_mul_mat(ctx, forget, h));
+            ggml_tensor * ref = ggml_add(ctx, ggml_mul(ctx, ggml_scale_bias(ctx, f, -1.0f, 1.0f), cur), ggml_mul(ctx, g, ggml_cont(ctx, msg)));
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, out, ref), 1.0f, 1.0f);
+        } else if (mode == 2) {
+            ggml_tensor * c0 = ggml_view_2d(ctx, cur, E, 1, cur->nb[1], 0);
+            ggml_tensor * m0 = ggml_view_2d(ctx, msg, E, 1, msg->nb[1], 0);
+            ggml_tensor * alone = ggml_inkling_loop_gate(ctx, c0, m0, down, gain, forget, 1e-6f);
+            ggml_tensor * all0  = ggml_view_2d(ctx, out, E, 1, out->nb[1], 0);
+            out = ggml_scale_bias(ctx, ggml_sub(ctx, ggml_cont(ctx, all0), alone), 1.0f, 1.0f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // weights small enough that tanh stays off its flat ends
+            init_tensor_uniform(t, t->type == GGML_TYPE_F32 && t->ne[0] != 64 && t->ne[0] != 4608 ? -2.0f : -0.05f,
+                                   t->type == GGML_TYPE_F32 && t->ne[0] != 64 && t->ne[0] != 4608 ?  2.0f :  0.05f);
+        }
+    }
+};
+
 // GGML_OP_INKLING_MIX (Inkling 2 depth mix): n states [E, T] (one a view with a row stride when v = 1), query [E, nq].
 // mode 0: the op. mode 1: op - (the chain of mix()) + 1. mode 2: batch invariance: token 0 of the batch against token 0 alone
 struct test_inkling_mix : public test_case {
@@ -9119,6 +9186,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_l2_clip({ 16, 24, t}, true,  4.0f, 1, 2));
     }
 
+    // INKLING_LOOP_GATE: F16 (our file) and F32 weights; decode 1 and 8 tokens, prefill 512; a view; chain; invariance
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t t : {1, 8, 512}) {
+            for (int mode : {0, 1}) {
+                test_cases.emplace_back(new test_inkling_loop_gate(type, 2304, 64, t, t == 8, mode));
+            }
+        }
+        test_cases.emplace_back(new test_inkling_loop_gate(type, 2304, 64, 8, 1, 2));
+    }
+
     // INKLING_MIX: 1 to 9 states, 1 and 3 queries; decode 1 and 8 tokens, prefill 512; a view; chain; invariance
     for (int64_t t : {1, 8, 512}) {
         for (int mode : {0, 1}) {
@@ -11271,6 +11348,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // MoE combine: (experts x expert scale) x router weights, 8-way sum
     for (int n : {1, 512}) {
         test_cases.emplace_back(new test_moe_weighted_reduction(2304, 8, n, false, true));
+    }
+    // INKLING_LOOP_GATE (F16), 1 and 512 tokens
+    for (int64_t t : {1, 512}) {
+        test_cases.emplace_back(new test_inkling_loop_gate(GGML_TYPE_F16, 2304, 64, t, 0, 0));
     }
     // INKLING_MIX at 3 and 6 states, 1 and 512 tokens
     for (int64_t t : {1, 512}) {
