@@ -750,6 +750,16 @@ enum llm_tensor {
     LLM_TENSOR_DSPARK_CONF_PROJ,
     LLM_TENSOR_DSPARK_LOG_SNR_FC1,
     LLM_TENSOR_DSPARK_LOG_SNR_FC2,
+    // Inkling 2 DSpark drafter (upstream #32218)
+    LLM_TENSOR_DSPARK_FUSE,              // [n_target_layers, n_layer + 1] softmax logits of the tap mix per draft layer (+ the head)
+    LLM_TENSOR_DSPARK_NORM,              // RMSNorm of the head's tap mix
+    LLM_TENSOR_DSPARK_HIDDEN_OUT,        // recurrent head latent -> hidden correction
+    LLM_TENSOR_DSPARK_MASK_EMBD,         // embedding of the masked block rows
+    LLM_TENSOR_DSPARK_JOINT_PROJ,        // recurrent head: [state, prev, hidden, context] -> [gate, candidate, latent]
+    LLM_TENSOR_DFLARE_NORM,              // per draft layer: RMSNorm of its tap mix
+    LLM_TENSOR_ATTN_K_CTX,               // per draft layer: context K from the tap mix
+    LLM_TENSOR_ATTN_V_CTX,               // per draft layer: context V from the tap mix
+    LLM_TENSOR_ATTN_K_CTX_NORM,          // per draft layer: RMSNorm of the context K heads
     LLM_TENSOR_DFLY_LAYER_FUSION,
     LLM_TENSOR_DFLY_CTX_NORM,
     LLM_TENSOR_DFLY_HC_HIDDEN_NORM,
