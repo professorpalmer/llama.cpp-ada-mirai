@@ -5607,6 +5607,28 @@ int32_t ggml_flash_attn_ext_banded_get_window(
     return ggml_get_op_params_i32(a, 4);
 }
 
+void ggml_flash_attn_ext_banded_set_pos(
+        struct ggml_tensor * a,
+        struct ggml_tensor * pos_q,
+        struct ggml_tensor * pos_kv) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(ggml_get_op_params_i32(a, 4) > 0 && a->src[3] == NULL); // positions replace the tail rule of the implicit window
+    GGML_ASSERT(pos_q != NULL && pos_kv != NULL);
+    GGML_ASSERT(pos_q->type == GGML_TYPE_I32 && pos_kv->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(pos_q) && ggml_is_contiguous(pos_kv));
+
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * k = a->src[1];
+    GGML_ASSERT(pos_q->ne[0]  == q->ne[1]);   // one position per query
+    GGML_ASSERT(pos_kv->ne[0] == k->ne[1]);   // one position per cell
+    GGML_ASSERT(pos_q->ne[2]  == 1 && pos_q->ne[3]  == 1);
+    GGML_ASSERT(pos_kv->ne[2] == 1 && pos_kv->ne[3] == 1);
+    GGML_ASSERT(q->ne[3] % pos_q->ne[1] == 0 && q->ne[3] % pos_kv->ne[1] == 0);
+
+    a->src[5] = pos_kv;
+    a->src[7] = pos_q;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
