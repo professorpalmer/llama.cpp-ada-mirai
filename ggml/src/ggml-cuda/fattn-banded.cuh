@@ -43,6 +43,18 @@ static __device__ __forceinline__ float fattn_banded_rel_bias(const char * table
     return sum;
 }
 
+// The same chain on a table row already read into registers as fp32 (DR = d_rel known at compile time): the same
+// operands in the same order as fattn_banded_rel_bias, so the same bits.
+template <int DR>
+static __device__ __forceinline__ float fattn_banded_rel_bias_reg(const float (&t)[DR], const float * rcur_row) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int c = 0; c < DR; ++c) {
+        sum = fmaf(t[c], rcur_row[c], sum);
+    }
+    return sum;
+}
+
 static __device__ __forceinline__ bool fattn_banded_visible(const int pq, const int pk, const int window, int & dist) {
     dist = pq - pk;
     return pk >= 0 && (window <= 0 || (dist >= 0 && dist < window));

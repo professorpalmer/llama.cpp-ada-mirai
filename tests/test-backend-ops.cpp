@@ -7889,16 +7889,17 @@ struct test_flash_attn_ext_banded_pos : public test_flash_attn_ext_banded {
 struct test_flash_attn_ext_banded_fact : public test_flash_attn_ext_banded_pos {
     const bool      use_pos;
     const ggml_type table_type;
-    const int64_t   d_rel = 16;
+    const int64_t   d_rel;
 
     std::string vars() override {
-        return test_flash_attn_ext_banded_pos::vars() + ",factors=" + ggml_type_name(table_type) + (use_pos ? "" : ",nopos");
+        return test_flash_attn_ext_banded_pos::vars() + ",factors=" + ggml_type_name(table_type) + (use_pos ? "" : ",nopos") +
+            (d_rel != 16 ? ",d_rel=" + std::to_string(d_rel) : "");
     }
 
     test_flash_attn_ext_banded_fact(int64_t n_q, int64_t n_kv, int32_t window, int layout, int64_t pad, ggml_type kv_type,
-            int sinks, ggml_type table_type, bool use_pos, ggml_type v_type = GGML_TYPE_COUNT)
+            int sinks, ggml_type table_type, bool use_pos, ggml_type v_type = GGML_TYPE_COUNT, int64_t d_rel = 16)
         : test_flash_attn_ext_banded_pos(n_q, n_kv, window, layout, pad, kv_type, sinks, 128, 24, 8, 1024, v_type),
-          use_pos(use_pos), table_type(table_type) {}
+          use_pos(use_pos), table_type(table_type), d_rel(d_rel) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out;
@@ -11490,6 +11491,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             const int64_t n_kv_g = std::max<int64_t>(4096, n_q);
             test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv_g, INT32_MAX, 0, 0, kv.first, 2, GGML_TYPE_F32, false, kv.second));
             test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv_g, 1024,      0, 0, kv.first, 1, GGML_TYPE_F16, false, kv.second));
+            const int64_t n_real = 1024 + n_q + 40;
+            const int64_t n_kv   = GGML_PAD(n_real, 256);
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv, 1024, 1, n_kv - n_real, kv.first, 2, GGML_TYPE_F32, true, kv.second));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv, 1024, 2, n_kv - n_real, kv.first, 0, GGML_TYPE_F16, true, kv.second));
+        }
+    }
+    // d_rel other than 16: the backend's generic bias kernel
+    test_cases.emplace_back(new test_flash_attn_ext_banded_fact(300, 4096, INT32_MAX, 0, 0, GGML_TYPE_Q8_0, 2, GGML_TYPE_F32, false, GGML_TYPE_COUNT, 8));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_fact(300, GGML_PAD(1024 + 300 + 40, 256), 1024, 1, GGML_PAD(1024 + 300 + 40, 256) - (1024 + 300 + 40),
+        GGML_TYPE_F16, 2, GGML_TYPE_F16, true, GGML_TYPE_COUNT, 8));
+
+    // the band bias from its factors at decode sizes (the decode kernel, n_tok <= 32; in batch-invariant mode or for f16)
+    for (const auto & kv : std::vector<std::pair<ggml_type, ggml_type>>{ {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+            {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0} }) {
+        for (int64_t n_q : { 1, 2, 4, 8, 32 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, 4096, INT32_MAX, 0, 0, kv.first, 2, GGML_TYPE_F32, false, kv.second));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, 1100, 1024,      0, 0, kv.first, 1, GGML_TYPE_F16, false, kv.second));
             const int64_t n_real = 1024 + n_q + 40;
             const int64_t n_kv   = GGML_PAD(n_real, 256);
             test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv, 1024, 1, n_kv - n_real, kv.first, 2, GGML_TYPE_F32, true, kv.second));

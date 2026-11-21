@@ -1537,6 +1537,39 @@ static __global__ void fattn_banded_rel_from_factors(
     rel[row*extent + d] = fattn_banded_rel_bias(table, table_type, t_nb1, rcur + row*d_rel, d_rel, (int) d);
 }
 
+// The same values for d_rel = DR (the model's 16): a thread keeps the table row of its distance d in registers and does
+// fattn_banded_rel_bias_reg for RB rows (h, iq) of rcur, staged in shared memory. The generic kernel above reads the
+// table row again for every row with a d_rel-float stride between threads (L1-bound: about 3 GB of L1 traffic for a
+// 256-query chunk at extent 1,024 and 24 heads).
+template <int DR, int RB>
+static __global__ void fattn_banded_rel_from_factors_reg(
+        const char * __restrict__ table, const int table_type, const int64_t t_nb1, const float * __restrict__ rcur,
+        float * __restrict__ rel, const int64_t extent, const int64_t n_rows) {
+    __shared__ float rs[RB*DR];
+    const int64_t d    = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t row0 = int64_t(blockIdx.y)*RB;
+    const int     nr   = n_rows - row0 < RB ? (int) (n_rows - row0) : RB;
+
+    for (int i = threadIdx.x; i < nr*DR; i += blockDim.x) {
+        rs[i] = rcur[row0*DR + i];
+    }
+    float t[DR];
+    if (d < extent) {
+        const char * tp = table + d*t_nb1;
+#pragma unroll
+        for (int c = 0; c < DR; ++c) {
+            t[c] = table_type == GGML_TYPE_F16 ? __half2float(((const half *) tp)[c]) : ((const float *) tp)[c];
+        }
+    }
+    __syncthreads();
+    if (d >= extent) {
+        return;
+    }
+    for (int r = 0; r < nr; ++r) {
+        rel[(row0 + r)*extent + d] = fattn_banded_rel_bias_reg<DR>(t, rs + r*DR);
+    }
+}
+
 // GGML_CUDA_BANDED_REL_CHUNK=n: queries per chunk when the band bias comes from its factors (default 256, rounded down
 // to a multiple of 64, at least 64)
 static int64_t fattn_banded_rel_chunk() {
@@ -1575,10 +1608,17 @@ static void fattn_banded_factored_launch(ggml_backend_cuda_context & ctx, ggml_t
         const int64_t nc = std::min(chunk, n_q - iq0);
 
         // relc[d + extent*(h + H*iq)] = sum_c table[c + d_rel*d] * rcur[c + d_rel*(h + H*(iq0 + iq))]
-        const dim3 rb((extent + 127)/128, H*nc, 1);
         const float * rc = (const float *) rcur->data + iq0*H*d_rel;
-        fattn_banded_rel_from_factors<<<rb, 128, 0, stream>>>((const char *) table->data, (int) table->type, table->nb[1], rc,
-            relc.get(), (int) d_rel, extent, H*nc);
+        if (d_rel == 16) {
+            constexpr int rows_per_block = 32;
+            const dim3 rb((extent + 127)/128, (H*nc + rows_per_block - 1)/rows_per_block, 1);
+            fattn_banded_rel_from_factors_reg<16, rows_per_block><<<rb, 128, 0, stream>>>((const char *) table->data,
+                (int) table->type, table->nb[1], rc, relc.get(), extent, H*nc);
+        } else {
+            const dim3 rb((extent + 127)/128, H*nc, 1);
+            fattn_banded_rel_from_factors<<<rb, 128, 0, stream>>>((const char *) table->data, (int) table->type, table->nb[1],
+                rc, relc.get(), (int) d_rel, extent, H*nc);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         ggml_tensor q_c = *q;
