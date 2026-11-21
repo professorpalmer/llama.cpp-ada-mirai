@@ -18,6 +18,20 @@ static constexpr int64_t n_kq_chunk_max = 64;
 // ubatches up to this many tokens keep the dense path
 static constexpr int64_t n_tokens_banded_min = 32;
 
+// LLAMA_INKLING_FUSED: a bit mask of the fused ops in use (MoE agent's ops, wired by the integrator):
+// 1 = L2_CLIP (clip), 2 = INKLING_CONV (convolve), 4 = INKLING_MIX (mix), 8 = INKLING_LOOP_GATE (control, decode only);
+// unset = all on; 0 = the old chains
+static int inkling_fused_mask() {
+    static const int mask = [] {
+        const char * e = getenv("LLAMA_INKLING_FUSED");
+        return e == nullptr ? 15 : atoi(e);
+    }();
+    return mask;
+}
+static bool inkling_fused(int bit) {
+    return (inkling_fused_mask() & bit) != 0;
+}
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -245,6 +259,9 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const 
 
 // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
 ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
+    if (inkling_fused(1)) {
+        return ggml_l2_clip(ctx0, cur, scale, threshold);
+    }
     if (scale) {
         cur = ggml_mul(ctx0, cur, scale);
     }
@@ -259,6 +276,14 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    if (inkling_fused(4) && blocks.size() + 1 <= GGML_INKLING_MIX_MAX_STATES && query->ne[1] <= 4) {
+        std::vector<ggml_tensor *> st;
+        for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
+            st.push_back(ggml_reshape_2d(ctx0, *it, n_embd, n_tokens));
+        }
+        st.push_back(ggml_reshape_2d(ctx0, cur, n_embd, n_tokens));
+        return ggml_inkling_mix(ctx0, st.data(), (int) st.size(), query, 1e-6f, 1.0f/sqrtf(n_embd));
+    }
     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     for (ggml_tensor * block : blocks) {
         states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
@@ -301,6 +326,17 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seqs       = ubatch.n_seqs;
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+
+    if (inkling_fused(2)) {
+        GGML_ASSERT(n_conv == 4);
+        ggml_tensor * cur3 = ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs);
+        ggml_tensor * dyn3 = dynamic ? ggml_reshape_3d(ctx0, dynamic, dynamic->ne[0], n_seq_tokens, n_seqs) : nullptr;
+        ggml_tensor * r = ggml_inkling_conv(ctx0, cur3, past, weight, dyn3, 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+        ggml_tensor * hist = ggml_view_3d(ctx0, r, n_conv - 1, n_channels, n_seqs,
+                (n_conv - 1)*sizeof(float), (n_conv - 1)*n_channels*sizeof(float), n_channels*n_tokens*sizeof(float));
+        build_conv_state_store(inp, state, hist, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+        return ggml_view_2d(ctx0, r, n_channels, n_tokens, n_channels*sizeof(float), 0);
+    }
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);
