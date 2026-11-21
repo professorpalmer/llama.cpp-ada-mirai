@@ -7889,16 +7889,17 @@ struct test_flash_attn_ext_banded_pos : public test_flash_attn_ext_banded {
 struct test_flash_attn_ext_banded_fact : public test_flash_attn_ext_banded_pos {
     const bool      use_pos;
     const ggml_type table_type;
-    const int64_t   d_rel = 16;
+    const int64_t   d_rel;
 
     std::string vars() override {
-        return test_flash_attn_ext_banded_pos::vars() + ",factors=" + ggml_type_name(table_type) + (use_pos ? "" : ",nopos");
+        return test_flash_attn_ext_banded_pos::vars() + ",factors=" + ggml_type_name(table_type) + (use_pos ? "" : ",nopos") +
+            (d_rel != 16 ? ",d_rel=" + std::to_string(d_rel) : "");
     }
 
     test_flash_attn_ext_banded_fact(int64_t n_q, int64_t n_kv, int32_t window, int layout, int64_t pad, ggml_type kv_type,
-            int sinks, ggml_type table_type, bool use_pos, ggml_type v_type = GGML_TYPE_COUNT)
+            int sinks, ggml_type table_type, bool use_pos, ggml_type v_type = GGML_TYPE_COUNT, int64_t d_rel = 16)
         : test_flash_attn_ext_banded_pos(n_q, n_kv, window, layout, pad, kv_type, sinks, 128, 24, 8, 1024, v_type),
-          use_pos(use_pos), table_type(table_type) {}
+          use_pos(use_pos), table_type(table_type), d_rel(d_rel) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out;
@@ -11496,6 +11497,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv, 1024, 2, n_kv - n_real, kv.first, 0, GGML_TYPE_F16, true, kv.second));
         }
     }
+    // d_rel other than 16: the backend's generic bias kernel
+    test_cases.emplace_back(new test_flash_attn_ext_banded_fact(300, 4096, INT32_MAX, 0, 0, GGML_TYPE_Q8_0, 2, GGML_TYPE_F32, false, GGML_TYPE_COUNT, 8));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_fact(300, GGML_PAD(1024 + 300 + 40, 256), 1024, 1, GGML_PAD(1024 + 300 + 40, 256) - (1024 + 300 + 40),
+        GGML_TYPE_F16, 2, GGML_TYPE_F16, true, GGML_TYPE_COUNT, 8));
 
     // mixed K / V cache (K q8_0, V q4_0; fattn_banded_kv_pair_ok): decode and prefill, implicit causal window and
     // sliding window, with and without token positions, sinks
