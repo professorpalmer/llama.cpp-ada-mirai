@@ -1,5 +1,6 @@
 #include "escha-gemv.cuh"
 #include "unary.cuh"
+#include "mmid.cuh"
 
 // Small-batch path of ggml_escha_mul_mat: the GEMV kernel of exllamav3 (exl3/quant/exl3_gemv_kernel.cuh, MIT, Copyright (c) 2025 Turboderp).
 //
@@ -197,20 +198,64 @@ static __global__ void escha_gemv_swiglu_out(
     }
 }
 
+// Routed form (ggml_escha_moe): a block has one work item = up to EXL3_GEMV_MAX_M rows of ONE expert.
+//   work == nullptr: 1 token. Item w is slot w: expert ids[w], row w.
+//   work != nullptr: item w = (expert, first compact row, row count) of the list of escha_gemv_build_work; n_work items are valid.
+//                    Compact row c is row ids_dst[c] (token*n_ids + slot) of xh and of dst.
+struct escha_gemv_route {
+    const int32_t * ids     = nullptr;
+    const int32_t * ids_dst = nullptr;
+    const int4    * work    = nullptr;
+    const int32_t * n_work  = nullptr;
+    int64_t nb_i0           = 0;
+};
+
 // mid = xh @ decode(code): the main loop of exl3_gemv_kernel (shuffle extraction, mcg codebook, fp16 accumulate folded to fp32).
 // A warp has WNT adjacent n-tiles and 1/S of k. A block has G column groups and S k-splits.
 //   FUSE = false: G = 1, one block per column group as in exllamav3. C is mid [rows][OC].
 //   FUSE = true:  G*WNT*16 = 128. The block has one Hadamard block of the output, it applies T128 and rout and writes dst.
-// MMODE 0 is rows == 1, MMODE 1 is 2 <= rows <= 8.
-template <int bits, int MMODE, int WNT, int S, bool FUSE>
+// MMODE 0 is rows == 1, MMODE 1 is 2 <= rows <= 8 (1 <= rows <= 8 in the routed form: a row has the same bits in both modes).
+// ROUTED: the grid is [items][size_n/128] in one dimension; A, B and rout are the tensors of all rows / experts and the block takes its part (FUSE only).
+template <int bits, int MMODE, int WNT, int S, bool FUSE, bool ROUTED = false>
 static __global__ void __launch_bounds__(32*S*(FUSE ? 8/WNT : 1), S*(FUSE ? 8/WNT : 1) <= 16 ? 2 : 1) escha_gemv_kernel(
-        const half     * __restrict__ A,
-        const uint16_t * __restrict__ B,
-        const half     * __restrict__ rout,
+        const half     * __restrict__ A_all,
+        const uint16_t * __restrict__ B_all,
+        const half     * __restrict__ rout_all,
         float          * __restrict__ C,
-        const int size_m, const int size_k, const int size_n, const int ne1,
-        const int64_t nb_d1, const int64_t nb_d2, const int row0) {
+        const int size_m_all, const int size_k, const int size_n, const int ne1,
+        const int64_t nb_d1, const int64_t nb_d2, const int row0, const escha_gemv_route route) {
 #ifdef AMPERE_MMA_AVAILABLE
+    static_assert(!ROUTED || FUSE, "the routed form writes dst in the block");
+
+    const half     * A    = A_all;
+    const uint16_t * B    = B_all;
+    const half     * rout = rout_all;
+    int size_m = size_m_all;
+    int bx     = blockIdx.x;   // column group block
+    int r_s    = 0;            // first compact row of the item
+    if constexpr (ROUTED) {
+        const int n_cb = size_n/128;
+        const int item = blockIdx.x/n_cb;
+        bx = blockIdx.x%n_cb;
+        int e;
+        if (route.work != nullptr) {
+            // the grid has an upper bound of the item count. The test is the same for all threads of the block
+            if (item >= *route.n_work) {
+                return;
+            }
+            const int4 w = route.work[item];
+            e      = w.x;
+            r_s    = w.y;
+            size_m = w.z;
+        } else {
+            e      = *(const int32_t *)((const char *) route.ids + item*route.nb_i0);
+            r_s    = item;
+            size_m = 1;
+        }
+        B    += (size_t) e*(size_k/16)*(size_n/16)*(16*bits);
+        rout += (size_t) e*size_n;
+    }
+
     constexpr int cb   = 1;   // mcg
     constexpr int G    = FUSE ? 8/WNT : 1;
     constexpr int PF   = WNT == 2 ? 4 : 2;   // prefetch ring depth
@@ -247,8 +292,14 @@ static __global__ void __launch_bounds__(32*S*(FUSE ? 8/WNT : 1), S*(FUSE ? 8/WN
 
     // A fragment row indices for this lane
     const int r0 = lane >> 2;
-    const size_t a_row0 = (size_t) r0*(size_k/2);
     const bool r0_ok = MMODE == 0 ? lane < 4 : r0 < size_m;
+    size_t a_row0 = (size_t) r0*(size_k/2);
+    if constexpr (ROUTED) {
+        // the rows of xh are in dst order, so each lane takes the row of its compact row
+        const int c    = r_s + (r0_ok ? (MMODE == 0 ? 0 : r0) : 0);
+        const int drow = route.ids_dst != nullptr ? route.ids_dst[c] : c;
+        a_row0 = (size_t) drow*(size_k/2);
+    }
 
     // per-lane extraction constants (see dq8_aligned_2bits / dq8<3, cb, 4> in exl3_dq.cuh)
     int x_src_a = 0, x_src_b = 0;
@@ -270,7 +321,7 @@ static __global__ void __launch_bounds__(32*S*(FUSE ? 8/WNT : 1), S*(FUSE ? 8/WN
 
     __shared__ __align__(16) float sh_red[S][ROWS][BCOLS];
 
-    const int group = blockIdx.x*G + grp;
+    const int group = bx*G + grp;
     const uint32_t * bp = B32 + (size_t) ks0*slice_stride + group*WNT*TWORDS + lane;
 
     // prefetch ring (indices must be compile-time or pf lands in local memory)
@@ -391,7 +442,7 @@ static __global__ void __launch_bounds__(32*S*(FUSE ? 8/WNT : 1), S*(FUSE ? 8/WN
         if constexpr (FUSE) {
             sh_red[0][r][c] = sum;
         } else {
-            C[(size_t) r*size_n + blockIdx.x*BCOLS + c] = sum;
+            C[(size_t) r*size_n + bx*BCOLS + c] = sum;
         }
     }
 
@@ -399,13 +450,16 @@ static __global__ void __launch_bounds__(32*S*(FUSE ? 8/WNT : 1), S*(FUSE ? 8/WN
         __syncthreads();
         // warp r does row r
         if (warp < rows_out) {
-            const int orow = row0 + warp;
+            int orow = row0 + warp;
+            if constexpr (ROUTED) {
+                orow = route.ids_dst != nullptr ? route.ids_dst[r_s + warp] : r_s + warp;
+            }
             float * dst_row = (float *)((char *) C + (int64_t)(orow%ne1)*nb_d1 + (int64_t)(orow/ne1)*nb_d2);
-            had_ff_r_128_inner<false, true>(sh_red[0][warp], dst_row + blockIdx.x*128, rout + blockIdx.x*128, ESCHA_GEMV_RS);
+            had_ff_r_128_inner<false, true>(sh_red[0][warp], dst_row + bx*128, rout + bx*128, ESCHA_GEMV_RS);
         }
     }
 #else
-    GGML_UNUSED_VARS(A, B, rout, C, size_m, size_k, size_n, ne1, nb_d1, nb_d2, row0);
+    GGML_UNUSED_VARS(A_all, B_all, rout_all, C, size_m_all, size_k, size_n, ne1, nb_d1, nb_d2, row0, route);
     NO_DEVICE_CODE;
 #endif // AMPERE_MMA_AVAILABLE
 }
@@ -484,7 +538,7 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             kernel<<<grid, threads, 0, stream>>>(
                 xh.get() + (size_t) row0*IC, (const uint16_t *) code->data, (const half *) rout->data,
                 fuse ? (float *) dst->data : mid.get() + (size_t) row0*OC,
-                m, IC, OC, (int) x->ne[1], dst->nb[1], dst->nb[2], row0);
+                m, IC, OC, (int) x->ne[1], dst->nb[1], dst->nb[2], row0, escha_gemv_route{});
         };
 
 #define ESCHA_GEMV_LAUNCH(bits, mm) \
@@ -512,6 +566,148 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             OC, n_rows, (int) x->ne[1], dst->nb[1], dst->nb[2]);
         CUDA_CHECK(cudaGetLastError());
     }
+
+    return true;
+}
+
+// Routed experts (ggml_escha_moe) on the GEMV kernel.
+//
+// xh[row] = f16(T128(x[row] * rin[expert of row])), row = token*n_ids + slot (dst order), one warp per 128 channels
+static __global__ void escha_gemv_had_in_routed(
+        const float   * __restrict__ x,
+        const half    * __restrict__ rin,
+        const int32_t * __restrict__ ids,
+        half          * __restrict__ xh,
+        const int IC, const int n_rows, const int n_x, const int n_ids,
+        const int64_t nb_x1, const int64_t nb_x2, const int64_t nb_i0, const int64_t nb_i1) {
+    const int nb = IC/128;
+    const int w  = blockIdx.x*(blockDim.x/32) + threadIdx.x/32;
+    if (w >= n_rows*nb) {
+        return;
+    }
+    const int row = w/nb;
+    const int blk = w%nb;
+    const int it  = row/n_ids;
+    const int is  = row%n_ids;
+
+    const int32_t e = *(const int32_t *)((const char *) ids + is*nb_i0 + it*nb_i1);
+
+    const float * x_row = (const float *)((const char *) x + (int64_t)(is%n_x)*nb_x1 + (int64_t) it*nb_x2);
+    had_fh_r_128_inner<true, false>(x_row + blk*128, xh + (int64_t) row*IC + blk*128, rin + (int64_t) e*IC + blk*128, ESCHA_GEMV_RS);
+}
+
+// one work item for each chunk of up to EXL3_GEMV_MAX_M compact rows of an expert. The items write different rows of dst, so their order has no effect on the result.
+static __global__ void escha_gemv_build_work(
+        const int32_t * __restrict__ bounds,
+        int4          * __restrict__ work,
+        int32_t       * __restrict__ n_work,
+        const int n_expert) {
+    for (int e = blockIdx.x*blockDim.x + threadIdx.x; e < n_expert; e += gridDim.x*blockDim.x) {
+        const int lo = bounds[e];
+        const int hi = bounds[e + 1];
+        for (int s = lo; s < hi; s += EXL3_GEMV_MAX_M) {
+            work[atomicAdd(n_work, 1)] = make_int4(e, s, min(EXL3_GEMV_MAX_M, hi - s), 0);
+        }
+    }
+}
+
+// GGML_ESCHA_MOE_GEMV=0: the routed op stays on the fp32 block kernels of escha-moe.cu.
+// 1 token: one launch, an item for each slot. More tokens: the rows of an expert in chunks of 8 (a chunk costs about as much as 1 row).
+// A row has the same bits alone and in a chunk, so a token gives the same result at every batch size.
+bool ggml_cuda_escha_moe_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * code = dst->src[0];
+    const ggml_tensor * rin  = dst->src[1];
+    const ggml_tensor * rout = dst->src[2];
+    const ggml_tensor * x    = dst->src[5];
+    const ggml_tensor * ids  = dst->src[6];
+
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_ESCHA_MOE_GEMV");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    const int K  = code->ne[0]/16;
+    const int OC = code->ne[1]*16;
+    const int IC = code->ne[2]*16;
+
+    const int n_expert = code->ne[3];
+    const int n_ids    = ids->ne[0];
+    const int n_tokens = ids->ne[1];
+    const int n_rows   = n_ids*n_tokens;
+    const int n_x      = x->ne[1];
+
+    if (!enabled || n_rows < 1 || (K != 2 && K != 3) || IC%128 != 0 || OC%128 != 0) {
+        return false;
+    }
+    if (!ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
+        return false;
+    }
+    if (!escha_gemv_rows_aligned(x) || !escha_gemv_rows_aligned(dst) || (uintptr_t) rin->data%8 != 0 || (uintptr_t) rout->data%8 != 0 ||
+            ids->nb[0] != ggml_element_size(ids) || ids->nb[1]%ggml_element_size(ids) != 0 || (n_x != 1 && n_x != n_ids)) {
+        // the block kernels are several times slower: say it once, a silent fallback looks like a slow model
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: escha_moe %s takes the block kernels (rows not 16-byte aligned or ids / x layout not supported)\n", __func__, dst->name);
+        }
+        return false;
+    }
+    const bool one_token = n_tokens == 1;
+
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<half> xh(ctx.pool(), (size_t) n_rows*IC);
+    escha_gemv_had_in_routed<<<(n_rows*(IC/128) + 7)/8, 256, 0, stream>>>(
+        (const float *) x->data, (const half *) rin->data, (const int32_t *) ids->data, xh.get(),
+        IC, n_rows, n_x, n_ids, x->nb[1], x->nb[2], ids->nb[0], ids->nb[1]);
+    CUDA_CHECK(cudaGetLastError());
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool());
+    ggml_cuda_pool_alloc<int4>    work(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> n_work(ctx.pool());
+
+    escha_gemv_route route;
+    route.ids   = (const int32_t *) ids->data;
+    route.nb_i0 = ids->nb[0];
+
+    int n_items = n_rows;
+    if (!one_token) {
+        // the ids helper needs each expert at most once in a token, as top-k routing gives
+        ids_src1.alloc(n_rows);
+        ids_dst.alloc(n_rows);
+        bounds.alloc(n_expert + 1);
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
+            n_expert, n_tokens, n_ids, n_x, (int) (ids->nb[1]/ggml_element_size(ids)), 1, /*write_inverse =*/ false, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        // an expert can end with a part chunk, so the item count has a bound only
+        n_items = (n_rows + EXL3_GEMV_MAX_M - 1)/EXL3_GEMV_MAX_M + n_expert;
+        work.alloc(n_items);
+        n_work.alloc(1);
+        CUDA_CHECK(cudaMemsetAsync(n_work.get(), 0, sizeof(int32_t), stream));
+        escha_gemv_build_work<<<1, 256, 0, stream>>>(bounds.get(), work.get(), n_work.get(), n_expert);
+        CUDA_CHECK(cudaGetLastError());
+
+        route.ids_dst = ids_dst.get();
+        route.work    = work.get();
+        route.n_work  = n_work.get();
+    }
+
+    auto launch = [&](auto kernel) {
+        kernel<<<n_items*(OC/128), 1024, 0, stream>>>(
+            xh.get(), (const uint16_t *) code->data, (const half *) rout->data, (float *) dst->data,
+            1, IC, OC, n_ids, dst->nb[1], dst->nb[2], 0, route);
+    };
+
+    switch (2*K + (one_token ? 0 : 1)) {
+        case 4: launch(escha_gemv_kernel<2, 0, 2, 8, true, true>); break;
+        case 5: launch(escha_gemv_kernel<2, 1, 2, 8, true, true>); break;
+        case 6: launch(escha_gemv_kernel<3, 0, 2, 8, true, true>); break;
+        case 7: launch(escha_gemv_kernel<3, 1, 2, 8, true, true>); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
 
     return true;
 }
@@ -621,6 +817,11 @@ bool ggml_cuda_escha_had_out_i32(ggml_backend_cuda_context & ctx, const int32_t 
 }
 
 bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, dst);
+    return false;
+}
+
+bool ggml_cuda_escha_moe_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED_VARS(ctx, dst);
     return false;
 }

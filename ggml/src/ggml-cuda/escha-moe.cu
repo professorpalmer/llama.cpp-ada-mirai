@@ -406,6 +406,11 @@ void ggml_cuda_op_escha_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     GGML_ASSERT(rin->type == GGML_TYPE_F16 && rout->type == GGML_TYPE_F16 && lut->type == GGML_TYPE_F16);
     GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
 
+    // the exllamav3 GEMV kernel with the expert of each row (escha-gemv.cu); the block kernels below are the fallback
+    if (ggml_cuda_escha_moe_gemv(ctx, dst)) {
+        return;
+    }
+
     const int K   = code->ne[0]/16;
     const int OC  = code->ne[1]*16;
     const int IC  = code->ne[2]*16;
