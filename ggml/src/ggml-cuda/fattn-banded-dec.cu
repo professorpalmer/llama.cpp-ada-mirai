@@ -66,6 +66,11 @@ struct banded_dec_params {
     const int32_t * pos_kv;
     int     pos_q_ns;
     int     pos_kv_ns;
+
+    // band bias from its factors (ggml_flash_attn_ext_banded_set_rel_factors): rel is then the table [d_rel, rel_extent]
+    // (r_nb1 bytes per distance, type_rel F32 / F16) and rcur [d_rel, n_head, n_q] F32; nullptr: rel holds rel_logits
+    const float * rcur;
+    int     d_rel;
 };
 
 static __device__ __forceinline__ float banded_dec_load_rel(const char * ptr, const int type) {
@@ -456,8 +461,12 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
                 float b = 0.0f;
                 if (mv != -INFINITY) {
                     if (d >= 0 && d < p.rel_extent) {
-                        b = banded_dec_load_rel(p.rel + (sequence % p.r_ne3)*p.r_nb3 + int64_t(iq)*p.r_nb2 +
-                            int64_t(head0 + jh)*p.r_nb1 + int64_t(d)*p.r_nb0, p.type_rel);
+                        b = p.rcur
+                            // the shared definition of the bias from its factors (fattn-banded.cuh), as in the prefill path
+                            ? fattn_banded_rel_bias(p.rel, p.type_rel, p.r_nb1, p.rcur + (int64_t(iq)*p.n_head + head0 + jh)*p.d_rel,
+                                p.d_rel, d)
+                            : banded_dec_load_rel(p.rel + (sequence % p.r_ne3)*p.r_nb3 + int64_t(iq)*p.r_nb2 +
+                                int64_t(head0 + jh)*p.r_nb1 + int64_t(d)*p.r_nb0, p.type_rel);
                     }
                     if (p.window == 0 && p.mask && p.ne32 > 1) {
                         b += __half2float(((const half *) (p.mask + (sequence % p.ne33)*p.nb33 +
@@ -743,10 +752,15 @@ static void banded_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     p.nb33 = mask ? mask->nb[3] : 0;
     p.ne32 = mask ? mask->ne[2] : 1;
     p.ne33 = mask ? mask->ne[3] : 1;
+    const ggml_tensor * rcur = dst->src[8];
     p.r_nb0 = rel->nb[0]; p.r_nb1 = rel->nb[1]; p.r_nb2 = rel->nb[2]; p.r_nb3 = rel->nb[3];
-    p.r_ne3      = rel->ne[3];
-    p.rel_extent = (int) rel->ne[0]; // the tensor extent (not op_params) is authoritative after graph cloning
+    p.r_ne3      = rcur ? 1 : rel->ne[3];
+    // the tensor extent (not op_params) is authoritative after graph cloning: rel_logits [extent, ...] or the factor
+    // table [d_rel, extent]
+    p.rel_extent = (int) (rcur ? rel->ne[1] : rel->ne[0]);
     p.type_rel   = rel->type;
+    p.rcur       = rcur ? (const float *) rcur->data : nullptr;
+    p.d_rel      = rcur ? (int) rcur->ne[0] : 0;
     p.sink_s1 = sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0;
     p.sink_s2 = sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0;
     p.window  = ggml_get_op_params_i32(dst, 4);
@@ -895,10 +909,6 @@ bool ggml_cuda_flash_attn_ext_banded_dec_supported(int device, const ggml_tensor
     if (!q || !k || !v || !rel || q->type != GGML_TYPE_F32) {
         return false;
     }
-    // band bias from its factors (ggml_flash_attn_ext_banded_set_rel_factors, src[8]): not read by this kernel yet
-    if (dst->src[8] != nullptr) {
-        return false;
-    }
     if (q->ne[1] < 1 || q->ne[1] > ggml_cuda_banded_dec_max_q(k->type)) {
         return false;
     }
@@ -935,7 +945,16 @@ bool ggml_cuda_flash_attn_ext_banded_dec_supported(int device, const ggml_tensor
             return false;
         }
     }
-    if (rel->ne[0] <= 0 || rel->ne[0] > INT32_MAX/2 || rel->ne[1] != q->ne[2] || rel->ne[2] != q->ne[1] ||
+    const ggml_tensor * rcur = dst->src[8];
+    if (rcur) {
+        // band bias from its factors: table F32 / F16 [d_rel, extent], rcur F32 [d_rel, n_head, n_q], both contiguous
+        if ((rel->type != GGML_TYPE_F32 && rel->type != GGML_TYPE_F16) || !ggml_is_contiguous(rel) ||
+            rel->ne[1] <= 0 || rel->ne[1] > INT32_MAX/2 || rel->ne[2] != 1 || rel->ne[3] != 1 ||
+            rcur->type != GGML_TYPE_F32 || !ggml_is_contiguous(rcur) || rcur->ne[0] != rel->ne[0] ||
+            rcur->ne[1] != q->ne[2] || rcur->ne[2] != q->ne[1] || rcur->ne[3] != 1 || q->ne[3] != 1) {
+            return false;
+        }
+    } else if (rel->ne[0] <= 0 || rel->ne[0] > INT32_MAX/2 || rel->ne[1] != q->ne[2] || rel->ne[2] != q->ne[1] ||
         (rel->ne[3] != 1 && rel->ne[3] != q->ne[3])) {
         return false;
     }

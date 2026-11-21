@@ -11502,6 +11502,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded_fact(300, GGML_PAD(1024 + 300 + 40, 256), 1024, 1, GGML_PAD(1024 + 300 + 40, 256) - (1024 + 300 + 40),
         GGML_TYPE_F16, 2, GGML_TYPE_F16, true, GGML_TYPE_COUNT, 8));
 
+    // the band bias from its factors at decode sizes (the decode kernel, n_tok <= 32; in batch-invariant mode or for f16)
+    for (const auto & kv : std::vector<std::pair<ggml_type, ggml_type>>{ {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+            {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0} }) {
+        for (int64_t n_q : { 1, 2, 4, 8, 32 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, 4096, INT32_MAX, 0, 0, kv.first, 2, GGML_TYPE_F32, false, kv.second));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, 1100, 1024,      0, 0, kv.first, 1, GGML_TYPE_F16, false, kv.second));
+            const int64_t n_real = 1024 + n_q + 40;
+            const int64_t n_kv   = GGML_PAD(n_real, 256);
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv, 1024, 1, n_kv - n_real, kv.first, 2, GGML_TYPE_F32, true, kv.second));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv, 1024, 2, n_kv - n_real, kv.first, 0, GGML_TYPE_F16, true, kv.second));
+        }
+    }
+
     // mixed K / V cache (K q8_0, V q4_0; fattn_banded_kv_pair_ok): decode and prefill, implicit causal window and
     // sliding window, with and without token positions, sinks
     for (int64_t n_q : { 1, 2, 4, 8, 32, 33, 64, 512, 1024 }) {
