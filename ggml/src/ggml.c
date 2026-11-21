@@ -5664,15 +5664,16 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
     GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
 
-    GGML_ASSERT(rel_logits != NULL);
-    GGML_ASSERT(rel_logits->type == GGML_TYPE_F32 ||
-                rel_logits->type == GGML_TYPE_F16 ||
-                rel_logits->type == GGML_TYPE_BF16);
     GGML_ASSERT(rel_extent > 0);
-    GGML_ASSERT(rel_logits->ne[0] == rel_extent);
-    GGML_ASSERT(rel_logits->ne[1] == q->ne[2]);
-    GGML_ASSERT(rel_logits->ne[2] == q->ne[1]);
-    GGML_ASSERT(rel_logits->ne[3] == 1 || rel_logits->ne[3] == q->ne[3]);
+    if (rel_logits != NULL) {   // NULL: ggml_flash_attn_ext_banded_set_rel_factors follows
+        GGML_ASSERT(rel_logits->type == GGML_TYPE_F32 ||
+                    rel_logits->type == GGML_TYPE_F16 ||
+                    rel_logits->type == GGML_TYPE_BF16);
+        GGML_ASSERT(rel_logits->ne[0] == rel_extent);
+        GGML_ASSERT(rel_logits->ne[1] == q->ne[2]);
+        GGML_ASSERT(rel_logits->ne[2] == q->ne[1]);
+        GGML_ASSERT(rel_logits->ne[3] == 1 || rel_logits->ne[3] == q->ne[3]);
+    }
 
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
@@ -5759,6 +5760,27 @@ int32_t ggml_flash_attn_ext_banded_get_window(
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
     return ggml_get_op_params_i32(a, 4);
+}
+
+void ggml_flash_attn_ext_banded_set_rel_factors(
+        struct ggml_tensor * a,
+        struct ggml_tensor * table,
+        struct ggml_tensor * rcur) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(table != NULL && rcur != NULL);
+    GGML_ASSERT(table->type == GGML_TYPE_F32 || table->type == GGML_TYPE_F16);
+    GGML_ASSERT(rcur->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(table) && ggml_is_contiguous(rcur));
+
+    const struct ggml_tensor * q = a->src[0];
+    GGML_ASSERT(table->ne[2] == 1 && table->ne[3] == 1 && table->ne[1] > 0);
+    GGML_ASSERT(rcur->ne[0] == table->ne[0]);   // d_rel
+    GGML_ASSERT(rcur->ne[1] == q->ne[2]);       // one row a head
+    GGML_ASSERT(rcur->ne[2] == q->ne[1]);       // and a query
+    GGML_ASSERT(rcur->ne[3] == 1 && q->ne[3] == 1);
+
+    a->src[6] = table;
+    a->src[8] = rcur;
 }
 
 void ggml_flash_attn_ext_banded_set_pos(

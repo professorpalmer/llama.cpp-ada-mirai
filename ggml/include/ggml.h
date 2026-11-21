@@ -2549,6 +2549,15 @@ extern "C" {
     // then rel_dist = pos_q[q_idx] - pos_kv[kv_idx] replaces the tail rule above; a cell is visible iff
     // pos_kv >= 0 and 0 <= rel_dist < window. Needs the implicit window (set_window > 0, no mask tensor).
     // The stream of batch b is b % n_stream.
+    // the band bias from its factors instead of rel_logits: rel(d, head, q) = sum_c table[c, d] * rcur[c, head, q]
+    //   table F32 or F16 [d_rel, rel_extent] (src[6]), rcur F32 [d_rel, n_head, n_batch, 1] (src[8])
+    // The bias is never materialised as [rel_extent, n_head, n_batch] (the backend builds it per query chunk). The op
+    // may be created with rel_logits = NULL when this setter follows.
+    GGML_API void ggml_flash_attn_ext_banded_set_rel_factors(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * rcur);
+
     GGML_API void ggml_flash_attn_ext_banded_set_pos(
             struct ggml_tensor * a,
             struct ggml_tensor * pos_q,

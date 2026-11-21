@@ -8843,6 +8843,30 @@ static inline float ggml_flash_attn_ext_banded_load(
     }
 }
 
+// the band bias from its factors (ggml_flash_attn_ext_banded_set_rel_factors): sum_c table[c, d] * rcur[c, head, q]
+static inline float ggml_flash_attn_ext_banded_factor_load(
+        const ggml_tensor * table,
+        const ggml_tensor * rcur,
+        int64_t iq1,
+        int64_t iq2,
+        int64_t rel_idx) {
+    const int64_t d_rel = table->ne[0];
+    const float * r = (const float *) ((const char *) rcur->data + iq2*rcur->nb[1] + iq1*rcur->nb[2]);
+    float sum = 0.0f;
+    if (table->type == GGML_TYPE_F32) {
+        const float * t = (const float *) ((const char *) table->data + rel_idx*table->nb[1]);
+        for (int64_t c = 0; c < d_rel; ++c) {
+            sum += t[c]*r[c];
+        }
+    } else {
+        const ggml_fp16_t * t = (const ggml_fp16_t *) ((const char *) table->data + rel_idx*table->nb[1]);
+        for (int64_t c = 0; c < d_rel; ++c) {
+            sum += GGML_CPU_FP16_TO_FP32(t[c])*r[c];
+        }
+    }
+    return sum;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9005,8 +9029,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             if (rel) {
                 // rel_dist as above (the tail rule aligns a short decode Q block to the tail of K, the FA4
                 // seqlen_k - seqlen_q convention)
-                if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
-                    s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
+                const ggml_tensor * rcur = dst->src[8];   // factors (table in src[6]): extent = table->ne[1]
+                if (rel_dist >= 0 && rel_dist < (rcur ? rel->ne[1] : rel->ne[0])) {
+                    s += rcur ? ggml_flash_attn_ext_banded_factor_load(rel, rcur, iq1, iq2, rel_dist)
+                              : ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
                 }
             }
 
