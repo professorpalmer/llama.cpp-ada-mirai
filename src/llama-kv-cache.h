@@ -240,6 +240,8 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     // distance from each token to each cell, extent for the empty, future and more distant cells (Inkling 2)
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // the token position held by each cell of the K/V view, -1 for an empty cell (Inkling 2, banded op with positions)
+    void set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -448,6 +450,8 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     // distance from each token to each cell, extent for the empty, future and more distant cells (Inkling 2)
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // the token position held by each cell of the K/V view, -1 for an empty cell (Inkling 2, banded op with positions)
+    void set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     // K/V cells of the banded attention for the current ubatch, 0 = not position-contiguous (Inkling 2)
     uint32_t get_n_kv_pos_contiguous() const;
     uint32_t get_size() const; // cells of the cache (Inkling 2 dense-bias chunking)

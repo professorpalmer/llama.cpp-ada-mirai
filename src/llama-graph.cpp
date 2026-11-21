@@ -1311,6 +1311,12 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     if (self_rel_pos_swa && self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
+    if (self_pos_kv && self_pos_kv->buffer) {
+        attn_ctx->get_base()->set_input_kv_pos(self_pos_kv, ubatch);
+    }
+    if (self_pos_kv_swa && self_pos_kv_swa->buffer) {
+        attn_ctx->get_swa()->set_input_kv_pos(self_pos_kv_swa, ubatch);
+    }
 }
 
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
@@ -1340,10 +1346,13 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
-    if (banded) {
+    if (banded && !use_pos) {
         res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
         res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
     }
+    // with positions the graph depends only on n_kv (a multiple of 256): the positions are inputs
+    res &= self_pos_kv->ne[0]     == attn_ctx->get_base()->get_n_kv();
+    res &= self_pos_kv_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
 
     res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
 
@@ -4007,6 +4016,14 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+
+    inp->self_pos_kv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv());
+    ggml_set_input(inp->self_pos_kv);
+    ggml_set_name(inp->self_pos_kv, "attn_inp_pos_kv");
+
+    inp->self_pos_kv_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv());
+    ggml_set_input(inp->self_pos_kv_swa);
+    ggml_set_name(inp->self_pos_kv_swa, "attn_inp_pos_kv_swa");
 
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }

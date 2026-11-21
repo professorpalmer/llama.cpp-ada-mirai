@@ -1382,6 +1382,17 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
     return pos_max + 1;
 }
 
+void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    const int64_t n_kv = dst->ne[0];
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    int32_t * data = (int32_t *) dst->data;
+    for (int64_t j = 0; j < n_kv; ++j) {
+        data[j] = (j >= (int64_t) cells.size() || cells.is_empty(j)) ? -1 : (int32_t) cells.pos_get(j);
+    }
+}
+
 void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     const int64_t n_kv = dst->ne[0];
@@ -3083,6 +3094,10 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
 
 uint32_t llama_kv_cache_context::get_size() const {
     return kv->get_size();
+}
+
+void llama_kv_cache_context::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_kv_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {

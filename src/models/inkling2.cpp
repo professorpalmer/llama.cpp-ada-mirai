@@ -379,13 +379,14 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
     // covers 1-32 rows) and f16 / q8_0 / q4_0 K/V, with the implicit window instead of a mask tensor.
     // LLAMA_INKLING_MASKED=1 restores Unsloth's choice (dense for ubatches of 32 rows or fewer, the F16 mask tensor).
     static const bool masked = [] { const char * e = getenv("LLAMA_INKLING_MASKED"); return e && atoi(e) != 0; }();
-    // Ubatches of 32 rows or fewer (decode) stay on the dense path for now: the banded view of the contiguous cells
-    // grows by one cell per token, so the decode graph could not be reused and was rebuilt every token (rig, ef60e363c:
-    // decode 23 tok/s at 4k). Op E (cell positions over the padded view, a multiple of 256) lifts this.
-    // LLAMA_INKLING_BANDED_DECODE=1 forces the banded op at decode (measurements).
-    static const bool banded_decode = [] { const char * e = getenv("LLAMA_INKLING_BANDED_DECODE"); return e && atoi(e) != 0; }();
-    inp->banded = cparams.flash_attn && ((!masked && banded_decode) || n_tokens > n_tokens_banded_min);
-    for (int i = 0; i < 2 && inp->banded; ++i) {
+    inp->banded = cparams.flash_attn && (!masked || n_tokens > n_tokens_banded_min);
+    // decode too: before op E the view of the contiguous cells grew by one cell per token, so the decode graph was
+    // rebuilt every token (rig, ef60e363c: 23 tok/s) and a59cd68e2 kept decode dense; with positions that is gone.
+    // with cell positions (op E) the banded op reads the padded K/V view of any cell order, the SWA ring past its wrap
+    // included, so no layer needs the dense bias path and the graph stays the same while n_kv (a multiple of 256) does
+    const bool use_pos = inp->banded && !masked;
+    inp->use_pos = use_pos;
+    for (int i = 0; i < 2 && inp->banded && !use_pos; ++i) {
         inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
     }
     std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
@@ -396,7 +397,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
             return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 ||
                 (!masked && (t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0));
         };
-        if (!(inp->n_kv_banded[swa] > 0 && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
+        if (!((use_pos || inp->n_kv_banded[swa] > 0) && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
                 type_ok(cache->type_k()) && type_ok(cache->type_v()) &&
                 (swa ? attn->self_kq_mask_swa : attn->self_kq_mask)->ne[3] == 1)) {
             return false;
@@ -424,6 +425,9 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_flash_attn_ext_banded_set_window(op, swa ? (int32_t) hparams.n_swa : INT32_MAX);
         }
         ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, nr, 1));
+        if (use_pos) {
+            ggml_flash_attn_ext_banded_set_pos(op, ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nr), ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nr));
+        }
         ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
         const bool ok = ggml_backend_dev_supports_op(dev, op);
         banded_dev_ok.push_back({ { swa, dev }, ok });
@@ -586,9 +590,10 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 ggml_build_forward_expand(gf, cache->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
                 ggml_build_forward_expand(gf, cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
 
-                const int64_t n_kv_b = inp->n_kv_banded[is_swa];
                 ggml_tensor * k_all = cache->get_k(ctx0, il);
                 ggml_tensor * v_all = cache->get_v(ctx0, il);
+                // with positions: the whole (padded) K/V view; without: the position-contiguous cells only
+                const int64_t n_kv_b = use_pos ? k_all->ne[2] : inp->n_kv_banded[is_swa];
                 GGML_ASSERT(n_kv_b <= k_all->ne[2]);
                 ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_tokens, 1), 0, 2, 1, 3);
                 ggml_tensor * k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv_b, k_all->ne[3],
@@ -617,6 +622,10 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                     ggml_flash_attn_ext_banded_set_window(cur, is_swa ? (int32_t) hparams.n_swa : INT32_MAX);
                 }
                 ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
+                if (use_pos) {
+                    // the token position of each query, the position held by each cell of the view (-1 = empty)
+                    ggml_flash_attn_ext_banded_set_pos(cur, inp_pos, is_swa ? inp->self_pos_kv_swa : inp->self_pos_kv);
+                }
                 ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
                 res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
                 cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

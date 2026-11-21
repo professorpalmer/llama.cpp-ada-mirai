@@ -886,6 +886,12 @@ public:
     uint32_t n_kv_banded[2] = { 0, 0 };
     bool     banded         = false;
 
+    // the token position held by each cell of the K/V view, -1 = empty (the banded op with positions, op E): any cell
+    // order, the SWA ring past its wrap included
+    ggml_tensor * self_pos_kv     = nullptr; // I32 [n_kv]
+    ggml_tensor * self_pos_kv_swa = nullptr; // I32 [n_kv_swa]
+    bool          use_pos         = false;
+
     const uint32_t extent;
     const uint32_t extent_swa;
 };
