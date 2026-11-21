@@ -8462,6 +8462,16 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling 2 Mini shapes (MoE perf agent): correctness at the real expert shapes
+    for (int n : {1, 3, 4, 32}) {
+        for (ggml_type t : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S}) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304));
+        }
+        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4}) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, true, 2304, n, 1152));
+        }
+    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -10516,6 +10526,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling 2 Mini shapes (MoE perf agent)
+    // experts: 128, top-8; gate_up fused 2304 -> 2304 (broadcast input), down 1152 -> 2304 (one input per expert)
+    for (int n : {1, 2, 3, 4, 8, 16, 32, 64, 512}) {
+        for (ggml_type t : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S}) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304));
+        }
+        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4}) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, true, 2304, n, 1152));
+        }
+    }
+    // router (F32), attention projections and the head at decode
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 2304, {1, 1}, {1, 1}));
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ3_XXS}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 3072, 1, 2304, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 201024, 1, 2304, {1, 1}, {1, 1}));
+    // router: sigmoid + bias, top-8, norm, scale 8
+    for (int n : {1, 512}) {
+        test_cases.emplace_back(new test_topk_moe({128, n, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f));
+    }
     // bandwidth comparison at Bonsai-2 shapes
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 1, 5120, {1, 1}, {1, 1}));
