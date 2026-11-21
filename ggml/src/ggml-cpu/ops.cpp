@@ -8544,6 +8544,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * rel   = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? dst->src[6] : nullptr;
+    const int32_t window      = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? ggml_get_op_params_i32(dst, 4) : 0;
+    // the banded op is the reference of kernels that sum P.V in fp32: F16 V is converted and summed in fp32 as well
+    const bool v_acc_f16      = v->type == GGML_TYPE_F16 && dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8632,7 +8635,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
+        if (v_acc_f16) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
@@ -8656,7 +8659,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? ggml_fa_mask_value(mask, mp, ic, slope) : 0.0f;
+            float mv = mp ? ggml_fa_mask_value(mask, mp, ic, slope) : 0.0f;
+            if (window > 0) {
+                // implicit mask of the banded op: visible iff 0 <= iq1 + (n_kv - n_q) - ic < window
+                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                mv = rel_dist >= 0 && rel_dist < window ? 0.0f : -INFINITY;
+            }
             if (mv == -INFINITY) {
                 continue;
             }
@@ -8689,7 +8697,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (v->type == GGML_TYPE_F16) {
+            if (v_acc_f16) {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -8730,7 +8738,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (v->type == GGML_TYPE_F16) {
+        if (v_acc_f16) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
             }

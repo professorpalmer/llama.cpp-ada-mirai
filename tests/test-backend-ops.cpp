@@ -7225,7 +7225,9 @@ struct test_flash_attn_ext_banded : public test_case {
     const int64_t n_q;
     const int64_t n_kv;
     const int64_t rel_extent;
-    const int mask_kind; // 0: none, 1: causal, 2: causal sliding window with dist < rel_extent
+    // mask_kind 0: none, 1: causal, 2: causal sliding window with dist < rel_extent, 3: causal with the last query row all -inf,
+    // 4: implicit causal window (no mask tensor, ggml_flash_attn_ext_banded_set_window INT32_MAX), 5: implicit window rel_extent
+    const int mask_kind;
     const ggml_type kv_type;
     const ggml_type rel_type;
     const bool strided;
@@ -7276,12 +7278,15 @@ struct test_flash_attn_ext_banded : public test_case {
         ggml_set_name(r, "rel_logits");
 
         ggml_tensor * m = nullptr;
-        if (mask_kind != 0) {
+        if (mask_kind >= 1 && mask_kind <= 3) {
             m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
             ggml_set_name(m, "m");
         }
 
         ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), rel_extent);
+        if (mask_kind >= 4) {
+            ggml_flash_attn_ext_banded_set_window(out, mask_kind == 4 ? INT32_MAX : (int32_t) rel_extent);
+        }
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -7294,7 +7299,8 @@ struct test_flash_attn_ext_banded : public test_case {
                 for (int64_t iq = 0; iq < n_q; ++iq) {
                     for (int64_t ik = 0; ik < n_kv; ++ik) {
                         const int64_t rel_dist = iq + (n_kv - n_q) - ik;
-                        const bool visible = rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent);
+                        const bool visible = rel_dist >= 0 && (mask_kind == 1 || (mask_kind == 3 && iq < n_q - 1) ||
+                            (mask_kind == 2 && rel_dist < rel_extent));
                         data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
                     }
                 }
@@ -7330,6 +7336,24 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
     void initialize_tensors(ggml_context * ctx) override {
         test_flash_attn_ext_banded::initialize_tensors(ctx);
         init_tensor_uniform(ggml_get_tensor(ctx, "sinks"), -4.0f, 4.0f);
+    }
+};
+
+// banded FA with Q values in [-q_range, q_range]: large logits, so the online softmax and the KV-split merge rescale
+struct test_flash_attn_ext_banded_large : public test_flash_attn_ext_banded_sinks {
+    const float q_range;
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_sinks::vars() + ",q_range=" + std::to_string((int) q_range);
+    }
+
+    test_flash_attn_ext_banded_large(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            ggml_type kv_type, int sinks, float q_range)
+        : test_flash_attn_ext_banded_sinks(d, n_head, n_head_kv, n_q, n_kv, rel_extent, 1, kv_type, GGML_TYPE_F32, sinks), q_range(q_range) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext_banded_sinks::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "q"), -q_range, q_range);
     }
 };
 
@@ -10664,6 +10688,70 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1,   1, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    // banded FA decode path (1-32 query rows) with f16 / q8_0 / q4_0 K/V; Inkling 2 Mini geometry: D 128, 24 Q / 8 K/V heads
+    for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t n_q : { 1, 2, 4, 8, 32 }) {
+            for (int64_t n_kv : { 512, 1100, 4096, 9000 }) {
+                for (int sinks : { 0, 1, 2 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 1, kv_type, GGML_TYPE_F32, sinks));
+                }
+            }
+            // short extent: both band edges inside a few tiles; sliding-window mask; strided K/V views; a padded query row
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 1100,   64, 1, kv_type, GGML_TYPE_F32, 2));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 1100,   64, 2, kv_type, GGML_TYPE_F32, 2));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q,  333,   64, 1, kv_type, GGML_TYPE_F32, 2, true));
+            test_cases.emplace_back(new test_flash_attn_ext_banded      (128, 24, 8, n_q, 1100, 1024, 3, kv_type, GGML_TYPE_F32));
+            // implicit mask (window in op_params, no mask tensor): causal and sliding window
+            for (int64_t n_kv : { 1100, 9000 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 4, kv_type, GGML_TYPE_F32, 2));
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 5, kv_type, GGML_TYPE_F32, 2));
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv,   64, 5, kv_type, GGML_TYPE_F32, 0));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 1100, 1024, 3, kv_type, GGML_TYPE_F32, 2));
+            // no mask, f16 / bf16 bias, GQA without a group of 3, head size 64
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 1100,  128, 0, kv_type, GGML_TYPE_F32, 1));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 1100,  128, 1, kv_type, GGML_TYPE_F16, 2));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 1100,  128, 1, kv_type, GGML_TYPE_BF16, 2));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2, n_q, 1100,  128, 1, kv_type, GGML_TYPE_F32, 2));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  6, 2, n_q, 1100,  128, 1, kv_type, GGML_TYPE_F32, 2));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  8, 2, n_q, 1100,  128, 1, kv_type, GGML_TYPE_F32, 2));
+        }
+        for (int64_t n_q : { 3, 5, 7, 17 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, 4096, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+        }
+        // n_kv smaller than the extent and than one tile; deep views
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 1,   100, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 8,     8, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 1, 65536, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 8, 65536, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 1, 65531, 1024, 1, kv_type, GGML_TYPE_F32, 1));
+        // prefill path (more than 32 query rows, the prefill kernel) with the same types
+        for (int64_t n_q : { 33, 64, 512, 1024 }) {
+            for (int64_t n_kv : { 512, 1100, 4096, 9000 }) {
+                if (n_kv < n_q) {
+                    continue;
+                }
+                for (int sinks : { 0, 1, 2 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 1, kv_type, GGML_TYPE_F32, sinks));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 100, 1100,   64, 2, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 512, 9000, 1024, 1, kv_type, GGML_TYPE_F32, 2, true));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks( 64,  8, 2,  77, 1000, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  64, 1100, 1024, 3, kv_type, GGML_TYPE_F32, 2));
+        for (int64_t n_q : { 33, 64, 512 }) {
+            for (int64_t n_kv : { 1100, 9000 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 4, kv_type, GGML_TYPE_F32, 2));
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 5, kv_type, GGML_TYPE_F32, 2));
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv,   64, 5, kv_type, GGML_TYPE_F32, 0));
+            }
+        }
+        // large logits: the running maximum moves often; fp32 sums over 65,536 cells
+        test_cases.emplace_back(new test_flash_attn_ext_banded_large(128, 24, 8, 1,  4096, 1024, kv_type, 2, 1000.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_large(128, 24, 8, 8, 65536, 1024, kv_type, 2, 1000.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_large(128, 24, 8, 512, 65536, 1024, kv_type, 2, 1000.0f));
+    }
 
 
     return test_cases;
@@ -11088,6 +11176,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // banded FA decode (Inkling 2 Mini global layers: D 128, 24 Q / 8 K/V heads, per-query sinks), and the plain FA decode
+    // with the same K/V as the ceiling of the in-place read
+    for (int64_t n_kv : { 4096, 16384, 32768 }) {
+        for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+            for (int64_t n_q : { 1, 2, 4, 8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 1, kv_type, GGML_TYPE_F32, 2));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, n_kv, 1, true, true, 0, 0, GGML_PREC_F32, kv_type, kv_type));
+        }
+    }
     return test_cases;
 }
 

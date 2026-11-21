@@ -5590,6 +5590,23 @@ struct ggml_tensor * ggml_flash_attn_ext(
 }
 
 
+void ggml_flash_attn_ext_banded_set_window(
+        struct ggml_tensor * a,
+        int32_t              window) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(window >= 0);
+    GGML_ASSERT(window == 0 || a->src[3] == NULL); // the implicit window replaces the mask tensor
+
+    ggml_set_op_params_i32(a, 4, window);
+}
+
+int32_t ggml_flash_attn_ext_banded_get_window(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+
+    return ggml_get_op_params_i32(a, 4);
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

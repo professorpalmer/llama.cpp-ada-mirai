@@ -2473,6 +2473,16 @@ extern "C" {
             float                 scale,
             int64_t               rel_extent);
 
+    // implicit mask of a banded op (no mask tensor, src[3] NULL): cell kv_idx is visible for query q_idx iff
+    // 0 <= rel_dist < window (rel_dist as above); INT32_MAX = causal, the window size for sliding-window layers.
+    // 0 (the default) = the mask tensor decides. Stored in op_params[4].
+    GGML_API void ggml_flash_attn_ext_banded_set_window(
+            struct ggml_tensor * a,
+            int32_t              window);
+
+    GGML_API int32_t ggml_flash_attn_ext_banded_get_window(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
