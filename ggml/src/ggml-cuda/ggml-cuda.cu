@@ -1819,7 +1819,7 @@ static bool ggml_cuda_tier_graph_wants_pipeline(const ggml_cgraph * cgraph) {
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
-        if (n->op == GGML_OP_FLASH_ATTN_EXT && n->src[1] && n->src[2] && n->src[1] != n->src[2] &&
+        if ((n->op == GGML_OP_FLASH_ATTN_EXT || n->op == GGML_OP_FLASH_ATTN_EXT_BANDED) && n->src[1] && n->src[2] && n->src[1] != n->src[2] &&
                 (ggml_cuda_tier_reaches_host(n->src[1]) || ggml_cuda_tier_reaches_host(n->src[2]))) {
             return true;
         }
@@ -1931,8 +1931,11 @@ static void ggml_cuda_tier_graph_begin(ggml_backend_cuda_context & ctx, ggml_cud
         }
         // ops that take the chunked path (GGML_CUDA_FA_CHUNK) copy their own K/V chunks, never read staging and
         // never call ggml_cuda_tier_fa_begin, so they stay out of the pipeline
-        if (prefetch_on && n->op == GGML_OP_FLASH_ATTN_EXT && n->src[1] && n->src[2] && n->src[1] != n->src[2] &&
-                !ggml_cuda_flash_attn_ext_chunked(n) && !ggml_cuda_fa_sparse_eligible(n) &&
+        // banded attention ops (Inkling 2, fattn-banded.cu) stage through the pipeline the same way; only those whose
+        // K/V reach the host tail call ggml_cuda_tier_fa_begin
+        if (prefetch_on && n->src[1] && n->src[2] && n->src[1] != n->src[2] &&
+                ((n->op == GGML_OP_FLASH_ATTN_EXT && !ggml_cuda_flash_attn_ext_chunked(n) && !ggml_cuda_fa_sparse_eligible(n)) ||
+                 n->op == GGML_OP_FLASH_ATTN_EXT_BANDED) &&
                 (ggml_cuda_tier_reaches_host(n->src[1]) || ggml_cuda_tier_reaches_host(n->src[2]))) {
             ts.fa.push_back(n);
         }
