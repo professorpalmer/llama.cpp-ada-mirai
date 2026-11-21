@@ -1526,13 +1526,9 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
 
     if (q->ne[1] <= fattn_banded_dec_max_q && fattn_banded_q_small_to_mma(q) && fattn_banded_kv_type_native(dst->src[1]->type)) {
         fattn_banded_mma_launch(ctx, dst, scale, rel_extent);   // GGML_CUDA_BANDED_MMA_MIN_Q (measurements)
-    } else if (dst->src[5] == nullptr && ggml_cuda_flash_attn_ext_banded_dec_supported(ctx.device, dst)) {
-        // decode and verify batches (n_tok <= 32) with f16 / q8_0 / q4_0 K/V
+    } else if (ggml_cuda_flash_attn_ext_banded_dec_supported(ctx.device, dst)) {
+        // decode and verify batches (n_tok <= 32) with f16 / q8_0 / q4_0 K/V, with or without token positions
         ggml_cuda_flash_attn_ext_banded_dec(ctx, dst);
-    } else if (dst->src[5] != nullptr && q->ne[1] <= fattn_banded_dec_max_q && fattn_banded_kv_type_native(dst->src[1]->type)) {
-        // token positions (ggml_flash_attn_ext_banded_set_pos) with q4_0 / q8_0 K/V and n_tok <= 32: the tensor-core kernel
-        // reads the positions; the decode kernel takes these ops once it reads them too (it then drops the src[5] test above)
-        fattn_banded_mma_launch(ctx, dst, scale, rel_extent);
     } else if (q->ne[1] <= fattn_banded_dec_max_q) {
         // n_tok <= 32 with f32 / bf16 K/V (or the decode kernel switched off): Unsloth's small-batch kernels
         if (sinks && fattn_banded_mma_usable(ctx.device, dst)) {

@@ -15,6 +15,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-banded-dec.cuh"
+#include "fattn-banded.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -50,6 +51,13 @@ struct banded_dec_params {
 
     int     window;      // > 0: implicit mask (no mask tensor), cell visible iff 0 <= d < window
     int     window_skip; // start each block's loop at the first tile the window can see (off in batch-invariant mode)
+
+    // token positions (ggml_flash_attn_ext_banded_set_pos, ring caches): d = pos_q[iq] - pos_kv[cell] replaces the tail
+    // rule, a cell with pos_kv < 0 is empty. nullptr: the tail rule. Stream of batch b: b % pos_*_ns.
+    const int32_t * pos_q;
+    const int32_t * pos_kv;
+    int     pos_q_ns;
+    int     pos_kv_ns;
 };
 
 static __device__ __forceinline__ float banded_dec_load_rel(const char * ptr, const int type) {
@@ -374,9 +382,17 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
 
     const int q_offset = p.n_kv - p.n_q; // the queries are the last n_q cells of the view
 
-    // implicit window: no query of this block sees a cell below ic0 + q_offset - (window - 1)
+    // token positions of this block's queries and of the cells (ring caches); without them the tail rule
+    const int32_t * pos_kv = p.pos_kv ? p.pos_kv + int64_t(sequence % p.pos_kv_ns)*p.n_kv : nullptr;
+    int pos_q[ncols1];
+#pragma unroll
+    for (int jq = 0; jq < ncols1; ++jq) {
+        pos_q[jq] = p.pos_q && (ncols1 == 1 || ic0 + jq < p.n_q) ? p.pos_q[int64_t(sequence % p.pos_q_ns)*p.n_q + ic0 + jq] : 0;
+    }
+
+    // implicit window (tail rule only): no query of this block sees a cell below ic0 + q_offset - (window - 1)
     int tile_lo = 0;
-    if (p.window > 0 && p.window_skip) {
+    if (p.window > 0 && p.window_skip && !pos_kv) {
         const int lo = ic0 + q_offset - (p.window - 1);
         tile_lo = lo > 0 ? lo / nthreads : 0;
     }
@@ -385,18 +401,22 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
         // Each lane owns one cell of its warp's 32 (cell_t = k_VKQ_0 + tid) for the bias, the mask and the softmax: the
         // per-cell loop below only computes the dots. bias_t / mask_t hold this lane's band bias and mask per column.
         const int  cell_t  = k_VKQ_0 + tid;
-        const bool valid_t = cell_t < p.n_kv;
+        const bool valid_t = cell_t < p.n_kv; // a cell past the view is never visible
+        // the cell's position: pos_kv (ring caches; < 0 = empty cell) or the tail rule (pk = cell index)
+        const int  pk_t    = pos_kv ? (valid_t ? pos_kv[cell_t] : -1) : cell_t;
         float bias_t[ncols];
         float mask_t[ncols1];
         bool visible = false;
 #pragma unroll
         for (int jq = 0; jq < ncols1; ++jq) {
             const int iq = ic0 + jq;
-            const int d  = iq + q_offset - cell_t;
+            // shared definition of distance and visibility (fattn-banded.cuh), as in the prefill kernels
+            int d;
+            const bool vis = fattn_banded_visible(pos_kv ? pos_q[jq] : iq + q_offset, pk_t, p.window, d);
             float mv = -INFINITY;
-            if (valid_t && (ncols1 == 1 || iq < p.n_q)) {
+            if (valid_t && vis && (ncols1 == 1 || iq < p.n_q)) {
                 if (p.window > 0) {
-                    mv = d >= 0 && d < p.window ? 0.0f : -INFINITY;
+                    mv = 0.0f;
                 } else if (p.mask && p.ne32 == 1) {
                     mv = __half2float(((const half *) (p.mask + (sequence % p.ne33)*p.nb33 + int64_t(iq)*p.nb31))[cell_t]);
                 } else {
@@ -428,10 +448,12 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
             continue;
         }
 
-        // P.V operands: the V rows of the first half of the warp's cells are loaded now, so that these loads overlap the
-        // Q.K work below; the second half is loaded before the first half is used.
-        constexpr int n_pre_V   = 16/V_cols_per_iter;       // V pieces per group (16 cells)
-        constexpr int n_vgroups = WARP_SIZE/16;             // 2
+        // P.V operands: the V rows of the warp's first cell group are loaded now, so that these loads overlap the Q.K work
+        // below; each next group is loaded before the current one is used. Many columns (more registers per cell):
+        // smaller groups, so that the per-column state does not spill.
+        constexpr int cells_vg  = 8;                        // cells per V group
+        constexpr int n_pre_V   = cells_vg/V_cols_per_iter; // V pieces per group
+        constexpr int n_vgroups = WARP_SIZE/cells_vg;
         banded_dec_v_piece<type_KV> vp[n_vgroups][n_pre_V];
 #pragma unroll
         for (int i1 = 0; i1 < n_pre_V; ++i1) {
@@ -443,7 +465,7 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
 
         // Q.K: the dot of each cell is reduced over its nthreads_KQ threads and the owning lane keeps it. The K rows of
         // n_pre cells are loaded before any of them is used, so that n_pre loads per warp are in flight together.
-        constexpr int n_pre = 8;
+        constexpr int n_pre = ncols > 3 ? 4 : 8;
         float KQ_reg[ncols];
 #pragma unroll
         for (int c = 0; c < ncols; ++c) {
@@ -473,11 +495,13 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
             }
         }
 
-        // online softmax, per warp; this lane holds the KQ value of cell_t
+        // online softmax, per warp; this lane holds the KQ value of cell_t. vis_t: the cell is visible for a column.
+        bool vis_t = false;
 #pragma unroll
         for (int c = 0; c < ncols; ++c) {
             const float m = mask_t[c / ncols2];
             const float s = m == -INFINITY ? -INFINITY : KQ_reg[c] + bias_t[c] + m;
+            vis_t = vis_t || s != -INFINITY;
             const float KQ_max_new = fmaxf(KQ_max[c], warp_reduce_max(s) + FATTN_KQ_MAX_OFFSET);
             const float KQ_max_scale = expf(KQ_max[c] - KQ_max_new);
             KQ_max[c] = KQ_max_new;
@@ -494,13 +518,16 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
 
         __syncwarp();
 
+        // the cells of this warp that some column sees (the others add weight 0 and are skipped, see below)
+        const uint32_t vis_mask = __ballot_sync(0xFFFFFFFF, vis_t);
+
         // P.V
 #pragma unroll
         for (int g = 0; g < n_vgroups; ++g) {
             if (g + 1 < n_vgroups) {
 #pragma unroll
                 for (int i1 = 0; i1 < n_pre_V; ++i1) {
-                    const int k = warp*WARP_SIZE + (g + 1)*16 + i1*V_cols_per_iter + (nthreads_V == WARP_SIZE ? 0 : lane / nthreads_V);
+                    const int k = warp*WARP_SIZE + (g + 1)*cells_vg + i1*V_cols_per_iter + (nthreads_V == WARP_SIZE ? 0 : lane / nthreads_V);
                     if (k_VKQ_0 + k < p.n_kv) {
                         vp[g + 1][i1].template load<nthreads_V>(V + int64_t(k_VKQ_0 + k)*p.nb21);
                     }
@@ -508,8 +535,10 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
             }
 #pragma unroll
             for (int i1 = 0; i1 < n_pre_V; ++i1) {
-                const int k = warp*WARP_SIZE + g*16 + i1*V_cols_per_iter + (nthreads_V == WARP_SIZE ? 0 : lane / nthreads_V);
-                if (k_VKQ_0 + k >= p.n_kv) {
+                const int k = warp*WARP_SIZE + g*cells_vg + i1*V_cols_per_iter + (nthreads_V == WARP_SIZE ? 0 : lane / nthreads_V);
+                // a cell no column sees (masked, empty ring cell, past the view) adds weight 0: skip its V row, whose
+                // bytes need not be finite (an empty cell of a padded view)
+                if (vis_mask != 0xFFFFFFFF && !((vis_mask >> (k % WARP_SIZE)) & 1)) {
                     continue;
                 }
                 float2 tmp[2];
@@ -693,11 +722,17 @@ static void banded_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     p.sink_s1 = sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0;
     p.sink_s2 = sinks && sinks->ne[2] > 1 ? int64_t(sinks->nb[2] / sizeof(float)) : 0;
     p.window  = ggml_get_op_params_i32(dst, 4);
+    const ggml_tensor * pos_kv = dst->src[5];
+    const ggml_tensor * pos_q  = dst->src[7];
+    p.pos_q     = pos_q  ? (const int32_t *) pos_q->data  : nullptr;
+    p.pos_kv    = pos_kv ? (const int32_t *) pos_kv->data : nullptr;
+    p.pos_q_ns  = pos_q  ? (int) pos_q->ne[1]  : 1;
+    p.pos_kv_ns = pos_kv ? (int) pos_kv->ne[1] : 1;
 
     const int ntiles_x  = (p.n_q + ncols1 - 1) / ncols1;
     const int n_groups  = p.n_head / ncols2;
     // tiles a block's loop can visit: with an implicit window only those the window reaches
-    const int64_t n_kv_vis = p.window > 0 ? std::min<int64_t>(p.n_kv, int64_t(p.window) + ncols1 - 1 + 4*WARP_SIZE) : p.n_kv;
+    const int64_t n_kv_vis = p.window > 0 && !p.pos_kv ? std::min<int64_t>(p.n_kv, int64_t(p.window) + ncols1 - 1 + 4*WARP_SIZE) : p.n_kv;
     const int ntiles_KV = (int) ((n_kv_vis + 4*WARP_SIZE - 1) / (4*WARP_SIZE));
 
     const dim3 block_dim(WARP_SIZE, 4, 1);
@@ -821,7 +856,7 @@ bool ggml_cuda_flash_attn_ext_banded_dec_supported(int device, const ggml_tensor
     if (!q || !k || !v || !rel || q->type != GGML_TYPE_F32) {
         return false;
     }
-    if (q->ne[1] < 1 || q->ne[1] > GGML_CUDA_BANDED_DEC_MAX_Q) {
+    if (q->ne[1] < 1 || q->ne[1] > ggml_cuda_banded_dec_max_q(k->type)) {
         return false;
     }
     if (k->type != v->type || (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_Q4_0)) {
@@ -866,6 +901,18 @@ bool ggml_cuda_flash_attn_ext_banded_dec_supported(int device, const ggml_tensor
     }
     const int32_t window = ggml_get_op_params_i32(dst, 4);
     if (window < 0 || (window > 0 && m)) {
+        return false;
+    }
+    // token positions (ring caches): both or none, with the implicit window
+    const ggml_tensor * pos_kv = dst->src[5];
+    const ggml_tensor * pos_q  = dst->src[7];
+    if ((pos_kv != nullptr) != (pos_q != nullptr)) {
+        return false;
+    }
+    if (pos_kv && (window <= 0 || m || pos_kv->type != GGML_TYPE_I32 || pos_q->type != GGML_TYPE_I32 ||
+                   !ggml_is_contiguous(pos_kv) || !ggml_is_contiguous(pos_q) ||
+                   pos_kv->ne[0] != k->ne[1] || pos_q->ne[0] != q->ne[1] ||
+                   q->ne[3] % pos_kv->ne[1] != 0 || q->ne[3] % pos_q->ne[1] != 0)) {
         return false;
     }
     if (m && (m->type != GGML_TYPE_F16 || m->nb[0] != sizeof(half) || m->ne[0] < k->ne[1] || m->ne[1] < q->ne[1] ||
