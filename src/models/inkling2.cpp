@@ -375,8 +375,11 @@ ggml_tensor * llama_model_inkling2::graph::dense_attn(
 llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(model) {
     auto * inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
     auto * attn = inp->get_attn();
-    // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
-    inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
+    // banded FA needs a position-contiguous cache. This tree: the banded op takes every ubatch size (the decode kernel
+    // covers 1-32 rows) and f16 / q8_0 / q4_0 K/V, with the implicit window instead of a mask tensor.
+    // LLAMA_INKLING_MASKED=1 restores Unsloth's choice (dense for ubatches of 32 rows or fewer, the F16 mask tensor).
+    static const bool masked = [] { const char * e = getenv("LLAMA_INKLING_MASKED"); return e && atoi(e) != 0; }();
+    inp->banded = cparams.flash_attn && (!masked || n_tokens > n_tokens_banded_min);
     for (int i = 0; i < 2 && inp->banded; ++i) {
         inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
     }
@@ -385,7 +388,8 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
         const int64_t hd = hparams.n_embd_head_k(il);
         const auto type_ok = [](ggml_type t) {
-            return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
+            return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 ||
+                (!masked && (t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0));
         };
         if (!(inp->n_kv_banded[swa] > 0 && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
                 type_ok(cache->type_k()) && type_ok(cache->type_v()) &&
@@ -403,13 +407,18 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         }
         const int64_t nh  = hparams.n_head(il);
         const int64_t nkv = hparams.n_head_kv(il);
-        ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, 1, nh, 1);
-        ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, 1, nkv, 1);
-        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, 1, nkv, 1);
-        ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
-        ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
+        // the probe has the shape of the real call (rows = n_tokens): the kernels differ by row count and K/V type
+        const int64_t nr = masked ? 1 : n_tokens;
+        ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, nr, nh, 1);
+        ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, nr, nkv, 1);
+        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, nr, nkv, 1);
+        ggml_tensor * pm = masked ? ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, nr, nr, 1, 1) : nullptr;
+        ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, nr, 1);
         ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
-        ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
+        if (!masked) {
+            ggml_flash_attn_ext_banded_set_window(op, swa ? (int32_t) hparams.n_swa : INT32_MAX);
+        }
+        ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, nr, 1));
         ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
         const bool ok = ggml_backend_dev_supports_op(dev, op);
         banded_dev_ok.push_back({ { swa, dev }, ok });
@@ -588,13 +597,20 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                     v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_b, v_all->ne[3],
                             v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
                 }
-                ggml_tensor * mask = is_swa ? attn->self_kq_mask_swa : attn->self_kq_mask;
-                ggml_tensor * m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
-                        mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                // the implicit window (causal for the global layers, n_swa for the SWA layers) replaces the mask tensor
+                ggml_tensor * m = nullptr;
+                if (masked) {
+                    ggml_tensor * mask = is_swa ? attn->self_kq_mask_swa : attn->self_kq_mask;
+                    m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+                            mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                }
                 // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
                 ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
                 rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
                 cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
+                if (!masked) {
+                    ggml_flash_attn_ext_banded_set_window(cur, is_swa ? (int32_t) hparams.n_swa : INT32_MAX);
+                }
                 ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
                 ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
                 res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});

@@ -17,6 +17,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -2726,6 +2727,28 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     this->n_outputs = save_n_outputs;
+
+    // LLAMA_GRAPH_TOP=N: print the N largest nodes of the reserved graph (compute-buffer analysis; the buffer is the
+    // allocator's peak of live tensors, so these are the candidates, not a sum)
+    if (gf && !split_only) {
+        static const int graph_top = [] { const char * e = getenv("LLAMA_GRAPH_TOP"); return e ? atoi(e) : 0; }();
+        if (graph_top > 0) {
+            std::vector<ggml_tensor *> nodes;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                if (t->view_src == nullptr) {
+                    nodes.push_back(t);
+                }
+            }
+            std::sort(nodes.begin(), nodes.end(), [](const ggml_tensor * a, const ggml_tensor * b) { return ggml_nbytes(a) > ggml_nbytes(b); });
+            LLAMA_LOG_INFO("%s: graph top %d of %zu non-view nodes (n_tokens %u, n_outputs %u):\n", __func__, graph_top, nodes.size(), n_tokens, n_outputs);
+            for (int i = 0; i < graph_top && i < (int) nodes.size(); ++i) {
+                const ggml_tensor * t = nodes[i];
+                LLAMA_LOG_INFO("  %8.2f MiB  %-14s %-28s [%lld, %lld, %lld, %lld] %s\n", ggml_nbytes(t)/1048576.0, ggml_op_desc(t), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type));
+            }
+        }
+    }
 
     // initialize scheduler with the specified graph
     if (split_only) {
