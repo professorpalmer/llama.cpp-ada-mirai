@@ -8608,16 +8608,6 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
-
-    // Inkling 2 Mini shapes (MoE perf agent): correctness at the real expert shapes
-    for (int n : {1, 3, 4, 32}) {
-        for (ggml_type t : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S}) {
-            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304));
-        }
-        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4}) {
-            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, true, 2304, n, 1152));
-        }
-    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -10692,15 +10682,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // Inkling 2 Mini shapes (MoE perf agent)
-    // experts: 128, top-8; gate_up fused 2304 -> 2304 (broadcast input), down 1152 -> 2304 (one input per expert)
-    for (int n : {1, 2, 3, 4, 8, 16, 32, 64, 512}) {
-        for (ggml_type t : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S}) {
-            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304));
-        }
-        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4}) {
-            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, true, 2304, n, 1152));
-        }
-    }
+    // no MUL_MAT_ID cases at the expert shape here: 128 experts x 2304 x 2304 of an IQ type take minutes of CPU
+    // quantization for each case, and the release file has trellis experts (test-escha-moe covers those)
     // router (F32), attention projections and the head at decode
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 2304, {1, 1}, {1, 1}));
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ3_XXS}) {
