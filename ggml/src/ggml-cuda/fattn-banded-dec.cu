@@ -20,6 +20,14 @@
 #include <algorithm>
 #include <cstdint>
 
+// load-group sizes (compile-time tuning knobs, 0 = the defaults in the kernel)
+#ifndef GGML_CUDA_BANDED_DEC_VG
+#define GGML_CUDA_BANDED_DEC_VG 0
+#endif
+#ifndef GGML_CUDA_BANDED_DEC_KPRE
+#define GGML_CUDA_BANDED_DEC_KPRE 0
+#endif
+
 struct banded_dec_params {
     const char  * Q;
     const char  * K;
@@ -75,6 +83,19 @@ static __device__ __forceinline__ float banded_dec_load_rel(const char * ptr, co
 
 // The K row piece of one thread: 4 consecutive values of the row at 4*(lane % nthreads_KQ), in the form the dot with
 // each column's Q needs. Loaded and unpacked once per cell, used by every column of the block.
+// 4 bytes at a 2-byte aligned address, as two 16-bit loads joined in a register (no address of a register variable is
+// taken, which could force the K / V pieces into local memory)
+static __device__ __forceinline__ int banded_dec_ld4(const void * p) {
+    const uint16_t * h = (const uint16_t *) p;
+    return (int) ((uint32_t) h[0] | ((uint32_t) h[1] << 16));
+}
+
+// 2 half2 at a 4-byte aligned address
+static __device__ __forceinline__ void banded_dec_ld_h2x2(const half2 * p, half2 & a, half2 & b) {
+    a = p[0];
+    b = p[1];
+}
+
 template <ggml_type type_K, int VPL>
 struct banded_dec_k_piece;
 
@@ -84,10 +105,10 @@ struct banded_dec_k_piece<GGML_TYPE_F16, 4> {
     float2 a, b;
     template <int nthreads_KQ>
     __device__ __forceinline__ void load(const char * K_row) {
-        half2 tmp[2];
-        ggml_cuda_memcpy_1<2*sizeof(half2), 4>(tmp, (const half2 *) K_row + 2*(threadIdx.x % nthreads_KQ));
-        a = __half22float2(tmp[0]);
-        b = __half22float2(tmp[1]);
+        half2 ta, tb;
+        banded_dec_ld_h2x2((const half2 *) K_row + 2*(threadIdx.x % nthreads_KQ), ta, tb);
+        a = __half22float2(ta);
+        b = __half22float2(tb);
     }
     __device__ __forceinline__ float dot(const float2 * Qf, const int * Qi, const float2 Qds) const {
         GGML_UNUSED(Qi);
@@ -108,7 +129,7 @@ struct banded_dec_k_piece<GGML_TYPE_Q4_0, 4> {
         const int ib    = k_KQ /  QI8_1;
         const int iqs4  = k_KQ %  QI4_0;
         const int shift = k_KQ & (QI8_1/2);
-        ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_q4_0[ib].qs + sizeof(int)*iqs4);
+        v = banded_dec_ld4(K_q4_0[ib].qs + sizeof(int)*iqs4);
         v = (v >> shift) & 0x0F0F0F0F;
         d = __half2float(K_q4_0[ib].d);
     }
@@ -130,7 +151,7 @@ struct banded_dec_k_piece<GGML_TYPE_Q8_0, 4> {
         const int k_KQ = threadIdx.x % nthreads_KQ;
         const int ib   = k_KQ / QI8_0;
         const int iqs  = k_KQ % QI8_0;
-        ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_q8_0[ib].qs + sizeof(int)*iqs);
+        v = banded_dec_ld4(K_q8_0[ib].qs + sizeof(int)*iqs);
         d = __half2float(K_q8_0[ib].d);
     }
     __device__ __forceinline__ float dot(const float2 * Qf, const int * Qi, const float2 Qds) const {
@@ -151,10 +172,9 @@ struct banded_dec_k_piece<GGML_TYPE_Q4_0, 16> {
         const int t     = threadIdx.x % nthreads_KQ;
         const block_q4_0 * x = (const block_q4_0 *) K_row + t/2;
         const int shift = 4*(t % 2);
-        ggml_cuda_memcpy_1<4*sizeof(int), 2>(v, x->qs);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            v[j] = (v[j] >> shift) & 0x0F0F0F0F;
+            v[j] = (banded_dec_ld4(x->qs + 4*j) >> shift) & 0x0F0F0F0F;
         }
         d = __half2float(x->d);
     }
@@ -178,7 +198,10 @@ struct banded_dec_k_piece<GGML_TYPE_Q8_0, 16> {
     __device__ __forceinline__ void load(const char * K_row) {
         const int t = threadIdx.x % nthreads_KQ;
         const block_q8_0 * x = (const block_q8_0 *) K_row + t/2;
-        ggml_cuda_memcpy_1<4*sizeof(int), 2>(v, x->qs + 16*(t % 2));
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[j] = banded_dec_ld4(x->qs + 16*(t % 2) + 4*j);
+        }
         d = __half2float(x->d);
     }
     __device__ __forceinline__ float dot(const float2 * Qf, const int * Qi, const float2 Qds) const {
@@ -192,6 +215,11 @@ struct banded_dec_k_piece<GGML_TYPE_Q8_0, 16> {
     }
 };
 
+// signed byte i of x as float, by shifts (taking the address of a register value can force it into local memory)
+static __device__ __forceinline__ float banded_dec_s8(const int x, const int i) {
+    return (float) (((int) ((unsigned int) x << (24 - 8*i))) >> 24);
+}
+
 // The V row piece of one thread: 4 consecutive values of the row at 4*(lane % nthreads_V), loaded raw first (so that
 // the loads of several cells are in flight together) and converted to fp32 when used.
 template <ggml_type type_V>
@@ -202,7 +230,7 @@ struct banded_dec_v_piece<GGML_TYPE_F16> {
     half2 h[2];
     template <int nthreads_V>
     __device__ __forceinline__ void load(const char * V_row) {
-        ggml_cuda_memcpy_1<2*sizeof(half2), 4>(h, (const half2 *) V_row + 2*(threadIdx.x % nthreads_V));
+        banded_dec_ld_h2x2((const half2 *) V_row + 2*(threadIdx.x % nthreads_V), h[0], h[1]);
     }
     __device__ __forceinline__ void get(float2 * out) const {
         out[0] = __half22float2(h[0]);
@@ -221,15 +249,14 @@ struct banded_dec_v_piece<GGML_TYPE_Q4_0> {
         const int ib    = i0 / QK4_0;
         const int iqs   = i0 % (QK4_0/2);
         const int shift = (i0 % QK4_0) / (QK4_0/2);
-        ggml_cuda_memcpy_1<sizeof(int), 2>(&q, x[ib].qs + iqs);
+        q = banded_dec_ld4(x[ib].qs + iqs);
         q = (q >> (4*shift)) & 0x0F0F0F0F;
         d = __half2float(x[ib].d);
     }
     __device__ __forceinline__ void get(float2 * out) const {
         const int qs = __vsubss4(q, 0x08080808);
-        const int8_t * q8 = (const int8_t *) &qs;
-        out[0] = make_float2(d*q8[0], d*q8[1]);
-        out[1] = make_float2(d*q8[2], d*q8[3]);
+        out[0] = make_float2(d*banded_dec_s8(qs, 0), d*banded_dec_s8(qs, 1));
+        out[1] = make_float2(d*banded_dec_s8(qs, 2), d*banded_dec_s8(qs, 3));
     }
 };
 
@@ -242,13 +269,12 @@ struct banded_dec_v_piece<GGML_TYPE_Q8_0> {
         const block_q8_0 * x = (const block_q8_0 *) V_row;
         const int i0 = 4*(threadIdx.x % nthreads_V);
         const int ib = i0 / QK8_0;
-        ggml_cuda_memcpy_1<sizeof(int), 2>(&q, x[ib].qs + i0 % QK8_0);
+        q = banded_dec_ld4(x[ib].qs + i0 % QK8_0);
         d = __half2float(x[ib].d);
     }
     __device__ __forceinline__ void get(float2 * out) const {
-        const int8_t * q8 = (const int8_t *) &q;
-        out[0] = make_float2(d*q8[0], d*q8[1]);
-        out[1] = make_float2(d*q8[2], d*q8[3]);
+        out[0] = make_float2(d*banded_dec_s8(q, 0), d*banded_dec_s8(q, 1));
+        out[1] = make_float2(d*banded_dec_s8(q, 2), d*banded_dec_s8(q, 3));
     }
 };
 
@@ -451,7 +477,7 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
         // P.V operands: the V rows of the warp's first cell group are loaded now, so that these loads overlap the Q.K work
         // below; each next group is loaded before the current one is used. Many columns (more registers per cell):
         // smaller groups, so that the per-column state does not spill.
-        constexpr int cells_vg  = 8;                        // cells per V group
+        constexpr int cells_vg  = GGML_CUDA_BANDED_DEC_VG > 0 ? GGML_CUDA_BANDED_DEC_VG : 8; // cells per V group
         constexpr int n_pre_V   = cells_vg/V_cols_per_iter; // V pieces per group
         constexpr int n_vgroups = WARP_SIZE/cells_vg;
         banded_dec_v_piece<type_KV> vp[n_vgroups][n_pre_V];
@@ -465,7 +491,7 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
 
         // Q.K: the dot of each cell is reduced over its nthreads_KQ threads and the owning lane keeps it. The K rows of
         // n_pre cells are loaded before any of them is used, so that n_pre loads per warp are in flight together.
-        constexpr int n_pre = ncols > 3 ? 4 : 8;
+        constexpr int n_pre = GGML_CUDA_BANDED_DEC_KPRE > 0 ? GGML_CUDA_BANDED_DEC_KPRE : (ncols > 3 ? 4 : 8);
         float KQ_reg[ncols];
 #pragma unroll
         for (int c = 0; c < ncols; ++c) {
@@ -536,13 +562,15 @@ static __global__ void flash_attn_ext_banded_vec(const banded_dec_params p) {
 #pragma unroll
             for (int i1 = 0; i1 < n_pre_V; ++i1) {
                 const int k = warp*WARP_SIZE + g*cells_vg + i1*V_cols_per_iter + (nthreads_V == WARP_SIZE ? 0 : lane / nthreads_V);
-                // a cell no column sees (masked, empty ring cell, past the view) adds weight 0: skip its V row, whose
-                // bytes need not be finite (an empty cell of a padded view)
-                if (vis_mask != 0xFFFFFFFF && !((vis_mask >> (k % WARP_SIZE)) & 1)) {
-                    continue;
-                }
+                // a cell no column sees (masked, empty ring cell, past the view) has weight 0 in every column; its V values
+                // are replaced by 0 (a select, no branch), so the bytes of an empty cell of a padded view need not be finite
+                const bool vis_k = vis_mask == 0xFFFFFFFF || ((vis_mask >> (k % WARP_SIZE)) & 1);
                 float2 tmp[2];
                 vp[g][i1].get(tmp);
+                if (!vis_k) {
+                    tmp[0] = make_float2(0.0f, 0.0f);
+                    tmp[1] = make_float2(0.0f, 0.0f);
+                }
 #pragma unroll
                 for (int c = 0; c < ncols; ++c) {
                     const float w = KQ[c*nthreads + k];
