@@ -3325,6 +3325,77 @@ static void ggml_compute_forward_swiglu(
     }
 }
 
+// ggml_compute_forward_situ
+// the same float steps as the unfused chain scale -> tanh -> scale, sigmoid, mul, (scale -> tanh -> scale), mul
+
+static void ggml_compute_forward_situ_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src1 != nullptr);
+
+    char * src0_d = (char *) src0->data;
+    char * src1_d = (char *) src1->data;
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(src1));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, dst));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc = src0->ne[0];
+    const int64_t nr = ggml_nrows(src0);
+
+    const float beta     = ggml_get_op_params_f32(dst, 2);
+    const float lb       = ggml_get_op_params_f32(dst, 3);
+    const float inv_beta = 1.0f/beta;
+    const float inv_lb   = lb > 0.0f ? 1.0f/lb : 0.0f;
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ir++) {
+        const int64_t i3 = ir/(src0->ne[2]*src0->ne[1]);
+        const int64_t i2 = (ir - i3*src0->ne[2]*src0->ne[1])/src0->ne[1];
+        const int64_t i1 = ir - i3*src0->ne[2]*src0->ne[1] - i2*src0->ne[1];
+
+        const float * g = (const float *) (src0_d + i1*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3]);
+        const float * u = (const float *) (src1_d + i1*src1->nb[1] + i2*src1->nb[2] + i3*src1->nb[3]);
+        float       * y = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        for (int64_t k = 0; k < nc; k++) {
+            const float x   = g[k];
+            const float act = (tanhf(x*inv_beta)*beta) * (1.0f/(1.0f + expf(-x)));
+            const float up  = lb > 0.0f ? tanhf(u[k]*inv_lb)*lb : u[k];
+            y[k] = act*up;
+        }
+    }
+}
+
+static void ggml_compute_forward_situ(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_situ_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_swiglu_oai
 
 static void ggml_compute_forward_swiglu_oai_f32(
@@ -10376,6 +10447,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_GEGLU_QUICK:
             {
                 ggml_compute_forward_geglu_quick(params, dst);
+            } break;
+        case GGML_GLU_OP_SITU:
+            {
+                ggml_compute_forward_situ(params, dst);
             } break;
         default:
             {
