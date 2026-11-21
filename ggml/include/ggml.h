@@ -593,6 +593,7 @@ extern "C" {
         GGML_OP_MIRAI_MUL_MAT,
         GGML_OP_ESCHA_MOE,
         GGML_OP_ESCHA_MUL_MAT,
+        GGML_OP_L2_CLIP,
 
         GGML_OP_UNARY,
 
@@ -2396,6 +2397,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             enum ggml_tri_type    type);
+
+    // y = v * clamp(threshold / (|v| + 1e-6), 0, 1) for each row (dim 0) of v = a * scale (Inkling 2 q, k and r clips)
+    // scale: NULL or F32 [a->ne[0], ...] that repeats to a. The rows of a need contiguous elements only
+    GGML_API struct ggml_tensor * ggml_l2_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * scale,
+            float                 threshold);
 
     // Fill tensor a with constant c
     GGML_API struct ggml_tensor * ggml_fill(

@@ -2224,6 +2224,82 @@ struct test_glu_split : public test_case {
     }
 };
 
+// GGML_OP_L2_CLIP (Inkling 2 clips): x [D, H, T] (a view with a row stride when v = 1), scale [D, H] or none.
+// mode 0: the op. mode 1: op - (the chain mul, sqr, sum_rows, sqrt, scale_bias, fill, div, clamp, mul) + x, against the CPU.
+// mode 2: batch invariance: op(all rows)[token 0] - op(token 0 alone) + x[token 0]; must be exact (max NMSE 0)
+struct test_l2_clip : public test_case {
+    const std::array<int64_t, 3> ne;
+    const bool  with_scale;
+    const float th;
+    const int   v;
+    const int   mode;
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, with_scale, th, v, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "L2_CLIP";
+    }
+
+    // the chain and invariance modes compare the final output only (their inner nodes are differences near 0)
+    bool run_whole_graph() override { return mode != 0; }
+
+    double max_nmse_err() override {
+        return mode == 2 ? 0.0 : 1e-7;
+    }
+
+    test_l2_clip(std::array<int64_t, 3> ne = {128, 24, 1}, bool with_scale = true, float th = 25.0f, int v = 0, int mode = 0)
+        : ne(ne), with_scale(with_scale), th(th), v(v), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0] + 16, ne[1], ne[2]);
+            ggml_set_name(big, "big");
+            x = ggml_view_3d(ctx, big, ne[0], ne[1], ne[2], big->nb[1], big->nb[2], 0);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+            ggml_set_name(x, "x");
+        }
+        ggml_tensor * sc = nullptr;
+        if (with_scale) {
+            sc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(sc, "scale");
+        }
+
+        ggml_tensor * out = ggml_l2_clip(ctx, x, sc, th);
+        if (mode == 1) {
+            ggml_tensor * xc  = ggml_cont(ctx, x);
+            ggml_tensor * cur = sc ? ggml_mul(ctx, xc, sc) : xc;
+            ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
+            norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+            ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, th), norm);
+            ggml_tensor * ref = ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+            out = ggml_add(ctx, ggml_sub(ctx, out, ref), xc);
+        } else if (mode == 2) {
+            ggml_tensor * x0 = ggml_cont(ctx, ggml_view_3d(ctx, x, ne[0], ne[1], 1, x->nb[1], x->nb[2], 0));
+            ggml_tensor * alone = ggml_l2_clip(ctx, x0, sc, th);
+            ggml_tensor * all0  = ggml_view_3d(ctx, out, ne[0], ne[1], 1, out->nb[1], out->nb[2], 0);
+            out = ggml_add(ctx, ggml_sub(ctx, all0, alone), x0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "scale") == 0) {
+                init_tensor_uniform(t, 0.5f, 2.0f);
+            } else {
+                // rows below and above the threshold
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_GLU SITU (Inkling 2, Kimi-K3): gate and up as separate tensors (v = 0) or as the row views of one fused
 // gate_up tensor (v = 1, as the MoE path gives them). chain = 1: out = situ - (unfused chain) + gate, so a fused
 // kernel that drifts from the chain of scale / tanh / sigmoid / mul ops shows as an error against the CPU;
@@ -8871,6 +8947,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // L2_CLIP: q (128 x 24 heads, scale), k (128 x 8, none), r (16 x 24, scale); decode 1 and 8 rows, prefill 512; views; chain; invariance
+    for (int64_t t : {1, 8, 512}) {
+        for (int mode : {0, 1}) {
+            test_cases.emplace_back(new test_l2_clip({128, 24, t}, true,  25.0f, 0, mode));
+            test_cases.emplace_back(new test_l2_clip({128,  8, t}, false, 25.0f, 1, mode));
+            test_cases.emplace_back(new test_l2_clip({ 16, 24, t}, true,   4.0f, 0, mode));
+        }
+    }
+    for (int64_t t : {8, 512}) {
+        test_cases.emplace_back(new test_l2_clip({128, 24, t}, true, 25.0f, 0, 2));
+        test_cases.emplace_back(new test_l2_clip({ 16, 24, t}, true,  4.0f, 1, 2));
+    }
+
     // SITU: separate gate / up and the fused gate_up row views; with and without the up cap; against the chain
     for (int v : {0, 1}) {
         for (float lb : {25.0f, 0.0f}) {
@@ -10996,6 +11085,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // MoE combine: (experts x expert scale) x router weights, 8-way sum
     for (int n : {1, 512}) {
         test_cases.emplace_back(new test_moe_weighted_reduction(2304, 8, n, false, true));
+    }
+    // L2_CLIP at the q shape, 1 and 512 tokens
+    for (int64_t t : {1, 512}) {
+        test_cases.emplace_back(new test_l2_clip({128, 24, t}, true, 25.0f, 0, 0));
     }
     // SITU on the fused gate_up row views (1152 x 8 experts x n tokens)
     for (int n : {1, 512}) {

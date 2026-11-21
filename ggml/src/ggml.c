@@ -1137,6 +1137,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MIRAI_MUL_MAT",
     "ESCHA_MOE",
     "ESCHA_MUL_MAT",
+    "L2_CLIP",
 
     "UNARY",
 
@@ -1154,7 +1155,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1257,6 +1258,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "mirai_mul_mat(w, xq, scale)",
     "escha_moe(code, x, ids)",
     "escha_mul_mat(code, x)",
+    "l2_clip(x)",
 
     "unary(x)",
 
@@ -1274,7 +1276,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5394,6 +5396,31 @@ struct ggml_tensor * ggml_tri(
 
     result->op = GGML_OP_TRI;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_l2_clip
+
+struct ggml_tensor * ggml_l2_clip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * scale,
+        float                 threshold) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->nb[0] == sizeof(float));
+    if (scale) {
+        GGML_ASSERT(scale->type == GGML_TYPE_F32 && scale->nb[0] == sizeof(float));
+        GGML_ASSERT(scale->ne[0] == a->ne[0] && ggml_can_repeat(scale, a));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params_f32(result, 0, threshold);
+
+    result->op     = GGML_OP_L2_CLIP;
+    result->src[0] = a;
+    result->src[1] = scale;
 
     return result;
 }

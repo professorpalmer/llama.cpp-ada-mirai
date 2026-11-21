@@ -2051,6 +2051,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_fill(params, tensor);
             } break;
+        case GGML_OP_L2_CLIP:
+            {
+                ggml_compute_forward_l2_clip(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {
@@ -2308,6 +2312,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_FILL:
+        case GGML_OP_L2_CLIP:
             {
                 n_tasks = n_threads;
             } break;

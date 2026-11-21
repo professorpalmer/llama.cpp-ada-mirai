@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -2290,6 +2291,53 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
             {
                 GGML_ABORT("unsupported type for ggml_compute_forward_fill: %s", ggml_type_name(src0->type));
             }
+    }
+}
+
+// ggml_compute_forward_l2_clip
+// the float steps of the chain mul, sqr, sum_rows, sqrt, scale_bias, fill, div, clamp, mul
+
+void ggml_compute_forward_l2_clip(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0  = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const float th = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t ne0   = src0->ne[0];
+    const int64_t nrows = ggml_nrows(src0);
+    const int64_t dr    = (nrows + params->nth - 1)/params->nth;
+    const int64_t ir0   = dr*params->ith;
+    const int64_t ir1   = MIN(ir0 + dr, nrows);
+
+    std::vector<float> v(ne0);
+    std::vector<float> v2(ne0);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i1 = ir % src0->ne[1];
+        const int64_t i2 = (ir / src0->ne[1]) % src0->ne[2];
+        const int64_t i3 = ir / (src0->ne[1]*src0->ne[2]);
+
+        const float * xr = (const float *) ((const char *) src0->data + i1*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3]);
+        const float * sr = scale ? (const float *) ((const char *) scale->data + (i1 % scale->ne[1])*scale->nb[1] +
+                (i2 % scale->ne[2])*scale->nb[2] + (i3 % scale->ne[3])*scale->nb[3]) : nullptr;
+        float * yr = (float *) ((char *) dst->data + ir*dst->nb[1]);
+
+        for (int64_t i = 0; i < ne0; ++i) {
+            v[i]  = sr ? xr[i]*sr[i] : xr[i];
+            v2[i] = v[i]*v[i];
+        }
+        float sum = 0.0f;
+        ggml_vec_sum_f32((int) ne0, &sum, v2.data());
+
+        const float norm = 1.0f*sqrtf(sum) + 1e-6f;
+        const float f    = fminf(fmaxf(th/norm, 0.0f), 1.0f);
+
+        for (int64_t i = 0; i < ne0; ++i) {
+            yr[i] = v[i]*f;
+        }
     }
 }
 
