@@ -427,6 +427,55 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     swiglu_oai_cuda(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), alpha, limit, stream);
 }
 
+// situ (Inkling 2, Kimi-K3): beta*tanh(x/beta)*sigmoid(x) * (lb > 0 ? lb*tanh(g/lb) : g)
+// the same float steps as the unfused chain scale -> tanh -> scale, sigmoid, mul, (scale -> tanh -> scale), mul;
+// x and g are rows of any row stride (the fused gate_up split gives row views), dst is contiguous
+
+static __global__ void situ_kernel(const float * x, const float * g, float * dst, const int64_t k, const int64_t n,
+        const int64_t o0, const int64_t o1, const float beta, const float inv_beta, const float lb, const float inv_lb) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = i / n;
+    const int64_t col = i - row*n;
+
+    const float xi = x[row*o0 + col];
+    const float gi = g[row*o1 + col];
+
+    const float act = (tanhf(xi*inv_beta)*beta) * (1.0f / (1.0f + expf(-xi)));
+    const float up  = lb > 0.0f ? tanhf(gi*inv_lb)*lb : gi;
+
+    dst[i] = act*up;
+}
+
+void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src1 != nullptr);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(src0) && src0->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous_1(src1) && src1->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, dst));
+
+    const float beta = ggml_get_op_params_f32(dst, 2);
+    const float lb   = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t k = ggml_nelements(dst);
+    const int64_t n = src0->ne[0];
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+
+    situ_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
+        (const float *) src0->data, (const float *) src1->data, (float *) dst->data, k, n,
+        src0->nb[1] / sizeof(float), src1->nb[1] / sizeof(float),
+        beta, 1.0f/beta, lb, lb > 0.0f ? 1.0f/lb : 0.0f);
+}
+
 /* CUDA kernel + launcher for xIELU */
 
 template <typename T>

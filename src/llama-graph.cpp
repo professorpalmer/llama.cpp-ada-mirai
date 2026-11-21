@@ -2414,9 +2414,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (gate_up_exps) {
-        // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+    const bool escha_gate_up = escha && escha->gate_up.active();
+
+    if (gate_up_exps || escha_gate_up) {
+        // merged gate_up path: one mul_mat_id (or one escha_moe), then split into gate and up views
+        // the escha code holds any per-expert scale already, so a scale tensor must not come with it
+        GGML_ASSERT(!escha_gate_up || up_exps_s == nullptr);
+        ggml_tensor * gate_up = escha_gate_up
+            ? build_escha_mm_id(*escha, escha->gate_up, cur, selected_experts)
+            : build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2469,7 +2475,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    const bool has_gate = gate_exps || gate_up_exps || (escha && escha->gate.active());
+    const bool has_gate = gate_exps || gate_up_exps || escha_gate_up || (escha && escha->gate.active());
 
     switch (type_op) {
         case LLM_FFN_SILU:
@@ -2512,20 +2518,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 const float beta = hparams.situ_beta;
                 const float lb   = hparams.situ_linear_beta;
 
-                // the fused gate_up path gives row views; this tree's scale needs contiguous rows (Inkling 2)
-                if (!ggml_is_contiguous(cur)) {
-                    cur = ggml_cont(ctx0, cur);
+                // one fused op (GGML_GLU_OP_SITU) that reads the row views of the fused gate_up split directly:
+                // 1 kernel per MoE call instead of 9-11; LLAMA_SITU_UNFUSED=1 builds the old chain (A/B, debugging)
+                static const bool situ_unfused = [] {
+                    const char * env = getenv("LLAMA_SITU_UNFUSED");
+                    return env != nullptr && atoi(env) != 0;
+                }();
+                if (!situ_unfused) {
+                    cur = ggml_situ_split(ctx0, cur, up, beta, lb);
+                } else {
+                    // the CPU scale needs contiguous rows
+                    if (!ggml_is_contiguous(cur)) {
+                        cur = ggml_cont(ctx0, cur);
+                    }
+                    if (!ggml_is_contiguous(up)) {
+                        up = ggml_cont(ctx0, up);
+                    }
+                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
+                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
+                    if (lb > 0.0f) {
+                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
+                    }
+                    cur = ggml_mul(ctx0, act, up);
                 }
-                if (!ggml_is_contiguous(up)) {
-                    up = ggml_cont(ctx0, up);
-                }
-
-                ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                if (lb > 0.0f) {
-                    up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                }
-                cur = ggml_mul(ctx0, act, up);
                 cb(cur, "ffn_moe_situ", il);
             } break;
         case LLM_FFN_GELU:

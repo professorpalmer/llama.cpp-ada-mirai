@@ -125,6 +125,33 @@ static bool check_codebook(const ggml_tensor * lut) {
     return bad == 0;
 }
 
+// The CUDA op takes the exllamav3 GEMV kernel (escha-gemv.cu) when the shape allows: it rounds the rotated
+// activations to fp16, as Escha's own runtime does, and adds up to 64 products in fp16 before each fold to fp32.
+// The line for it is the line of the dense GEMV test (test-escha-mul-mat.cpp): 1e-3.
+// GGML_ESCHA_MOE_GEMV=0 selects the fp32 block kernels and the 1e-5 line.
+static double tolerance_for(bool cuda) {
+    static const bool gemv = getenv("GGML_ESCHA_MOE_GEMV") == nullptr || atoi(getenv("GGML_ESCHA_MOE_GEMV")) != 0;
+    return cuda && gemv ? 1e-3 : 1e-5;
+}
+
+// a case with the tokens t0, t0 + 1, ... (modulo the token count of c) of case c; x and ids are new tensors in ctx
+static escha_case sub_case(ggml_context * ctx, const escha_case & c, int64_t t0, int64_t n_tokens) {
+    escha_case r = c;
+    const int64_t nt_src = c.ids->ne[1];
+
+    r.x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.x->ne[0], c.x->ne[1], n_tokens);
+    r.ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.ids->ne[0], n_tokens);
+    r.yref = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.yref->ne[0], c.yref->ne[1], n_tokens);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const int64_t ts = (t0 + t)%nt_src;
+        memcpy((char *) r.x->data    + t*r.x->nb[2],    (const char *) c.x->data    + ts*c.x->nb[2],    c.x->nb[2]);
+        memcpy((char *) r.ids->data  + t*r.ids->nb[1],  (const char *) c.ids->data  + ts*c.ids->nb[1],  c.ids->nb[1]);
+        memcpy((char *) r.yref->data + t*r.yref->nb[2], (const char *) c.yref->data + ts*c.yref->nb[2], c.yref->nb[2]);
+    }
+    return r;
+}
+
 // max abs difference and relative RMS against the reference
 static bool score(const char * label, uint32_t ic, int64_t K, int64_t IC, int64_t OC,
                   const std::vector<float> & got, const ggml_tensor * yref) {
@@ -142,7 +169,7 @@ static bool score(const char * label, uint32_t ic, int64_t K, int64_t IC, int64_
 
     // f32 reassociation only: the op runs a butterfly Hadamard and accumulates per
     // tile, the reference multiplies by a dense folded matrix
-    const bool ok = rel < 1e-5;
+    const bool ok = rel < tolerance_for(strcmp(label, "cuda") == 0);
 
     printf("case %u  %-4s  K=%" PRId64 "  %4" PRId64 " -> %-4" PRId64
            "  max_abs=%.3e  rel_rms=%.3e  %s\n",
@@ -188,16 +215,130 @@ static void bench(const escha_case & c, ggml_backend_t backend, uint32_t ic) {
     const double us = (double)(ggml_time_us() - t0)/reps;
 
     printf("bench %u  K=%" PRId64 "  %4" PRId64 " -> %-4" PRId64
-           "  %7.1f us/op   %6.1f Gdecode/s\n",
-           ic, c.code->ne[0]/16, IC, OC, us, decodes/us*1e-3);
+           "  tokens %4" PRId64 "  %9.1f us/op   %7.1f Gdecode/s\n",
+           ic, c.code->ne[0]/16, IC, OC, (int64_t) c.ids->ne[1], us, decodes/us*1e-3);
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
 }
 
+// Batch-invariant rule: the rows of a token are the same bits when the token runs alone, in a batch of 3 and in the
+// full batch of the case. Returns true if all compared rows are equal.
+static bool check_invariant(const escha_case & c, ggml_backend_t backend, uint32_t ic) {
+    const int64_t n_tokens = c.ids->ne[1];
+    if (n_tokens < 2) {
+        return true;
+    }
+    const int64_t row = c.yref->ne[0]*c.yref->ne[1];   // floats per token
+
+    const std::vector<float> full = run_case(c, backend);
+
+    ggml_init_params ip = { 64u*1024*1024 + (size_t) 16*ggml_nbytes(c.x)/n_tokens*3, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+
+    int64_t bad = 0, n = 0;
+    const int64_t picks[] = { 0, 1, n_tokens/2, n_tokens - 1 };
+    for (const int64_t t : picks) {
+        for (const int64_t nb : { (int64_t) 1, (int64_t) 3 }) {
+            if (t + nb > n_tokens) {
+                continue;
+            }
+            const escha_case sc = sub_case(ctx, c, t, nb);
+            const std::vector<float> got = run_case(sc, backend);
+            for (int64_t i = 0; i < nb*row; ++i) {
+                bad += memcmp(&got[i], &full[t*row + i], sizeof(float)) != 0;
+            }
+            n += nb*row;
+        }
+    }
+    ggml_free(ctx);
+
+    printf("case %u  invariant  %" PRId64 " tokens: alone / batch of 3 against the full batch  %s (%" PRId64 " of %" PRId64 " values differ)\n",
+           ic, n_tokens, bad ? "FAIL" : "bit-identical", bad, n);
+    return bad == 0;
+}
+
+static void set_prefill_env(const char * v) {
+#ifdef _WIN32
+    _putenv_s("GGML_ESCHA_MOE_PREFILL", v);
+#else
+    setenv("GGML_ESCHA_MOE_PREFILL", v, 1);
+#endif
+}
+
+// Prefill kernel (escha-moe-prefill.cu, batches of more than 8 tokens) against the routed GEMV path (8-row chunks,
+// GGML_ESCHA_MOE_PREFILL=0), which --invariant ties to the 1-token path: the same bits for every value. With --bench
+// also the time of both paths. The tokens of the case repeat up to the batch size.
+static bool check_prefill(const escha_case & c, ggml_backend_t backend, uint32_t ic, bool timing) {
+    const int64_t row = c.yref->ne[0]*c.yref->ne[1];   // floats per token
+    bool ok = true;
+    for (const int64_t nt : { (int64_t) 9, (int64_t) 64, (int64_t) 200, (int64_t) 512, (int64_t) 1024 }) {
+        ggml_init_params ip = { 64u*1024*1024 + (size_t) (ggml_nbytes(c.x) + ggml_nbytes(c.yref))/c.ids->ne[1]*(nt + 8), nullptr, false };
+        ggml_context * ctx = ggml_init(ip);
+        const escha_case sc = sub_case(ctx, c, 0, nt);
+
+        set_prefill_env("0");
+        const std::vector<float> ref = run_case(sc, backend);
+        if (timing) {
+            printf("  gemv    ");
+            bench(sc, backend, ic);
+        }
+        set_prefill_env("1");
+        const std::vector<float> got = run_case(sc, backend);
+        if (timing) {
+            printf("  prefill ");
+            bench(sc, backend, ic);
+        }
+
+        int64_t bad = 0;
+        for (int64_t i = 0; i < nt*row; ++i) {
+            bad += memcmp(&got[i], &ref[i], sizeof(float)) != 0;
+        }
+        // rows per expert of this batch
+        std::vector<int> cnt(c.code->ne[3], 0);
+        for (int64_t t = 0; t < nt; ++t) {
+            for (int64_t s = 0; s < sc.ids->ne[0]; ++s) {
+                cnt[((const int32_t *) ((const char *) sc.ids->data + t*sc.ids->nb[1]))[s]]++;
+            }
+        }
+        int used = 0, mx = 0;
+        for (const int v : cnt) {
+            used += v > 0;
+            mx = std::max(mx, v);
+        }
+        printf("case %u  prefill  %4" PRId64 " tokens (experts used %d, rows per used expert mean %.1f max %d): against the GEMV path  %s (%" PRId64 " of %" PRId64 " values differ)\n",
+               ic, nt, used, used ? (double) (nt*sc.ids->ne[0])/used : 0.0, mx, bad ? "FAIL" : "bit-identical", bad, nt*row);
+        ok &= bad == 0;
+        ggml_free(ctx);
+    }
+    set_prefill_env("1");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const char * path = argc > 1 ? argv[1] : DEFAULT_CASES;
-    const bool do_bench = argc > 2 && std::string(argv[2]) == "--bench";
+    const std::string mode = argc > 2 ? argv[2] : "";
+    const bool do_bench     = mode == "--bench";
+    const bool do_invariant = mode == "--invariant";
+    const bool do_prefill   = mode == "--prefill" || mode == "--prefill-bench";
+    const bool prefill_time = mode == "--prefill-bench";
+    if (do_prefill) {
+        // the two paths differ only by GGML_ESCHA_MOE_PREFILL, which a CUDA graph capture does not see: a replay of the
+        // other path's graph would compare a path with itself
+#ifdef _WIN32
+        _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
+#else
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+#endif
+        // the prefill kernel also for the small batches (its default minimum is higher), unless the caller sets one
+        if (getenv("GGML_ESCHA_MOE_PREFILL_MIN") == nullptr) {
+#ifdef _WIN32
+            _putenv_s("GGML_ESCHA_MOE_PREFILL_MIN", "9");
+#else
+            setenv("GGML_ESCHA_MOE_PREFILL_MIN", "9", 1);
+#endif
+        }
+    }
 
     ggml_context * ctx_data = nullptr;
     gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_data };
@@ -247,8 +388,21 @@ int main(int argc, char ** argv) {
         }
         if (gpu) {
             all_ok &= score("cuda", ic, K, IC, OC, run_case(c, gpu), c.yref);
+            if (do_invariant) {
+                all_ok &= check_invariant(c, gpu, ic);
+            }
+            if (do_prefill) {
+                all_ok &= check_prefill(c, gpu, ic, prefill_time);
+            }
             if (do_bench) {
                 bench(c, gpu, ic);
+                // the same routing repeated up to a 512-token ubatch
+                if (c.ids->ne[1] >= 100 && c.ids->ne[1] < 512) {
+                    ggml_init_params ip = { 64u*1024*1024 + (size_t) (ggml_nbytes(c.x) + ggml_nbytes(c.yref))/c.ids->ne[1]*520, nullptr, false };
+                    ggml_context * ctx = ggml_init(ip);
+                    bench(sub_case(ctx, c, 0, 512), gpu, ic);
+                    ggml_free(ctx);
+                }
             }
         }
     }

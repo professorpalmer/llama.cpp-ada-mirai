@@ -646,6 +646,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SITU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1385,6 +1386,15 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 alpha,
             float                 limit);
+
+    // SITU (Inkling 2, Kimi-K3): beta*tanh(a/beta)*sigmoid(a) * (lb > 0 ? lb*tanh(b/lb) : b)
+    // a = gate, b = up; rows may be views (the fused gate_up split), each row contiguous
+    GGML_API struct ggml_tensor * ggml_situ_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 beta,
+            float                 lb);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(

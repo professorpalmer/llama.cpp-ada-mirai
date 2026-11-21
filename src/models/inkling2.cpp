@@ -101,10 +101,16 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
 
     hparams.n_sconv_channels = n_channels_max;
 
+    // routed experts in the escha 2/3-bit trellis code (our Kintsugi files): version 1, else plain ggml types
+    ml.get_key(LLM_KV_ESCHA_VERSION, escha_version, false);
+    if (escha_version != 0 && escha_version != 1) {
+        throw std::runtime_error(format("inkling2: unsupported escha codec version %u", escha_version));
+    }
+
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
+void llama_model_inkling2::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     if (hparams.n_vocab_unpadded != vocab.n_tokens()) {
@@ -124,6 +130,29 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
     output_res_query = create_tensor(tn(LLM_TENSOR_OUTPUT_RES_QUERY, "weight"), {n_embd}, 0);
 
     const bool loop = hparams.loop_n_pass > 1;
+
+    if (escha_version != 0) {
+        escha_lut    = create_tensor(tn(LLM_TENSOR_ESCHA_LUT),    { 65536 },  0);
+        escha_dep_k2 = create_tensor(tn(LLM_TENSOR_ESCHA_DEP_K2), { 16, 256 }, TENSOR_NOT_REQUIRED);
+        escha_dep_k3 = create_tensor(tn(LLM_TENSOR_ESCHA_DEP_K3), { 16, 256 }, TENSOR_NOT_REQUIRED);
+    }
+
+    // escha experts: code [16*K, OC/16, IC/16, n_expert] I16 (K = 2 or 3, read from the file), rin [IC, n_expert],
+    // rout [OC, n_expert] F16; the per-expert scale of the source weights is inside the code (no .scale tensors)
+    auto load_escha_exps = [&](llm_escha_exps & e, llm_tensor t, int il, int64_t ic, int64_t oc) {
+        const std::string cname = tn(t, "escha_code", il).str();
+        const auto * w = ml.get_weight(cname.c_str());
+        if (w == nullptr) {
+            throw std::runtime_error("inkling2: escha model is missing " + cname);
+        }
+        const int64_t n_code = w->tensor->ne[0];
+        if (n_code != 32 && n_code != 48) {
+            throw std::runtime_error(format("%s: unsupported code width %d", cname.c_str(), (int) n_code));
+        }
+        e.code = create_tensor(tn(t, "escha_code", il), { n_code, oc/16, ic/16, n_expert }, 0);
+        e.rin  = create_tensor(tn(t, "escha_rin",  il), { ic, n_expert }, 0);
+        e.rout = create_tensor(tn(t, "escha_rout", il), { oc, n_expert }, 0);
+    };
 
     for (int i = 0; i < n_layer - (int) hparams.loop_n_extra(); ++i) {
         auto & layer = layers[i];
@@ -178,8 +207,13 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         layer.ffn_norm         = create_tensor(tn(LLM_TENSOR_FFN_NORM,         "weight", i), {n_embd}, 0);
         layer.ffn_gate_inp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,     "weight", i), {n_embd, n_expert}, 0);
         layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
-        layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+        if (escha_version != 0) {
+            load_escha_exps(layer.ffn_gate_up_escha, LLM_TENSOR_FFN_GATE_UP_EXPS, i, n_embd,   2*n_ff_exp);
+            load_escha_exps(layer.ffn_down_escha,    LLM_TENSOR_FFN_DOWN_EXPS,    i, n_ff_exp, n_embd);
+        } else {
+            layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
+            layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+        }
 
         // message controllers of the looped core: (attn, k, v, mlp) x (down, gain, forget)
         if (loop && i >= (int) hparams.loop_core_start && i < (int) hparams.loop_core_end) {
@@ -725,6 +759,15 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         }
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
+        llm_escha_moe escha;
+        if (model.escha_version != 0) {
+            escha.lut     = model.escha_lut;
+            escha.dep_k2  = model.escha_dep_k2;
+            escha.dep_k3  = model.escha_dep_k3;
+            escha.gate_up = layer.ffn_gate_up_escha;
+            escha.down    = layer.ffn_down_escha;
+        }
+
         cur = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 nullptr,
@@ -741,7 +784,9 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 layer.ffn_gate_up_exps,
                 layer.ffn_up_exps_s,
                 layer.ffn_gate_exps_s,
-                layer.ffn_down_exps_s);
+                layer.ffn_down_exps_s,
+                nullptr,
+                escha.active() ? &escha : nullptr);
 
         cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
         cb(cur, "ffn_out", il);

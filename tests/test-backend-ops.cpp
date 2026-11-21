@@ -2224,6 +2224,79 @@ struct test_glu_split : public test_case {
     }
 };
 
+// GGML_OP_GLU SITU (Inkling 2, Kimi-K3): gate and up as separate tensors (v = 0) or as the row views of one fused
+// gate_up tensor (v = 1, as the MoE path gives them). chain = 1: out = situ - (unfused chain) + gate, so a fused
+// kernel that drifts from the chain of scale / tanh / sigmoid / mul ops shows as an error against the CPU;
+// chain = 2: the unfused chain alone (with the two row copies), the perf baseline of the fused op
+struct test_situ : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int v;
+    const float beta;
+    const float lb;
+    const int chain;
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, v, beta, lb, chain);
+    }
+
+    test_situ(std::array<int64_t, 4> ne = {64, 8, 3, 1}, int v = 0, float beta = 4.0f, float lb = 25.0f, int chain = 0)
+        : ne(ne), v(v), beta(beta), lb(lb), chain(chain) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * g;
+        ggml_tensor * u;
+        if (v & 1) {
+            ggml_tensor * gu = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2*ne[0], ne[1], ne[2], ne[3]);
+            ggml_set_name(gu, "gate_up");
+            g = ggml_view_4d(ctx, gu, ne[0], ne[1], ne[2], ne[3], gu->nb[1], gu->nb[2], gu->nb[3], 0);
+            u = ggml_view_4d(ctx, gu, ne[0], ne[1], ne[2], ne[3], gu->nb[1], gu->nb[2], gu->nb[3], ne[0]*gu->nb[0]);
+        } else {
+            g = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(g, "gate");
+            u = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(u, "up");
+        }
+
+        ggml_tensor * out = chain == 2 ? nullptr : ggml_situ_split(ctx, g, u, beta, lb);
+        if (out) {
+            ggml_set_name(out, "situ");
+        }
+
+        if (chain) {
+            ggml_tensor * gc = ggml_cont(ctx, g);
+            ggml_tensor * uc = ggml_cont(ctx, u);
+            ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gc, 1.0f/beta)), beta);
+            act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gc));
+            if (lb > 0.0f) {
+                uc = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, uc, 1.0f/lb)), lb);
+            }
+            ggml_tensor * ref = ggml_mul(ctx, act, uc);
+            if (chain == 2) {
+                // the unfused chain alone (perf baseline of the fused op)
+                out = ref;
+                ggml_set_name(out, "situ_chain");
+            } else {
+                out = ggml_add(ctx, ggml_sub(ctx, out, ref), gc);
+                ggml_set_name(out, "situ_minus_chain_plus_gate");
+            }
+        }
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // past both caps (gate 4, up 25) and far into the sigmoid tails
+            init_tensor_uniform(t, -60.f, 60.f);
+        }
+    }
+};
+
 struct test_swiglu_oai : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -6479,6 +6552,79 @@ struct test_topk_moe : public test_case {
     }
 };
 
+struct test_moe_weighted_reduction : public test_case {
+    const int64_t n_embd;
+    const int64_t n_expert_used;
+    const int64_t n_tokens;
+    const bool unaligned_experts;
+    const bool with_expert_scale;
+    const bool interleaved_views_adds;
+
+    test_moe_weighted_reduction(
+            int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+        n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
+        unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
+        interleaved_views_adds(interleaved_views_adds) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_WEIGHTED_REDUCTION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * experts;
+        if (unaligned_experts) {
+            ggml_tensor * storage = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_F32, n_embd * n_expert_used * n_tokens + 1);
+            ggml_set_name(storage, "experts_storage");
+            experts = ggml_view_3d(ctx, storage, n_embd, n_expert_used, n_tokens,
+                n_embd * sizeof(float), n_embd * n_expert_used * sizeof(float), sizeof(float));
+        } else {
+            experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens);
+        }
+        ggml_set_name(experts, "experts");
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * scaled = experts;
+        if (with_expert_scale) {
+            ggml_tensor * expert_scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
+            ggml_set_name(expert_scale, "expert_scale");
+            scaled = ggml_mul(ctx, experts, expert_scale);
+            ggml_set_name(scaled, "scaled_experts");
+        }
+
+        ggml_tensor * weighted = ggml_mul(ctx, scaled, weights);
+        ggml_set_name(weighted, "weighted_experts");
+
+        std::vector<ggml_tensor *> views(n_expert_used);
+        for (int64_t expert = 0; expert < n_expert_used; ++expert) {
+            views[expert] = ggml_view_2d(
+                ctx, weighted, n_embd, n_tokens, weighted->nb[2], expert * weighted->nb[1]);
+            if (!interleaved_views_adds && mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, views[expert]);
+            }
+        }
+
+        ggml_tensor * out = views[0];
+        for (int64_t expert = 1; expert < n_expert_used; ++expert) {
+            out = ggml_add(ctx, out, views[expert]);
+            if (!interleaved_views_adds && mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, out);
+            }
+        }
+        ggml_set_name(out, "moe_weighted_reduction");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -8814,6 +8960,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // SITU: separate gate / up and the fused gate_up row views; with and without the up cap; against the chain
+    for (int v : {0, 1}) {
+        for (float lb : {25.0f, 0.0f}) {
+            for (int chain : {0, 1}) {
+                test_cases.emplace_back(new test_situ({64, 8, 3, 1}, v, 4.0f, lb, chain));
+            }
+            test_cases.emplace_back(new test_situ({1152, 8, 5, 1}, v, 4.0f, lb, 0));
+        }
+    }
+
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
         test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
@@ -10678,6 +10834,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    test_cases.emplace_back(new test_moe_weighted_reduction(63,  2, 17));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 15, 40, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 16, 32, false, true));
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -10923,6 +11087,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling 2 Mini shapes (MoE perf agent)
+    // no MUL_MAT_ID cases at the expert shape here: 128 experts x 2304 x 2304 of an IQ type take minutes of CPU
+    // quantization for each case, and the release file has trellis experts (test-escha-moe covers those)
+    // router (F32), attention projections and the head at decode
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 2304, {1, 1}, {1, 1}));
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ3_XXS}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 3072, 1, 2304, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 201024, 1, 2304, {1, 1}, {1, 1}));
+    // router: sigmoid + bias, top-8, norm, scale 8
+    for (int n : {1, 512}) {
+        test_cases.emplace_back(new test_topk_moe({128, n, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f));
+    }
+    // MoE combine: (experts x expert scale) x router weights, 8-way sum
+    for (int n : {1, 512}) {
+        test_cases.emplace_back(new test_moe_weighted_reduction(2304, 8, n, false, true));
+    }
+    // SITU on the fused gate_up row views (1152 x 8 experts x n tokens)
+    for (int n : {1, 512}) {
+        test_cases.emplace_back(new test_situ({1152, 8, n, 1}, 1, 4.0f, 25.0f, 0));
+        test_cases.emplace_back(new test_situ({1152, 8, n, 1}, 1, 4.0f, 25.0f, 2));
+    }
     // bandwidth comparison at Bonsai-2 shapes
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 1, 5120, {1, 1}, {1, 1}));

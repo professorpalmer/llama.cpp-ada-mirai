@@ -362,6 +362,7 @@ struct llama_layer {
     llm_escha_exps ffn_gate_escha;
     llm_escha_exps ffn_up_escha;
     llm_escha_exps ffn_down_escha;
+    llm_escha_exps ffn_gate_up_escha; // fused gate+up experts (Inkling 2: OC = 2*n_ff_exp, gate rows first)
 
     // dense escha models keep attention and linear attention in the code too, so every
     // projection in the block has a counterpart here (400 of them in Qwen3.8-27B-Escha-W2)

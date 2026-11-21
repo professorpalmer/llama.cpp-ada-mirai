@@ -2,6 +2,8 @@
 
 // small-batch path of ggml_escha_mul_mat (rows <= 8). Returns false if it does not take the call.
 bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// ggml_escha_moe (routed experts) on the same kernel, at every batch size. Returns false if it does not take the call.
+bool ggml_cuda_escha_moe_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 // the largest batch that ggml_cuda_escha_gemv takes (0: it takes no batch)
 int ggml_cuda_escha_gemv_max_rows();
 

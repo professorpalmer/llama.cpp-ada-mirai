@@ -66,6 +66,9 @@ struct llm_escha_moe {
     llm_escha_exps up;
     llm_escha_exps down;
 
+    // fused gate+up experts (OC = 2*n_ff: gate rows first, then up), used instead of gate/up when set
+    llm_escha_exps gate_up;
+
     bool active() const { return down.active(); }
 };
 
