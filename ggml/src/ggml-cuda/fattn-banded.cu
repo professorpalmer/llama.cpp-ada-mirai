@@ -662,7 +662,8 @@ static __global__ void flash_attn_ext_banded_mma(
         const int32_t * __restrict__ pos_kv,
         int64_t pos_q_ne1,
         int64_t pos_kv_ne1,
-        const int2 * __restrict__ tile_pos) {
+        const int2 * __restrict__ tile_pos,
+        int64_t q_offset_in) {
 #ifdef FATTN_BANDED_MMA_AVAILABLE
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
     static_assert(type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q4_0 || type_KV == GGML_TYPE_Q8_0, "unsupported K/V type");
@@ -695,7 +696,8 @@ static __global__ void flash_attn_ext_banded_mma(
     const int64_t ih_kv = ih / (n_head_q / n_head_kv);
 
     const int64_t n_kt     = (n_kv + BK - 1)/BK;
-    const int64_t q_offset = n_kv - n_q;
+    // the tail rule: query iq sits at cell iq + q_offset (n_kv - n_q for a whole op; a query chunk passes its own)
+    const int64_t q_offset = q_offset_in;
 
     // implicit mask (window > 0, ggml_flash_attn_ext_banded_set_window): the block's queries [iq_b0, iq_b1] see the
     // cells [iq_b0 + q_offset - window + 1, iq_b1 + q_offset]; K/V tiles outside that range are not visited
@@ -1076,7 +1078,7 @@ static __global__ void flash_attn_ext_banded_mma(
     GGML_UNUSED_VARS(q, k, v, mask, flags, rel, sinks, dst, part, scale, type_rel, n_q, n_kv, n_head_q, n_head_kv,
         n_chunks, tiles_per_chunk, rel_extent, mask_ne2, mask_ne3, q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3,
         v_nb1, v_nb2, v_nb3, m_nb1, m_nb2, m_nb3, r_nb0, r_nb1, r_nb2, r_nb3, rel_ne3, sinks_s1, sinks_s2, window,
-        pos_q, pos_kv, pos_q_ne1, pos_kv_ne1, tile_pos);
+        pos_q, pos_kv, pos_q_ne1, pos_kv_ne1, tile_pos, q_offset_in);
     NO_DEVICE_CODE;
 #endif // FATTN_BANDED_MMA_AVAILABLE
 }
@@ -1145,7 +1147,17 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
         v->nb[0] != ggml_type_size(v->type) || rel->nb[0] != ggml_type_size(rel->type)) {
         return false;
     }
-    if (rel->ne[0] <= 0 || rel->ne[1] != q->ne[2] || rel->ne[2] != q->ne[1] ||
+    const ggml_tensor * rcur = dst->src[8];
+    if (rcur) {
+        // the bias from its factors (table in src[6]): built per query chunk for the tensor-core kernel, so prefill-size
+        // ops only (n_tok > 32), one stream
+        if (!ggml_is_contiguous(rel) || rel->ne[1] <= 0 || rcur->type != GGML_TYPE_F32 || !ggml_is_contiguous(rcur) ||
+                rcur->ne[0] != rel->ne[0] || rcur->ne[1] != q->ne[2] || rcur->ne[2] != q->ne[1] || rcur->ne[3] != 1 ||
+                q->ne[3] != 1 || q->ne[1] <= fattn_banded_dec_max_q || rel->type == GGML_TYPE_BF16 ||
+                !fattn_banded_mma_usable(device, dst)) {
+            return false;
+        }
+    } else if (rel->ne[0] <= 0 || rel->ne[1] != q->ne[2] || rel->ne[2] != q->ne[1] ||
         (rel->ne[3] != 1 && rel->ne[3] != q->ne[3])) {
         return false;
     }
@@ -1260,7 +1272,8 @@ static bool fattn_banded_mma_usable(const int device, const ggml_tensor * dst) {
             break; \
     }
 
-static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent) {
+static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent,
+        const int64_t q_offset_arg = -1) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1380,7 +1393,8 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
         rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2, window, \
         pos_q_t ? (const int32_t *) pos_q_t->data : nullptr, pos_kv_t ? (const int32_t *) pos_kv_t->data : nullptr, \
-        pos_q_t ? pos_q_t->ne[1] : 1, pos_kv_t ? pos_kv_t->ne[1] : 1, pos_kv_t ? tile_pos.get() : nullptr)
+        pos_q_t ? pos_q_t->ne[1] : 1, pos_kv_t ? pos_kv_t->ne[1] : 1, pos_kv_t ? tile_pos.get() : nullptr, \
+        q_offset_arg >= 0 ? q_offset_arg : n_kv - n_q)
     FATTN_BANDED_MMA_SWITCH(LAUNCH_BANDED_MMA)
 #undef LAUNCH_BANDED_MMA
 #undef LAUNCH_BANDED_MMA2
@@ -1508,6 +1522,114 @@ static int64_t fattn_banded_tier_stage_min_q() {
     return q;
 }
 
+// GGML_CUDA_BANDED_REL_CHUNK=n: queries per chunk when the band bias comes from its factors (default 256, rounded down
+// to a multiple of 64, at least 64)
+static int64_t fattn_banded_rel_chunk() {
+    static const int64_t n = [] {
+        const char * e = getenv("GGML_CUDA_BANDED_REL_CHUNK");
+        const int64_t v = e != nullptr ? atoll(e) : 256;
+        return std::max<int64_t>(64, v - v % 64);
+    }();
+    return n;
+}
+
+// The band bias from its factors (ggml_flash_attn_ext_banded_set_rel_factors): rel(d, h, q) = sum_c table[c, d] *
+// rcur[c, h, q]. Per chunk of queries the bias is built in pool scratch ([rel_extent, n_head, chunk] fp32, one fp32 GEMM
+// with k = d_rel), then the tensor-core kernel runs on that chunk with the whole op's tail rule (query offset) and the
+// chunk's slices of the mask, sinks and positions. The [rel_extent, n_head, n_tok] tensor is never materialised.
+static void fattn_banded_factored_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    ggml_tensor       * m     = dst->src[3];
+    ggml_tensor       * sinks = dst->src[4];
+    const ggml_tensor * table = dst->src[6];
+    ggml_tensor       * pos_q = dst->src[7];
+    const ggml_tensor * rcur  = dst->src[8];
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t d_rel  = table->ne[0];
+    const int64_t extent = table->ne[1];
+    const int64_t H      = q->ne[2];
+    const int64_t n_q    = q->ne[1];
+    const int64_t n_kv   = k->ne[1];
+    const int64_t chunk  = std::min(n_q, fattn_banded_rel_chunk());
+
+    const float * T = (const float *) table->data;
+    ggml_cuda_pool_alloc<float> t32(ctx.pool());
+    if (table->type == GGML_TYPE_F16) {
+        t32.alloc(d_rel*extent);
+        ggml_get_to_fp32_cuda(GGML_TYPE_F16)(table->data, t32.get(), d_rel*extent, stream);
+        T = t32.get();
+    }
+    ggml_cuda_pool_alloc<float> relc(ctx.pool(), extent*H*chunk);
+
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    const float one  = 1.0f;
+    const float zero = 0.0f;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    const auto compute_type = CUBLAS_COMPUTE_32F;
+#else
+    const auto compute_type = CUBLAS_COMPUTE_32F_PEDANTIC;   // fp32 products and sums, no TF32
+#endif
+
+    for (int64_t iq0 = 0; iq0 < n_q; iq0 += chunk) {
+        const int64_t nc = std::min(chunk, n_q - iq0);
+
+        // relc[d + extent*(h + H*iq)] = sum_c T[c + d_rel*d] * rcur[c + d_rel*(h + H*(iq0 + iq))]
+        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int) extent, (int) (H*nc), (int) d_rel, &one,
+            T, CUDA_R_32F, (int) d_rel, (const float *) rcur->data + iq0*H*d_rel, CUDA_R_32F, (int) d_rel, &zero,
+            relc.get(), CUDA_R_32F, (int) extent, compute_type, CUBLAS_GEMM_DEFAULT));
+
+        ggml_tensor q_c = *q;
+        q_c.ne[1] = nc;
+        q_c.data  = (char *) q->data + iq0*q->nb[1];
+
+        ggml_tensor rel_c = *table;
+        rel_c.type  = GGML_TYPE_F32;
+        rel_c.ne[0] = extent;
+        rel_c.ne[1] = H;
+        rel_c.ne[2] = nc;
+        rel_c.ne[3] = 1;
+        rel_c.nb[0] = sizeof(float);
+        rel_c.nb[1] = extent*sizeof(float);
+        rel_c.nb[2] = extent*H*sizeof(float);
+        rel_c.nb[3] = extent*H*nc*sizeof(float);
+        rel_c.data  = relc.get();
+        rel_c.view_src = nullptr;
+
+        ggml_tensor m_c;
+        if (m) {
+            m_c = *m;
+            m_c.ne[1] = nc;
+            m_c.data  = (char *) m->data + iq0*m->nb[1];
+        }
+        ggml_tensor s_c;
+        if (sinks && sinks->ne[1] > 1) {
+            s_c = *sinks;
+            s_c.ne[1] = nc;
+            s_c.data  = (char *) sinks->data + iq0*sinks->nb[1];
+        }
+        ggml_tensor pq_c;
+        if (pos_q) {
+            pq_c = *pos_q;
+            pq_c.ne[0] = nc;
+            pq_c.data  = (char *) pos_q->data + iq0*sizeof(int32_t);
+        }
+
+        ggml_tensor d_c = *dst;
+        d_c.ne[2]  = nc;
+        d_c.data   = (char *) dst->data + iq0*dst->nb[2];
+        d_c.src[0] = &q_c;
+        d_c.src[3] = m ? &m_c : nullptr;
+        d_c.src[4] = sinks ? (sinks->ne[1] > 1 ? &s_c : sinks) : nullptr;
+        d_c.src[6] = &rel_c;
+        d_c.src[7] = pos_q ? &pq_c : nullptr;
+        d_c.src[8] = nullptr;
+        fattn_banded_mma_launch(ctx, &d_c, scale, extent, n_kv - n_q + iq0);
+    }
+}
+
 void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_flash_attn_ext_banded_supported(ctx.device, dst));
 
@@ -1517,8 +1639,8 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(scale));
-    // the tensor extent (not op_params) is authoritative after graph cloning
-    const int64_t rel_extent = rel->ne[0];
+    // the tensor extent (not op_params) is authoritative after graph cloning; factors: the table's [d_rel, extent]
+    const int64_t rel_extent = dst->src[8] ? rel->ne[1] : rel->ne[0];
 
     // K/V in a tiered buffer whose host tail this op reaches (the global layers at depth): the host rows go to the
     // VRAM staging alias first, from the prefetch pipeline (ggml_cuda_tier_graph_begin lists these ops) or by a
@@ -1550,7 +1672,10 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
         }
     }
 
-    if (ggml_cuda_flash_attn_ext_banded_dec_supported(ctx.device, dst)) {
+    if (dst->src[8] != nullptr) {
+        // the band bias from its factors: per query chunk on the tensor-core kernel
+        fattn_banded_factored_launch(ctx, dst, scale);
+    } else if (ggml_cuda_flash_attn_ext_banded_dec_supported(ctx.device, dst)) {
         // decode and verify batches (n_tok <= 32) with f16 / q8_0 / q4_0 K/V, with or without token positions
         ggml_cuda_flash_attn_ext_banded_dec(ctx, dst);
     } else if (q->ne[1] <= fattn_banded_dec_max_q && !fattn_banded_kv_type_native(dst->src[1]->type)) {

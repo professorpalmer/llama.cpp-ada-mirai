@@ -7883,6 +7883,52 @@ struct test_flash_attn_ext_banded_pos : public test_flash_attn_ext_banded {
     }
 };
 
+// banded FA with the band bias from its factors (ggml_flash_attn_ext_banded_set_rel_factors): table [d_rel, rel_extent]
+// (F32 or F16) and rcur [d_rel, n_head, n_q] instead of rel_logits; on the window rule (use_pos false) or with the token
+// positions of test_flash_attn_ext_banded_pos. The backend builds the bias per query chunk: n_q 300 has a part chunk.
+struct test_flash_attn_ext_banded_fact : public test_flash_attn_ext_banded_pos {
+    const bool      use_pos;
+    const ggml_type table_type;
+    const int64_t   d_rel = 16;
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_pos::vars() + ",factors=" + ggml_type_name(table_type) + (use_pos ? "" : ",nopos");
+    }
+
+    test_flash_attn_ext_banded_fact(int64_t n_q, int64_t n_kv, int32_t window, int layout, int64_t pad, ggml_type kv_type,
+            int sinks, ggml_type table_type, bool use_pos, ggml_type v_type = GGML_TYPE_COUNT)
+        : test_flash_attn_ext_banded_pos(n_q, n_kv, window, layout, pad, kv_type, sinks, 128, 24, 8, 1024, v_type),
+          use_pos(use_pos), table_type(table_type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out;
+        if (use_pos) {
+            out = test_flash_attn_ext_banded_pos::build_graph(ctx);
+        } else {
+            out = test_flash_attn_ext_banded::build_graph(ctx);
+            ggml_flash_attn_ext_banded_set_window(out, window);
+            if (sinks) {
+                ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, sinks == 2 ? n_q : 1);
+                ggml_set_name(s, "sinks");
+                ggml_flash_attn_ext_add_sinks(out, s);
+            }
+        }
+        ggml_tensor * table = ggml_new_tensor_2d(ctx, table_type, d_rel, rel_extent);
+        ggml_tensor * rcur  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_rel, n_head, n_q);
+        ggml_set_name(table, "rel_table");
+        ggml_set_name(rcur,  "rel_rcur");
+        ggml_flash_attn_ext_banded_set_rel_factors(out, table, rcur);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext_banded_pos::initialize_tensors(ctx);
+        // a bias of about +-1 (as the rel_logits of the other cases)
+        init_tensor_uniform(ggml_get_tensor(ctx, "rel_table"), -0.6f, 0.6f);
+        init_tensor_uniform(ggml_get_tensor(ctx, "rel_rcur"),  -0.6f, 0.6f);
+    }
+};
+
 // banded FA with Q values in [-q_range, q_range]: large logits, so the online softmax and the KV-split merge rescale
 struct test_flash_attn_ext_banded_large : public test_flash_attn_ext_banded_sinks {
     const float q_range;
@@ -11437,6 +11483,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded_pos(77, 1280, 1024, 2, 100, GGML_TYPE_F16, 2, 64, 8, 2));
 
+    // the band bias from its factors (prefill sizes): window rule and positions, F32 and F16 tables, the K/V types
+    for (const auto & kv : std::vector<std::pair<ggml_type, ggml_type>>{ {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+            {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0} }) {
+        for (int64_t n_q : { 33, 300, 512, 1024 }) {
+            const int64_t n_kv_g = std::max<int64_t>(4096, n_q);
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv_g, INT32_MAX, 0, 0, kv.first, 2, GGML_TYPE_F32, false, kv.second));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv_g, 1024,      0, 0, kv.first, 1, GGML_TYPE_F16, false, kv.second));
+            const int64_t n_real = 1024 + n_q + 40;
+            const int64_t n_kv   = GGML_PAD(n_real, 256);
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv, 1024, 1, n_kv - n_real, kv.first, 2, GGML_TYPE_F32, true, kv.second));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv, 1024, 2, n_kv - n_real, kv.first, 0, GGML_TYPE_F16, true, kv.second));
+        }
+    }
+
     // mixed K / V cache (K q8_0, V q4_0; fattn_banded_kv_pair_ok): decode and prefill, implicit causal window and
     // sliding window, with and without token positions, sinks
     for (int64_t n_q : { 1, 2, 4, 8, 32, 33, 64, 512, 1024 }) {
@@ -11813,6 +11873,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             // the release default (q8_0 / q8_0) and the mixed pair (K q8_0, V q4_0)
             test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 4, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, GGML_TYPE_Q8_0));
             test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, n_q, n_kv, 1024, 4, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, GGML_TYPE_Q4_0));
+        }
+    }
+    // the band bias from its factors against rel_logits (the dense form's bias GEMM is not in its op time)
+    for (int64_t n_q : { 512, 1024, }) {
+        const int64_t n_kv_r = GGML_PAD(1024 + n_q + 40, 256);
+        test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv_r, 1024, 1, n_kv_r - (1024 + n_q + 40), GGML_TYPE_F16, 2, GGML_TYPE_F32, true));
+        for (int64_t n_kv : { 4096, 32768, }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_fact(n_q, n_kv, INT32_MAX, 0, 0, GGML_TYPE_Q8_0, 2, GGML_TYPE_F32, false));
         }
     }
     for (int64_t n_q : { 1, 512, 1024, }) {
