@@ -3441,6 +3441,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_GLU_OP_GEGLU_QUICK:
                     ggml_cuda_op_geglu_quick(ctx, dst);
                     break;
+                case GGML_GLU_OP_SITU:
+                    ggml_cuda_op_situ(ctx, dst);
+                    break;
                 default:
                     return false;
             }
@@ -7221,6 +7224,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                     return ggml_is_contiguous_1(op->src[0]);
+                case GGML_GLU_OP_SITU:
+                    return op->src[1] != nullptr && op->src[0]->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous_1(op->src[0]) && ggml_is_contiguous_1(op->src[1]);
                 default:
                     return false;
             }

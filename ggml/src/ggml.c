@@ -1310,9 +1310,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "SWIGLU_OAI",
     "GEGLU_ERF",
     "GEGLU_QUICK",
+    "SITU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
+static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -3174,6 +3175,21 @@ struct ggml_tensor * ggml_swiglu_oai(
     struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_OAI, false);
     ggml_set_op_params_f32(result, 2, alpha);
     ggml_set_op_params_f32(result, 3, limit);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_situ_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 beta,
+        float                 lb) {
+    GGML_ASSERT(b != NULL);
+    GGML_ASSERT(beta > 0.0f);
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SITU, false);
+    ggml_set_op_params_f32(result, 2, beta);
+    ggml_set_op_params_f32(result, 3, lb);
 
     return result;
 }

@@ -2224,6 +2224,79 @@ struct test_glu_split : public test_case {
     }
 };
 
+// GGML_OP_GLU SITU (Inkling 2, Kimi-K3): gate and up as separate tensors (v = 0) or as the row views of one fused
+// gate_up tensor (v = 1, as the MoE path gives them). chain = 1: out = situ - (unfused chain) + gate, so a fused
+// kernel that drifts from the chain of scale / tanh / sigmoid / mul ops shows as an error against the CPU;
+// chain = 2: the unfused chain alone (with the two row copies), the perf baseline of the fused op
+struct test_situ : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int v;
+    const float beta;
+    const float lb;
+    const int chain;
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, v, beta, lb, chain);
+    }
+
+    test_situ(std::array<int64_t, 4> ne = {64, 8, 3, 1}, int v = 0, float beta = 4.0f, float lb = 25.0f, int chain = 0)
+        : ne(ne), v(v), beta(beta), lb(lb), chain(chain) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * g;
+        ggml_tensor * u;
+        if (v & 1) {
+            ggml_tensor * gu = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2*ne[0], ne[1], ne[2], ne[3]);
+            ggml_set_name(gu, "gate_up");
+            g = ggml_view_4d(ctx, gu, ne[0], ne[1], ne[2], ne[3], gu->nb[1], gu->nb[2], gu->nb[3], 0);
+            u = ggml_view_4d(ctx, gu, ne[0], ne[1], ne[2], ne[3], gu->nb[1], gu->nb[2], gu->nb[3], ne[0]*gu->nb[0]);
+        } else {
+            g = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(g, "gate");
+            u = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(u, "up");
+        }
+
+        ggml_tensor * out = chain == 2 ? nullptr : ggml_situ_split(ctx, g, u, beta, lb);
+        if (out) {
+            ggml_set_name(out, "situ");
+        }
+
+        if (chain) {
+            ggml_tensor * gc = ggml_cont(ctx, g);
+            ggml_tensor * uc = ggml_cont(ctx, u);
+            ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gc, 1.0f/beta)), beta);
+            act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gc));
+            if (lb > 0.0f) {
+                uc = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, uc, 1.0f/lb)), lb);
+            }
+            ggml_tensor * ref = ggml_mul(ctx, act, uc);
+            if (chain == 2) {
+                // the unfused chain alone (perf baseline of the fused op)
+                out = ref;
+                ggml_set_name(out, "situ_chain");
+            } else {
+                out = ggml_add(ctx, ggml_sub(ctx, out, ref), gc);
+                ggml_set_name(out, "situ_minus_chain_plus_gate");
+            }
+        }
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // past both caps (gate 4, up 25) and far into the sigmoid tails
+            init_tensor_uniform(t, -60.f, 60.f);
+        }
+    }
+};
+
 struct test_swiglu_oai : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -8641,6 +8714,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // SITU: separate gate / up and the fused gate_up row views; with and without the up cap; against the chain
+    for (int v : {0, 1}) {
+        for (float lb : {25.0f, 0.0f}) {
+            for (int chain : {0, 1}) {
+                test_cases.emplace_back(new test_situ({64, 8, 3, 1}, v, 4.0f, lb, chain));
+            }
+            test_cases.emplace_back(new test_situ({1152, 8, 5, 1}, v, 4.0f, lb, 0));
+        }
+    }
+
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
         test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
@@ -10631,6 +10714,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // MoE combine: (experts x expert scale) x router weights, 8-way sum
     for (int n : {1, 512}) {
         test_cases.emplace_back(new test_moe_weighted_reduction(2304, 8, n, false, true));
+    }
+    // SITU on the fused gate_up row views (1152 x 8 experts x n tokens)
+    for (int n : {1, 512}) {
+        test_cases.emplace_back(new test_situ({1152, 8, n, 1}, 1, 4.0f, 25.0f, 0));
+        test_cases.emplace_back(new test_situ({1152, 8, n, 1}, 1, 4.0f, 25.0f, 2));
     }
     // bandwidth comparison at Bonsai-2 shapes
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0}) {
