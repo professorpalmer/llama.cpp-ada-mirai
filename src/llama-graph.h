@@ -853,6 +853,43 @@ public:
     const llama_memory_hybrid_iswa_context * mctx;
 };
 
+// hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell
+// (Inkling 2). The KQ masks are dense (never packed) and are filled from the same cells as the distances, so that the
+// bias gathered by distance lines up with the mask. Ported from Unsloth's llama.cpp mix b12588-mix-c0c3de8 (MIT).
+class llm_graph_input_mem_hybrid_iswa_rel : public llm_graph_input_mem_hybrid_iswa {
+public:
+    llm_graph_input_mem_hybrid_iswa_rel(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn,
+            std::unique_ptr<llm_graph_input_rs>          inp_rs,
+            const llama_memory_hybrid_iswa_context *     mctx,
+            uint32_t extent,
+            uint32_t extent_swa) :
+        llm_graph_input_mem_hybrid_iswa(cparams, std::move(inp_attn), std::move(inp_rs), mctx),
+        extent(extent),
+        extent_swa(extent_swa) { }
+    virtual ~llm_graph_input_mem_hybrid_iswa_rel() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // distance from the token to the cell, extent for the empty, future and more distant cells
+    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
+    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+
+    // [base, swa] device copies, made once per graph
+    ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
+    ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
+
+    // [base, swa] K/V cells of the banded attention, 0 = dense
+    uint32_t n_kv_banded[2] = { 0, 0 };
+    bool     banded         = false;
+
+    const uint32_t extent;
+    const uint32_t extent_swa;
+};
+
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
@@ -1544,6 +1581,20 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    // Inkling 2: extent, extent_swa = the distance where the bias tables of the full and the SWA layers stop
+    llm_graph_input_mem_hybrid_iswa_rel * build_inp_mem_hybrid_iswa_rel(
+            uint32_t extent,
+            uint32_t extent_swa) const;
+
+    // store the conv history of the ubatch cells, the last n_cols columns of conv_x {n_cols + n_seq_tokens, channels,
+    // n_seqs}, at byte offset offs of each row of s (Inkling 2; no rollback slots in this tree)
+    void build_conv_state_store(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+            ggml_tensor * conv_x,
+                int64_t   n_cols,
+                 size_t   offs) const;
 
     //
     // pooling

@@ -1289,6 +1289,64 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     inp_rs->set_input_rs(mctx->get_recr(), ubatch);
 }
 
+// Inkling 2 (Unsloth's llama.cpp mix b12588-mix-c0c3de8, MIT)
+void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch) {
+    // the K/V rotation inputs exist only when the cache rotates (quantized K/V); unused ones have no buffer
+    for (ggml_tensor ** t : { &inp_attn->self_k_rot, &inp_attn->self_v_rot, &inp_attn->self_k_rot_swa, &inp_attn->self_v_rot_swa }) {
+        if (*t && !(*t)->buffer) {
+            *t = nullptr;
+        }
+    }
+
+    llm_graph_input_mem_hybrid_iswa::set_input(ubatch);
+
+    const auto * attn_ctx = mctx->get_attn();
+
+    if (self_rel_pos && self_rel_pos->buffer) {
+        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
+    }
+    if (self_rel_pos_swa && self_rel_pos_swa->buffer) {
+        attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+}
+
+bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx);
+
+    this->mctx = mctx;
+
+    bool res = true;
+
+    const auto * attn_ctx = mctx->get_attn();
+
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    }
+    if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
+        res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
+    }
+
+    // the masks are dense (see build_inp_mem_hybrid_iswa_rel)
+    res &= inp_attn->self_kq_mask->type     != GGML_TYPE_I32 && inp_attn->self_kq_mask->ne[0]     == attn_ctx->get_base()->get_n_kv();
+    res &= inp_attn->self_kq_mask_swa->type != GGML_TYPE_I32 && inp_attn->self_kq_mask_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    res &= inp_attn->self_kq_mask->ne[1]     == params.ubatch.n_tokens;
+    res &= inp_attn->self_kq_mask_swa->ne[1] == params.ubatch.n_tokens;
+
+    res &= self_rel_pos->ne[0]     == attn_ctx->get_base()->get_n_kv();
+    res &= self_rel_pos->ne[1]     == params.ubatch.n_tokens;
+    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    if (banded) {
+        res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
+        res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+    }
+
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
+
+    return res;
+}
+
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx);
 
@@ -3878,6 +3936,97 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
+}
+
+// Inkling 2 (Unsloth's llama.cpp mix b12588-mix-c0c3de8, MIT): dense masks, K/V rotations, relative positions
+static ggml_tensor * build_attn_inp_kq_mask_dense(
+        ggml_context * ctx,
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams) {
+    const auto n_kv     = mctx->get_n_kv();
+    const auto n_tokens = ubatch.n_tokens;
+    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv, n_tokens/n_stream, 1, n_stream);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_kq_mask");
+
+    return res;
+}
+
+llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_iswa_rel(
+        uint32_t extent,
+        uint32_t extent_swa) const {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
+
+    auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+
+    const auto * attn_ctx = mctx_cur->get_attn();
+
+    auto inp_attn = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, attn_ctx);
+
+    {
+        inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
+        inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
+
+        inp_attn->self_kq_mask     = build_attn_inp_kq_mask_dense(ctx0, attn_ctx->get_base(), ubatch, cparams);
+        inp_attn->self_kq_mask_cnv = inp_attn->self_kq_mask;
+    }
+
+    {
+        inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
+        inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
+
+        inp_attn->self_kq_mask_swa     = build_attn_inp_kq_mask_dense(ctx0, attn_ctx->get_swa(), ubatch, cparams);
+        inp_attn->self_kq_mask_swa_cnv = inp_attn->self_kq_mask_swa;
+    }
+
+    inp_attn->self_k_rot     = attn_ctx->get_base()->build_input_k_rot(ctx0);
+    inp_attn->self_v_rot     = attn_ctx->get_base()->build_input_v_rot(ctx0);
+    inp_attn->self_k_rot_swa = attn_ctx->get_swa()->build_input_k_rot(ctx0);
+    inp_attn->self_v_rot_swa = attn_ctx->get_swa()->build_input_v_rot(ctx0);
+
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
+
+    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
+    ggml_set_input(inp->self_rel_pos);
+    ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+
+    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
+    ggml_set_input(inp->self_rel_pos_swa);
+    ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+
+    return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
+}
+
+void llm_graph_context::build_conv_state_store(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+        ggml_tensor * conv_x,
+            int64_t   n_cols,
+             size_t   offs) const {
+    const auto * mctx_cur = inp->mctx;
+
+    const int64_t n        = conv_x->ne[0] - n_cols; // n_seq_tokens
+    const int64_t channels = conv_x->ne[1];
+    const int64_t n_seqs   = conv_x->ne[2];
+
+    const size_t row_size  = s->nb[1];
+    const size_t cell_offs = mctx_cur->get_head()*row_size + offs;
+
+    GGML_ASSERT(cparams.n_rs_seq == 0 && "Inkling 2 conv state: rollback slots are not ported");
+
+    ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
+            n_cols, channels, n_seqs,
+            conv_x->nb[1], conv_x->nb[2],
+            ggml_row_size(conv_x->type, n));
+
+    ggml_tensor * cell = ggml_view_2d(ctx0, s,
+            n_cols*channels, n_seqs,
+            row_size, cell_offs);
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
 }
 
 llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {

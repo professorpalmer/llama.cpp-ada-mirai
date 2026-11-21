@@ -1336,6 +1336,66 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+// Inkling 2 (Unsloth's llama.cpp mix b12588-mix-c0c3de8, MIT)
+uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+    if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
+        ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
+        ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr) {
+        return 0;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (sinfo.strm[0] < 0 || (uint32_t) sinfo.strm[0] != stream || stream >= v_cells.size()) {
+        return 0;
+    }
+
+    const auto & cells = v_cells[stream];
+    const llama_pos pos_max = cells.seq_pos_max(seq_id);
+
+    if (pos_max < 0 || pos_max >= (llama_pos) cells.size()) {
+        return 0;
+    }
+
+    // the banded op aligns Q to the tail of K: the ubatch must be that monotonic tail, else dense bias
+    if ((uint32_t) pos_max + 1 < ubatch.n_tokens) {
+        return 0;
+    }
+    const llama_pos pos_start = pos_max + 1 - ubatch.n_tokens;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != pos_start + (llama_pos) i ||
+            ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
+            return 0;
+        }
+    }
+
+    for (llama_pos pos = 0; pos <= pos_max; ++pos) {
+        if (cells.is_empty(pos) || cells.pos_get(pos) != pos || !cells.seq_has(pos, seq_id)) {
+            return 0;
+        }
+    }
+
+    return pos_max + 1;
+}
+
+void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    const int64_t n_kv = dst->ne[0];
+    std::vector<int32_t> data(n_kv * ubatch->n_tokens);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
+            data[i*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -3005,6 +3065,28 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+// Inkling 2 (Unsloth's llama.cpp mix b12588-mix-c0c3de8, MIT)
+uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
+    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
+        // reserve the banded path; the dense fallback is unallocatable at large n_ctx
+        if (kv != nullptr && lctx == nullptr && kv->get_n_stream() == 1) {
+            return n_kv;
+        }
+        return 0;
+    }
+
+    const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
+    return result <= (uint32_t) n_kv ? result : 0;
+}
+
+uint32_t llama_kv_cache_context::get_size() const {
+    return kv->get_size();
+}
+
+void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_relative_pos(dst, ubatch, extent);
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

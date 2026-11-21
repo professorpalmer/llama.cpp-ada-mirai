@@ -2311,6 +2311,12 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_GPT4O;
                 clean_spaces = false;
             } else if (
+                tokenizer_pre == "inkling2") {
+                // Inkling 2 (Unsloth's llama.cpp mix b12588-mix-c0c3de8): GPT-4o split, no BOS
+                pre_type = LLAMA_VOCAB_PRE_TYPE_GPT4O;
+                special_bos_id = LLAMA_TOKEN_NULL;
+                clean_spaces = false;
+            } else if (
                 tokenizer_pre == "granite-embed-multi-97m") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_GRANITE_EMB_MULTI;
                 clean_spaces = false;
@@ -2868,6 +2874,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     || t.first == "<|tool_response>" // gemma4
                     || t.first == "<｜end▁of▁sentence｜>" // deepseek-ocr
                     || t.first == "[e~[" // minimax-m2/m3
+                    || t.first == "<|content_model_end_sampling|>" // inkling
                ) {
                 special_eog_ids.insert(t.second);
                 if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {

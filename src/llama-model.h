@@ -297,6 +297,28 @@ struct llama_layer {
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
 
+    // inkling2 (Unsloth's llama.cpp mix b12588-mix-c0c3de8, MIT): relative-position bias, clips, per-query sinks,
+    // short convolutions, block attention residuals, loop message controllers (attn, k, v, mlp)
+    struct ggml_tensor * attn_rel         = nullptr;
+    struct ggml_tensor * attn_rel_bias    = nullptr;
+    struct ggml_tensor * attn_q_clip      = nullptr;
+    struct ggml_tensor * attn_rel_clip    = nullptr;
+    struct ggml_tensor * attn_sink_proj   = nullptr;
+    struct ggml_tensor * loop_down[4]     = {};
+    struct ggml_tensor * loop_gain[4]     = {};
+    struct ggml_tensor * loop_forget[4]   = {};
+    struct ggml_tensor * attn_q_inp_norm  = nullptr;
+    struct ggml_tensor * attn_k_inp_norm  = nullptr;
+    struct ggml_tensor * attn_v_inp_norm  = nullptr;
+    struct ggml_tensor * attn_k_conv      = nullptr;
+    struct ggml_tensor * attn_v_conv      = nullptr;
+    struct ggml_tensor * attn_k_conv_proj = nullptr;
+    struct ggml_tensor * attn_v_conv_proj = nullptr;
+    struct ggml_tensor * attn_post_conv   = nullptr;
+    struct ggml_tensor * attn_res_query   = nullptr;
+    struct ggml_tensor * ffn_post_conv    = nullptr;
+    struct ggml_tensor * ffn_res_query    = nullptr;
+
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
     struct ggml_tensor * attn_rel_b_enc   = nullptr;
@@ -636,6 +658,10 @@ struct llama_model {
     struct ggml_tensor * pos_embd   = nullptr;
     struct ggml_tensor * tok_norm   = nullptr;
     struct ggml_tensor * tok_norm_b = nullptr;
+
+    struct ggml_tensor * output_res_query  = nullptr; // inkling2: query of the final attention-residual mix
+    struct ggml_tensor * loop_res_query    = nullptr; // inkling2 loop: cross-pass queries (attn, mlp per core layer)
+    struct ggml_tensor * loop_kv_res_query = nullptr; // inkling2 loop: cross-pass queries (k, v per core layer)
 
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix

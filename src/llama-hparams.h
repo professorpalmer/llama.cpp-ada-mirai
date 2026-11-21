@@ -184,6 +184,25 @@ struct llama_hparams {
     // kimi-k3
     uint32_t n_expert_latent      = 0;      // routed_expert_hidden_size (0 = experts run at n_embd)
     uint32_t attn_res_block_size  = 0;      // 0 = no cross-layer attention residuals
+
+    // inkling2 (Thinking Machines Inkling 2): relative-position bias, log-scaled global queries, clips, padded vocab,
+    // and the convolution state width (ported from Unsloth's llama.cpp mix b12588-mix-c0c3de8, MIT)
+    uint32_t n_relative        = 0;
+    uint32_t n_relative_extent = 0;
+    uint32_t n_vocab_unpadded  = 0;
+    uint32_t n_vocab_padded    = 0;
+    uint32_t n_log_scale_floor = 0;
+    float    f_log_scale_alpha = 0.0f;
+    float    f_qk_clip         = 0.0f;
+    float    f_relative_clip   = 0.0f;
+    uint32_t n_sconv_channels  = 0;
+
+    // looped layers: [loop_core_start, loop_core_end) run loop_n_pass times, each visit is its own layer index
+    // (upstream llama.cpp #32694; Unsloth mix b12588-mix-c0c3de8)
+    uint32_t loop_core_start = 0;
+    uint32_t loop_core_end   = 0;
+    uint32_t loop_n_pass     = 0; // < 2: no loop
+    uint32_t loop_gate_rank  = 0; // inkling2
     float    kda_gate_lower_bound = -INFINITY;
     float    situ_beta            = 1.0f;
     float    situ_linear_beta     = 0.0f;   // 0 = no linear-beta transform on the up branch
@@ -440,6 +459,14 @@ struct llama_hparams {
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
+
+    // looped layers: visits beyond the physical layers, physical layer of a visit, first visit of a physical layer
+    uint32_t loop_n_extra() const;
+    uint32_t loop_layer(uint32_t il) const;
+    uint32_t loop_visit(uint32_t ip) const;
+
+    // layers that hold weights (includes nextn layers), the unit of n_gpu_layers; fewer than n_layer_all with looped layers
+    uint32_t n_layer_weights() const;
 
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons

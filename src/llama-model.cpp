@@ -296,6 +296,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_openai_moe(params);
         case LLM_ARCH_FALCON_H1:
             return new llama_model_falcon_h1(params);
+        case LLM_ARCH_INKLING2:
+            return new llama_model_inkling2(params);
         case LLM_ARCH_LFM2:
             return new llama_model_lfm2(params);
         case LLM_ARCH_LFM2MOE:
@@ -1537,8 +1539,30 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         hparams.n_cls_out = classifier_labels.size();
     }
 
+    // looped layers: the GGUF has one block per layer visit, the visits of a core layer share its weights
+    // (upstream llama.cpp #32694; Unsloth's llama.cpp mix b12588-mix-c0c3de8)
+    ml.get_key(LLM_KV_LOOP_CORE_END, hparams.loop_core_end, false);
+    if (hparams.loop_core_end > 0) {
+        ml.get_key(LLM_KV_LOOP_CORE_START, hparams.loop_core_start);
+        ml.get_key(LLM_KV_NUM_LOOPS,       hparams.loop_n_pass);
+        if (hparams.loop_n_pass < 2 || hparams.loop_core_start >= hparams.loop_core_end ||
+            (uint64_t) hparams.loop_core_end + (uint64_t) (hparams.loop_n_pass - 1)*(hparams.loop_core_end - hparams.loop_core_start) > hparams.n_layer()) {
+            throw std::runtime_error(format("invalid loop layout: core [%u, %u) x %u passes, %u layer visits",
+                hparams.loop_core_start, hparams.loop_core_end, hparams.loop_n_pass, hparams.n_layer()));
+        }
+    }
+
     // per-arch hparams
     load_arch_hparams(ml);
+
+    for (uint32_t il = 0; il < hparams.n_layer() && hparams.loop_n_pass > 1; ++il) {
+        const uint32_t iv = hparams.loop_visit(hparams.loop_layer(il));
+        if (hparams.is_swa(il) != hparams.is_swa(iv) || hparams.is_recr(il) != hparams.is_recr(iv) ||
+            hparams.n_head(il) != hparams.n_head(iv) || hparams.n_head_kv(il) != hparams.n_head_kv(iv) ||
+            hparams.n_ff(il) != hparams.n_ff(iv)) {
+            throw std::runtime_error(format("layer visit %u differs from the first visit %u of its layer", il, iv));
+        }
+    }
 
     pimpl->n_bytes = ml.n_bytes;
 
@@ -1639,10 +1663,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    // n_gpu_layers and the splits count the layers that hold weights: with looped layers the extra visits share them
+    const int n_layer_weights = hparams.n_layer_weights();
+    const int i_gpu_start = std::max(n_layer_weights + 1 - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_weights + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
-        const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        const bool is_swa = il < n_layer_weights && hparams.is_swa(hparams.loop_visit(il));
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -1660,11 +1686,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
-        pimpl->dev_layer[il] = get_layer_buft_list(il);
+        pimpl->dev_layer[il] = get_layer_buft_list(hparams.loop_layer(il)); // each visit on the device of its weights
     }
 
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    pimpl->dev_output = get_layer_buft_list(n_layer_weights);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -1694,7 +1720,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             return create_tensor(tn(type, "scale", i), {1}, TENSOR_NOT_REQUIRED);
         };
-        for (int i = 0; i < n_layer_all; ++i) {
+        const int n_layer_phys = n_layer_all - (int) hparams.loop_n_extra();
+        for (int i = 0; i < n_layer_phys; ++i) {
             auto & layer = layers[i];
 
             // attention weight scales (per-tensor, shape {1})
@@ -1746,6 +1773,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            }
+            // fused gate_up experts: one scale per expert for the fused tensor (Unsloth mix b12588-mix-c0c3de8)
+            if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -1831,6 +1862,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.nextn.shared_head_head_in_s && layer.nextn.shared_head_head) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
+        }
+        // looped layers: every visit shares the weights of its physical layer (upstream #32694; Unsloth mix)
+        for (int il = n_layer_all - 1; il >= 0; --il) {
+            const int ip = (int) hparams.loop_layer(il);
+            if (ip != il) {
+                layers[il] = layers[ip];
             }
         }
         // Mirai S: the head's per-row scale and the model-wide tensors
@@ -2336,7 +2374,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    // tn.bid numbers the layers that hold weights, which go with their first visit; blocks past them go with the
+    // output (looped layers: upstream #32694; Unsloth's llama.cpp mix b12588-mix-c0c3de8)
+    const buft_list_t * buft_list_layer = nullptr;
+    if (tn.bid != -1) {
+        buft_list_layer = (uint32_t) tn.bid < hparams.n_layer_weights() ?
+            pimpl->dev_layer.at(hparams.loop_visit(tn.bid)).buft_list : pimpl->dev_output.buft_list;
+    }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
@@ -2968,7 +3012,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
-                    if (arch == LLM_ARCH_FALCON_H1) {
+                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2) {
+                        // inkling2: every layer visit has a K/V cache and a convolution state
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -3006,7 +3051,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* n_kv_vram_cells   */ cparams.n_kv_vram_cells);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -3302,6 +3348,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_INKLING2:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

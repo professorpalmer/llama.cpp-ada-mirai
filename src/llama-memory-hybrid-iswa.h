@@ -39,7 +39,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                 uint32_t   n_kv_vram_cells = 0); // tiered K/V of the base attention cache (Inkling 2)
 
     ~llama_memory_hybrid_iswa() = default;
 

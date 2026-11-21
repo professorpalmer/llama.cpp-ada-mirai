@@ -2059,6 +2059,43 @@ struct llama_model_openai_moe : public llama_model_base {
 };
 
 
+// Inkling 2: ported from Unsloth's llama.cpp mix b12588-mix-c0c3de8 (MIT)
+struct llama_model_inkling2 : public llama_model_base {
+    llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        const llama_model & model;
+
+        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const llama_layer & layer, int module);
+        ggml_tensor * convolve(
+                ggml_tensor * cur,
+                ggml_tensor * weight,
+                ggml_tensor * dynamic,
+                ggml_tensor * state,
+                ggml_tensor * history,
+                llm_graph_input_rs * inp,
+                int64_t offset);
+        ggml_tensor * dense_attn(
+                llm_graph_input_mem_hybrid_iswa_rel * inp,
+                ggml_tensor * q_cur,
+                ggml_tensor * k_cur,
+                ggml_tensor * v_cur,
+                ggml_tensor * kq_b,
+                ggml_tensor * sinks,
+                float         kq_scale,
+                int           il,
+                int64_t       i_row);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_falcon_h1 : public llama_model_base {
     llama_model_falcon_h1(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

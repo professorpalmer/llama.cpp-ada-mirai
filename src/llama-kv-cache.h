@@ -175,6 +175,10 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // cells [0, n) hold positions [0, n) of the one sequence of the ubatch, and the ubatch is their tail; 0 otherwise
+    // (banded relative-position attention, Inkling 2; Unsloth mix b12588-mix-c0c3de8)
+    uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -234,6 +238,8 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // distance from each token to each cell, extent for the empty, future and more distant cells (Inkling 2)
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -440,6 +446,11 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // distance from each token to each cell, extent for the empty, future and more distant cells (Inkling 2)
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // K/V cells of the banded attention for the current ubatch, 0 = not position-contiguous (Inkling 2)
+    uint32_t get_n_kv_pos_contiguous() const;
+    uint32_t get_size() const; // cells of the cache (Inkling 2 dense-bias chunking)
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
