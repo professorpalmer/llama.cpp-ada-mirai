@@ -29,7 +29,9 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                     uint32_t   n_kv_vram_cells = 0); // tiered K/V for the base (non-SWA) cache only (Inkling 2)
+                     uint32_t   n_kv_vram_cells = 0,  // tiered K/V for the base (non-SWA) cache only (Inkling 2)
+                    ggml_type   type_k_swa = GGML_TYPE_COUNT, // K/V types of the SWA cache, COUNT = as the base (Inkling 2)
+                    ggml_type   type_v_swa = GGML_TYPE_COUNT);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -48,7 +50,9 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                     uint32_t   n_kv_vram_cells = 0); // tiered K/V for the base (non-SWA) cache only (Inkling 2)
+                     uint32_t   n_kv_vram_cells = 0,  // tiered K/V for the base (non-SWA) cache only (Inkling 2)
+                    ggml_type   type_k_swa = GGML_TYPE_COUNT, // K/V types of the SWA cache, COUNT = as the base (Inkling 2)
+                    ggml_type   type_v_swa = GGML_TYPE_COUNT);
 
     ~llama_kv_cache_iswa() = default;
 

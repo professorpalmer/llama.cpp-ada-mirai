@@ -40,7 +40,9 @@ public:
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
-                 uint32_t   n_kv_vram_cells = 0); // tiered K/V of the base attention cache (Inkling 2)
+                 uint32_t   n_kv_vram_cells = 0,  // tiered K/V of the base attention cache (Inkling 2)
+                ggml_type   type_k_swa = GGML_TYPE_COUNT, // K/V types of the SWA cache, COUNT = as the base (Inkling 2)
+                ggml_type   type_v_swa = GGML_TYPE_COUNT);
 
     ~llama_memory_hybrid_iswa() = default;
 

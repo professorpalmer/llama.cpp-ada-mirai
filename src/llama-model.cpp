@@ -3033,6 +3033,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                        // Inkling 2: LLAMA_INKLING_SWA_KV=f16|q8_0|q4_0 gives the 40 SWA caches their own K/V type (the
+                        // global caches keep -ctk / -ctv); unset = the same type as the global caches
+                        ggml_type swa_kv = GGML_TYPE_COUNT;
+                        if (arch == LLM_ARCH_INKLING2) {
+                            if (const char * e = getenv("LLAMA_INKLING_SWA_KV")) {
+                                const std::string v = e;
+                                swa_kv = v == "f16" ? GGML_TYPE_F16 : v == "q8_0" ? GGML_TYPE_Q8_0 : v == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_COUNT;
+                                if (swa_kv == GGML_TYPE_COUNT) {
+                                    throw std::runtime_error("LLAMA_INKLING_SWA_KV must be f16, q8_0 or q4_0");
+                                }
+                            }
+                        }
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
@@ -3052,7 +3064,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* n_kv_vram_cells   */ cparams.n_kv_vram_cells);
+                            /* n_kv_vram_cells   */ cparams.n_kv_vram_cells,
+                            /* type_k_swa        */ swa_kv,
+                            /* type_v_swa        */ swa_kv);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,

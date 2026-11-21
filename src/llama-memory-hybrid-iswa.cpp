@@ -30,7 +30,9 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-                 uint32_t   n_kv_vram_cells) :
+                 uint32_t   n_kv_vram_cells,
+                ggml_type   type_k_swa,
+                ggml_type   type_v_swa) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -50,7 +52,9 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             : filter_attn,
         nullptr,
         nullptr,
-        n_kv_vram_cells
+        n_kv_vram_cells,
+        type_k_swa,
+        type_v_swa
     )),
     mem_recr(new llama_memory_recurrent(
         model,
