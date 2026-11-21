@@ -8545,6 +8545,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * rel   = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? dst->src[6] : nullptr;
     const int32_t window      = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? ggml_get_op_params_i32(dst, 4) : 0;
+    // token positions of the banded op (ggml_flash_attn_ext_banded_set_pos): rel_dist = pos_q[q] - pos_kv[cell]
+    const ggml_tensor * pos_kv = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? dst->src[5] : nullptr;
+    const ggml_tensor * pos_q  = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? dst->src[7] : nullptr;
     // the banded op is the reference of kernels that sum P.V in fp32: F16 V is converted and summed in fp32 as well
     const bool v_acc_f16      = v->type == GGML_TYPE_F16 && dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED;
 
@@ -8658,12 +8661,18 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
+        // positions: the query's position and the cells' positions of this stream
+        const int32_t * ppkv = pos_kv ? (const int32_t *) ((const char *) pos_kv->data + (iq3 % pos_kv->ne[1])*pos_kv->nb[1]) : nullptr;
+        const int64_t   pq_pos = pos_q ? ((const int32_t *) ((const char *) pos_q->data + (iq3 % pos_q->ne[1])*pos_q->nb[1]))[iq1] : 0;
+
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
             float mv = mp ? ggml_fa_mask_value(mask, mp, ic, slope) : 0.0f;
+            // the distance of the cell from the query: from the positions, else the tail rule (the queries are the
+            // last n_q cells of the view)
+            const int64_t rel_dist = ppkv ? pq_pos - (int64_t) ppkv[ic] : iq1 + (nek1 - neq1) - ic;
             if (window > 0) {
-                // implicit mask of the banded op: visible iff 0 <= iq1 + (n_kv - n_q) - ic < window
-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
-                mv = rel_dist >= 0 && rel_dist < window ? 0.0f : -INFINITY;
+                // implicit mask of the banded op: visible iff 0 <= rel_dist < window (and the cell is not empty)
+                mv = rel_dist >= 0 && rel_dist < window && (!ppkv || ppkv[ic] >= 0) ? 0.0f : -INFINITY;
             }
             if (mv == -INFINITY) {
                 continue;
@@ -8681,8 +8690,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
 
             if (rel) {
-                // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                // rel_dist as above (the tail rule aligns a short decode Q block to the tail of K, the FA4
+                // seqlen_k - seqlen_q convention)
                 if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
                     s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
                 }

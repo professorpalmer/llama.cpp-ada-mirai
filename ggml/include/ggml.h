@@ -2483,6 +2483,17 @@ extern "C" {
     GGML_API int32_t ggml_flash_attn_ext_banded_get_window(
             const struct ggml_tensor * a);
 
+    // token positions for a banded op over a K/V view whose cell order does not follow position (a ring cache):
+    //   pos_q  I32 [n_batch, n_stream]: the position of each query      (src[7])
+    //   pos_kv I32 [n_kv,    n_stream]: the position held by each cell, -1 for an empty cell (src[5])
+    // then rel_dist = pos_q[q_idx] - pos_kv[kv_idx] replaces the tail rule above; a cell is visible iff
+    // pos_kv >= 0 and 0 <= rel_dist < window. Needs the implicit window (set_window > 0, no mask tensor).
+    // The stream of batch b is b % n_stream.
+    GGML_API void ggml_flash_attn_ext_banded_set_pos(
+            struct ggml_tensor * a,
+            struct ggml_tensor * pos_q,
+            struct ggml_tensor * pos_kv);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

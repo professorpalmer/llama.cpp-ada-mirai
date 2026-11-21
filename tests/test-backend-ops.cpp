@@ -7339,6 +7339,95 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
     }
 };
 
+// banded FA with token positions (ggml_flash_attn_ext_banded_set_pos): a K/V view whose cell order is not the position
+// order, as the ring caches of sliding-window layers. layout:
+//   0: positions that state the tail rule (pos_kv[i] = base + i, the queries are the last n_q cells)
+//   1: a ring of n_real = n_kv - pad cells past its wrap (the newest cells at low indices, the oldest at high ones),
+//      the pad cells empty (-1) at the end, as a cache padded to 256
+//   2: the ring of layout 1 with its cells shuffled and some cells emptied
+//   3: a fresh ring: only the first P cells hold tokens, the rest empty
+// In every layout the n_q queries are the newest positions and their own cells are in the view (a ubatch sees its
+// earlier tokens and not its later ones through 0 <= rel_dist).
+struct test_flash_attn_ext_banded_pos : public test_flash_attn_ext_banded {
+    const int32_t window;
+    const int layout;
+    const int64_t pad;
+    const int sinks;   // 0: none, 1: per head, 2: per query
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded::vars() + ",window=" + std::to_string(window) + ",layout=" + std::to_string(layout) +
+            ",pad=" + std::to_string(pad) + ",sinks=" + std::to_string(sinks);
+    }
+
+    test_flash_attn_ext_banded_pos(int64_t n_q, int64_t n_kv, int32_t window, int layout, int64_t pad, ggml_type kv_type,
+            int sinks, int64_t d = 128, int64_t n_head = 24, int64_t n_head_kv = 8, int64_t rel_extent = 1024)
+        : test_flash_attn_ext_banded(d, n_head, n_head_kv, n_q, n_kv, rel_extent, 4, kv_type, GGML_TYPE_F32),
+          window(window), layout(layout), pad(pad), sinks(sinks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext_banded::build_graph(ctx);
+        ggml_flash_attn_ext_banded_set_window(out, window);
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, sinks == 2 ? n_q : 1);
+            ggml_set_name(s, "sinks");
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
+        ggml_tensor * pq = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q);
+        ggml_tensor * pk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        ggml_set_name(pq, "pos_q");
+        ggml_set_name(pk, "pos_kv");
+        ggml_flash_attn_ext_banded_set_pos(out, pq, pk);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t n_real = n_kv - pad;   // cells that can hold tokens
+        // P tokens so far: past the wrap for layouts 1 and 2, before it for layout 3; the queries are the last n_q
+        const int64_t P = layout == 3 ? std::max<int64_t>(n_q, n_real/2) : n_real + 777;
+        std::vector<int32_t> pk(n_kv, -1);
+        std::vector<int32_t> pq(n_q);
+        std::mt19937 rng((uint32_t) (n_kv*131 + n_q*7 + layout));
+        if (layout == 0) {
+            const int32_t base = 5000;
+            for (int64_t i = 0; i < n_kv; ++i) {
+                pk[i] = base + (int32_t) i;
+            }
+            for (int64_t i = 0; i < n_q; ++i) {
+                pq[i] = base + (int32_t) (n_kv - n_q + i);
+            }
+        } else {
+            for (int64_t p = std::max<int64_t>(0, P - n_real); p < P; ++p) {
+                pk[p % n_real] = (int32_t) p;
+            }
+            for (int64_t i = 0; i < n_q; ++i) {
+                pq[i] = (int32_t) (P - n_q + i);
+            }
+            if (layout == 2) {
+                std::shuffle(pk.begin(), pk.end(), rng);
+                // empty a few cells that hold none of the queries' own tokens
+                for (int64_t i = 0; i < n_kv; i += 37) {
+                    if (pk[i] >= 0 && pk[i] < P - n_q) {
+                        pk[i] = -1;
+                    }
+                }
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pos_q") == 0) {
+                ggml_backend_tensor_set(t, pq.data(), 0, pq.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "pos_kv") == 0) {
+                ggml_backend_tensor_set(t, pk.data(), 0, pk.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "rel_logits") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (strcmp(t->name, "sinks") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
 // banded FA with Q values in [-q_range, q_range]: large logits, so the online softmax and the KV-split merge rescale
 struct test_flash_attn_ext_banded_large : public test_flash_attn_ext_banded_sinks {
     const float q_range;
@@ -10799,6 +10888,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_large(128, 24, 8, 512, 65536, 1024, kv_type, 2, 1000.0f));
     }
 
+    // token positions (op E, ggml_flash_attn_ext_banded_set_pos): the ring caches of the sliding-window layers
+    for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t n_q : { 1, 2, 8, 32, 33, 64, 512, 1024 }) {
+            for (int32_t window : { 1024, 64 }) {
+                // a ring of window + n_q (+ slack) cells past its wrap, padded to 256 with empty cells; and shuffled
+                const int64_t n_real = window + n_q + 40;
+                const int64_t n_kv   = GGML_PAD(n_real, 256);
+                test_cases.emplace_back(new test_flash_attn_ext_banded_pos(n_q, n_kv, window, 1, n_kv - n_real, kv_type, 2));
+                test_cases.emplace_back(new test_flash_attn_ext_banded_pos(n_q, n_kv, window, 2, n_kv - n_real, kv_type, n_q % 2 ? 1 : 0));
+            }
+        }
+        for (int64_t n_q : { 1, 8, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(n_q, 1100, 1024,      2, 0, kv_type, 2));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(n_q, 4096, 1024,      2, 0, kv_type, 2));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(n_q, 4096, INT32_MAX, 0, 0, kv_type, 2)); // tail-rule positions
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(n_q, 2048, 1024,      3, 0, kv_type, 2)); // fresh ring, half empty
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_banded_pos(77, 1280, 1024, 2, 100, GGML_TYPE_F16, 2, 64, 8, 2));
 
     return test_cases;
 }
