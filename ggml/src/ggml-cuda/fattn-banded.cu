@@ -544,6 +544,38 @@ static __device__ __forceinline__ void fattn_banded_mma_wait() {
 }
 #endif // FATTN_BANDED_MMA_AVAILABLE
 
+// token positions (ggml_flash_attn_ext_banded_set_pos): the lowest and highest position of the non-empty cells of each
+// tile of fattn_banded_mma_bk cells (x > y: no token in the tile). grid [n_kt, n_stream], block fattn_banded_mma_bk.
+static __global__ void flash_attn_ext_banded_tile_pos(
+        const int32_t * __restrict__ pos_kv,
+        int2          * __restrict__ tile_pos,
+        int64_t n_kv) {
+    __shared__ int s_lo[32];
+    __shared__ int s_hi[32];
+    const int64_t kt = blockIdx.x;
+    const int64_t ik = kt*blockDim.x + threadIdx.x;
+    const int     p  = ik < n_kv ? pos_kv[blockIdx.y*n_kv + ik] : -1;
+    int lo = p >= 0 ? p : INT32_MAX;
+    int hi = p >= 0 ? p : INT32_MIN;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        lo = min(lo, __shfl_xor_sync(0xffffffffu, lo, o, WARP_SIZE));
+        hi = max(hi, __shfl_xor_sync(0xffffffffu, hi, o, WARP_SIZE));
+    }
+    if (threadIdx.x % WARP_SIZE == 0) {
+        s_lo[threadIdx.x / WARP_SIZE] = lo;
+        s_hi[threadIdx.x / WARP_SIZE] = hi;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < (int) (blockDim.x / WARP_SIZE); ++w) {
+            lo = min(lo, s_lo[w]);
+            hi = max(hi, s_hi[w]);
+        }
+        tile_pos[blockIdx.y*gridDim.x + kt] = make_int2(lo, hi);
+    }
+}
+
 static __global__ void flash_attn_ext_banded_mma_tile_flags(
         const char * __restrict__ mask,
         uint8_t    * __restrict__ flags,
@@ -629,7 +661,8 @@ static __global__ void flash_attn_ext_banded_mma(
         const int32_t * __restrict__ pos_q,
         const int32_t * __restrict__ pos_kv,
         int64_t pos_q_ne1,
-        int64_t pos_kv_ne1) {
+        int64_t pos_kv_ne1,
+        const int2 * __restrict__ tile_pos) {
 #ifdef FATTN_BANDED_MMA_AVAILABLE
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
     static_assert(type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q4_0 || type_KV == GGML_TYPE_Q8_0, "unsupported K/V type");
@@ -666,9 +699,21 @@ static __global__ void flash_attn_ext_banded_mma(
     // cells [iq_b0 + q_offset - window + 1, iq_b1 + q_offset]; K/V tiles outside that range are not visited
     const int64_t iq_b0 = qt*BQ;
     const int64_t iq_b1 = (qt*BQ + BQ < n_q ? qt*BQ + BQ : n_q) - 1;
-    // token positions (ggml_flash_attn_ext_banded_set_pos): the cells are in any order, every tile is visited and
-    // each cell is tested by its position
+    // token positions (ggml_flash_attn_ext_banded_set_pos): the cells are in any order; each cell is tested by its
+    // position, and a tile is skipped when its position range (tile_pos) holds no cell any query of the block can see
     const int32_t * pkv = pos_kv ? pos_kv + (ib % pos_kv_ne1)*n_kv : nullptr;
+    const int2    * tpr = pkv && tile_pos ? tile_pos + (ib % pos_kv_ne1)*n_kt : nullptr;
+    int64_t pq_lo = 0;   // the block's lowest and highest query position
+    int64_t pq_hi = 0;
+    if (tpr) {
+        pq_lo = INT64_MAX;
+        pq_hi = INT64_MIN;
+        for (int64_t iq = iq_b0; iq <= iq_b1; ++iq) {
+            const int64_t p = pos_q[(ib % pos_q_ne1)*n_q + iq];
+            pq_lo = p < pq_lo ? p : pq_lo;
+            pq_hi = p > pq_hi ? p : pq_hi;
+        }
+    }
     int64_t kt_lo = 0;
     int64_t kt_hi = n_kt;
     if (window > 0 && !pkv) {
@@ -732,6 +777,16 @@ static __global__ void flash_attn_ext_banded_mma(
     auto next_tile = [&](int64_t kt) {
         if (f_base) {
             while (kt < kt_end && f_base[kt] == 0) {
+                ++kt;
+            }
+        }
+        if (tpr) {
+            // visible cells have pq_lo - window + 1 <= pos <= pq_hi
+            while (kt < kt_end) {
+                const int2 r = tpr[kt];
+                if (r.x <= r.y && int64_t(r.y) >= pq_lo - int64_t(window) + 1 && int64_t(r.x) <= pq_hi) {
+                    break;
+                }
                 ++kt;
             }
         }
@@ -1003,7 +1058,7 @@ static __global__ void flash_attn_ext_banded_mma(
     GGML_UNUSED_VARS(q, k, v, mask, flags, rel, sinks, dst, part, scale, type_rel, n_q, n_kv, n_head_q, n_head_kv,
         n_chunks, tiles_per_chunk, rel_extent, mask_ne2, mask_ne3, q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3,
         v_nb1, v_nb2, v_nb3, m_nb1, m_nb2, m_nb3, r_nb0, r_nb1, r_nb2, r_nb3, rel_ne3, sinks_s1, sinks_s2, window,
-        pos_q, pos_kv, pos_q_ne1, pos_kv_ne1);
+        pos_q, pos_kv, pos_q_ne1, pos_kv_ne1, tile_pos);
     NO_DEVICE_CODE;
 #endif // FATTN_BANDED_MMA_AVAILABLE
 }
@@ -1013,12 +1068,12 @@ static __global__ void flash_attn_ext_banded_mma(
 // (GGML_CUDA_BANDED_DEC=0); quantized K/V with n_tok <= 32 is then unsupported.
 static constexpr int64_t fattn_banded_dec_max_q = GGML_CUDA_BANDED_DEC_MAX_Q;
 
-// GGML_CUDA_BANDED_MMA_MIN_Q=n (measurements, n >= 8): quantized K/V ops of n to 32 queries also take the tensor-core
+// GGML_CUDA_BANDED_MMA_MIN_Q=n (measurements, n >= 1): quantized K/V ops of n to 32 queries also take the tensor-core
 // prefill kernel (the crossover with the decode kernel). Unset: 0, off.
 static int64_t fattn_banded_mma_min_q_env() {
     static const int64_t n = [] {
         const char * e = getenv("GGML_CUDA_BANDED_MMA_MIN_Q");
-        return e != nullptr ? std::max<int64_t>(8, atoll(e)) : (int64_t) 0;
+        return e != nullptr ? std::max<int64_t>(1, atoll(e)) : (int64_t) 0;
     }();
     return n;
 }
@@ -1246,6 +1301,12 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     const int64_t n_qt = (n_q + bq - 1)/bq;
     const int64_t n_kt = (n_kv + fattn_banded_mma_bk - 1)/fattn_banded_mma_bk;
 
+    ggml_cuda_pool_alloc<int2> tile_pos(ctx.pool());
+    if (pos_kv_t) {
+        tile_pos.alloc(n_kt*pos_kv_t->ne[1]);
+        flash_attn_ext_banded_tile_pos<<<dim3(n_kt, pos_kv_t->ne[1]), fattn_banded_mma_bk, 0, stream>>>(
+            (const int32_t *) pos_kv_t->data, tile_pos.get(), n_kv);
+    }
     ggml_cuda_pool_alloc<uint8_t> flags(ctx.pool());
     if (m) {
         const int64_t n_z = m->ne[2]*m->ne[3];
@@ -1296,7 +1357,7 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
         rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2, window, \
         pos_q_t ? (const int32_t *) pos_q_t->data : nullptr, pos_kv_t ? (const int32_t *) pos_kv_t->data : nullptr, \
-        pos_q_t ? pos_q_t->ne[1] : 1, pos_kv_t ? pos_kv_t->ne[1] : 1)
+        pos_q_t ? pos_q_t->ne[1] : 1, pos_kv_t ? pos_kv_t->ne[1] : 1, pos_kv_t ? tile_pos.get() : nullptr)
     FATTN_BANDED_MMA_SWITCH(LAUNCH_BANDED_MMA)
 #undef LAUNCH_BANDED_MMA
     CUDA_CHECK(cudaGetLastError());
