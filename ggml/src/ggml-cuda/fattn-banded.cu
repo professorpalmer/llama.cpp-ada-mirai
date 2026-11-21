@@ -1013,6 +1013,21 @@ static __global__ void flash_attn_ext_banded_mma(
 // (GGML_CUDA_BANDED_DEC=0); quantized K/V with n_tok <= 32 is then unsupported.
 static constexpr int64_t fattn_banded_dec_max_q = GGML_CUDA_BANDED_DEC_MAX_Q;
 
+// GGML_CUDA_BANDED_MMA_MIN_Q=n (measurements, n >= 8): quantized K/V ops of n to 32 queries also take the tensor-core
+// prefill kernel (the crossover with the decode kernel). Unset: 0, off.
+static int64_t fattn_banded_mma_min_q_env() {
+    static const int64_t n = [] {
+        const char * e = getenv("GGML_CUDA_BANDED_MMA_MIN_Q");
+        return e != nullptr ? std::max<int64_t>(8, atoll(e)) : (int64_t) 0;
+    }();
+    return n;
+}
+
+static bool fattn_banded_q_small_to_mma(const ggml_tensor * q) {
+    const int64_t n = fattn_banded_mma_min_q_env();
+    return n > 0 && q->ne[1] >= n && q->ne[1] <= fattn_banded_dec_max_q;
+}
+
 static bool fattn_banded_type_supported(ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
 }
@@ -1048,7 +1063,7 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     }
     if (fattn_banded_kv_type_native(k->type) || fattn_banded_kv_type_native(v->type)) {
         // quantized K/V: the tensor-core prefill kernel, the same type for K and V
-        if (k->type != v->type || q->ne[1] <= fattn_banded_dec_max_q ||
+        if (k->type != v->type || (q->ne[1] <= fattn_banded_dec_max_q && !fattn_banded_q_small_to_mma(q)) ||
                 !turing_mma_available(ggml_cuda_info().devices[device].cc)) {
             return false;
         }
@@ -1223,7 +1238,10 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * pos_q_t  = dst->src[7];
     GGML_ASSERT(window <= 0 || m == nullptr);
 
-    const int nw = n_q >= 64 ? 4 : (n_q >= 32 ? 2 : 1);
+    int nw = n_q >= 64 ? 4 : (n_q >= 32 ? 2 : 1);
+    if (type_KV != GGML_TYPE_F16 && nw < 2) {
+        nw = 2;   // the quantized K/V kernels are built for 2 and 4 warps
+    }
     const int bq = nw*16;
     const int64_t n_qt = (n_q + bq - 1)/bq;
     const int64_t n_kt = (n_kv + fattn_banded_mma_bk - 1)/fattn_banded_mma_bk;
@@ -1445,7 +1463,9 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
         }
     }
 
-    if (ggml_cuda_flash_attn_ext_banded_dec_supported(ctx.device, dst)) {
+    if (q->ne[1] <= fattn_banded_dec_max_q && fattn_banded_q_small_to_mma(q) && fattn_banded_kv_type_native(dst->src[1]->type)) {
+        fattn_banded_mma_launch(ctx, dst, scale, rel_extent);   // GGML_CUDA_BANDED_MMA_MIN_Q (measurements)
+    } else if (ggml_cuda_flash_attn_ext_banded_dec_supported(ctx.device, dst)) {
         // decode and verify batches (n_tok <= 32) with f16 / q8_0 / q4_0 K/V
         ggml_cuda_flash_attn_ext_banded_dec(ctx, dst);
     } else if (q->ne[1] <= fattn_banded_dec_max_q) {
