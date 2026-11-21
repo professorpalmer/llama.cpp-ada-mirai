@@ -11222,7 +11222,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     for (int64_t n_q : { 1, 512, 1024, }) {
         const int64_t n_kv = GGML_PAD(1024 + n_q + 40, 256);
-        test_cases.emplace_back(new test_flash_attn_ext_banded_pos(n_q, n_kv, 1024, 2, n_kv - (1024 + n_q + 40), GGML_TYPE_F16, 2));
+        for (int layout : { 1, 2, }) {   // ring order (the real SWA cache past its wrap) and shuffled
+            test_cases.emplace_back(new test_flash_attn_ext_banded_pos(n_q, n_kv, 1024, layout, n_kv - (1024 + n_q + 40), GGML_TYPE_F16, 2));
+        }
     }
 
     for (int col : {8192, 16384, 32768, 65536, 131072, 262144, 524288}) {
