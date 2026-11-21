@@ -4056,20 +4056,25 @@ void llm_graph_context::build_conv_state_store(
     const int64_t n_seqs   = conv_x->ne[2];
 
     const size_t row_size  = s->nb[1];
-    const size_t cell_offs = mctx_cur->get_head()*row_size + offs;
 
-    GGML_ASSERT(cparams.n_rs_seq == 0 && "Inkling 2 conv state: rollback slots are not ported");
+    // slot 0 = the final state, slot k = the state k tokens back (partial rollback, the recurrent memory widens the
+    // state to 1 + n_rs_seq planes of mem_size rows), as LFM2 does
+    const int64_t K         = cparams.n_rs_seq > 0 ? (int64_t) cparams.n_rs_seq + 1 : 1;
+    const int64_t n_written = std::max<int64_t>(1, std::min<int64_t>(n, K));
+    const size_t  mem_size  = mctx_cur->get_size();
 
-    ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
-            n_cols, channels, n_seqs,
-            conv_x->nb[1], conv_x->nb[2],
-            ggml_row_size(conv_x->type, n));
+    for (int64_t slot = 0; slot < n_written; ++slot) {
+        ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
+                n_cols, channels, n_seqs,
+                conv_x->nb[1], conv_x->nb[2],
+                ggml_row_size(conv_x->type, n - slot));
 
-    ggml_tensor * cell = ggml_view_2d(ctx0, s,
-            n_cols*channels, n_seqs,
-            row_size, cell_offs);
+        ggml_tensor * cell = ggml_view_2d(ctx0, s,
+                n_cols*channels, n_seqs,
+                row_size, ((size_t) slot*mem_size + mctx_cur->get_head())*row_size + offs);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+    }
 }
 
 llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {
