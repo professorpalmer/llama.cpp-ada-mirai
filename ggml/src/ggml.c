@@ -1138,6 +1138,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ESCHA_MOE",
     "ESCHA_MUL_MAT",
     "L2_CLIP",
+    "INKLING_CONV",
 
     "UNARY",
 
@@ -1155,7 +1156,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1259,6 +1260,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "escha_moe(code, x, ids)",
     "escha_mul_mat(code, x)",
     "l2_clip(x)",
+    "inkling_conv(cur, past, w)",
 
     "unary(x)",
 
@@ -1276,7 +1278,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5421,6 +5423,41 @@ struct ggml_tensor * ggml_l2_clip(
     result->op     = GGML_OP_L2_CLIP;
     result->src[0] = a;
     result->src[1] = scale;
+
+    return result;
+}
+
+// ggml_inkling_conv
+
+struct ggml_tensor * ggml_inkling_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * past,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * dyn,
+        float                 scale) {
+    const int64_t C = cur->ne[0];
+    const int64_t T = cur->ne[1];
+    const int64_t S = cur->ne[2];
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && past->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->ne[3] == 1 && cur->nb[0] == sizeof(float));
+    GGML_ASSERT(past->ne[0] == 3 && past->ne[1] == C && past->ne[2] == S && past->nb[0] == sizeof(float));
+    GGML_ASSERT(w->ne[0] == 4 && w->ne[1] == C && ggml_is_contiguous(w));
+    if (dyn) {
+        GGML_ASSERT(dyn->type == GGML_TYPE_F32 && dyn->nb[0] == sizeof(float));
+        GGML_ASSERT(dyn->ne[0] % 4 == 0 && C % (dyn->ne[0]/4) == 0 && dyn->ne[1] == T && dyn->ne[2] == S);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C*T*S + 3*C*S);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_INKLING_CONV;
+    result->src[0] = cur;
+    result->src[1] = past;
+    result->src[2] = w;
+    result->src[3] = dyn;
 
     return result;
 }

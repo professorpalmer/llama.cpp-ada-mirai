@@ -594,6 +594,7 @@ extern "C" {
         GGML_OP_ESCHA_MOE,
         GGML_OP_ESCHA_MUL_MAT,
         GGML_OP_L2_CLIP,
+        GGML_OP_INKLING_CONV,
 
         GGML_OP_UNARY,
 
@@ -2405,6 +2406,19 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * scale,
             float                 threshold);
+
+    // Inkling 2 short conv (4 taps) with its history, in one op:
+    //   x = [past, cur] along time; out[c, t] = (cur[c, t] + sum_j w[j, c]*x[t + j][c] + sum_l dyn[l, head(c), t]*x[t + 3 - l][c]) * scale
+    //   cur  : [C, T, S] F32 (contiguous rows)    past : [3, C, S] F32 (time contiguous)
+    //   w    : [4, C] F32                         dyn  : NULL or [4*H, T, S] F32, H heads over C channels
+    //   result: 1D F32 [C*T*S + 3*C*S]: out [C, T, S], then the new history [3, C, S] (the last 3 steps of x)
+    GGML_API struct ggml_tensor * ggml_inkling_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * dyn,
+            float                 scale);
 
     // Fill tensor a with constant c
     GGML_API struct ggml_tensor * ggml_fill(

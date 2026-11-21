@@ -2341,6 +2341,66 @@ void ggml_compute_forward_l2_clip(const ggml_compute_params * params, ggml_tenso
     }
 }
 
+// ggml_compute_forward_inkling_conv
+// the float steps of the chain concat, ssm_conv, (mul, add) x 4 taps, add, scale; the channels split over the threads
+
+void ggml_compute_forward_inkling_conv(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cur  = dst->src[0];
+    const ggml_tensor * past = dst->src[1];
+    const ggml_tensor * w    = dst->src[2];
+    const ggml_tensor * dyn  = dst->src[3];
+
+    const int64_t C = cur->ne[0];
+    const int64_t T = cur->ne[1];
+    const int64_t S = cur->ne[2];
+    const int64_t H = dyn ? dyn->ne[0]/4 : 0;
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    float * out  = (float *) dst->data;
+    float * hist = out + C*T*S;
+
+    const int64_t dc  = (C + params->nth - 1)/params->nth;
+    const int64_t ic0 = dc*params->ith;
+    const int64_t ic1 = MIN(ic0 + dc, C);
+
+    for (int64_t s = 0; s < S; ++s) {
+        for (int64_t c = ic0; c < ic1; ++c) {
+            const float * pc = (const float *) ((const char *) past->data + c*past->nb[1] + s*past->nb[2]);
+            const float * wc = (const float *) w->data + c*4;
+            const int64_t head = H > 0 ? c / (C/H) : 0;
+
+            float x[4] = { pc[0], pc[1], pc[2], 0.0f };
+            for (int64_t t = 0; t < T; ++t) {
+                const float xt = *(const float *) ((const char *) cur->data + t*cur->nb[1] + s*cur->nb[2] + c*sizeof(float));
+                x[3] = xt;
+
+                float sumf = 0.0f;
+                for (int j = 0; j < 4; ++j) {
+                    sumf += x[j]*wc[j];
+                }
+                if (dyn) {
+                    const float * dt = (const float *) ((const char *) dyn->data + t*dyn->nb[1] + s*dyn->nb[2]) + head*4;
+                    for (int l = 0; l < 4; ++l) {
+                        const float term = x[3 - l]*dt[l];
+                        sumf = sumf + term;
+                    }
+                }
+                const float y = xt + sumf;
+                out[(s*T + t)*C + c] = scale*y;
+
+                x[0] = x[1];
+                x[1] = x[2];
+                x[2] = x[3];
+            }
+            float * hc = hist + (s*C + c)*3;
+            hc[0] = x[0];
+            hc[1] = x[1];
+            hc[2] = x[2];
+        }
+    }
+}
+
 // ggml_compute_tri
 
 static void ggml_compute_forward_tri_f32(const ggml_compute_params * params, ggml_tensor * dst) {
