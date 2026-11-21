@@ -32,11 +32,12 @@ static bool inkling_fused(int bit) {
     return (inkling_fused_mask() & bit) != 0;
 }
 
-// banded op: band bias from its factors (prefill agent's item 5) for n_tokens > 32; LLAMA_INKLING_REL_FACTORS=0 = off
+// banded op: band bias from its factors (prefill agent's item 5) for n_tokens > 32. Default OFF (coordinator: on by
+// default only when its speed is at or above the dense path and G1 holds); LLAMA_INKLING_REL_FACTORS=1 = on
 static bool inkling_rel_factors(int64_t n_tokens) {
     static const bool on = [] {
         const char * e = getenv("LLAMA_INKLING_REL_FACTORS");
-        return e == nullptr || atoi(e) != 0;
+        return e != nullptr && atoi(e) != 0;
     }();
     return on && n_tokens > 32;
 }
@@ -711,7 +712,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 // prefill (n_tokens > 32): the op builds the band bias from its factors (attn_rel_bias table, Rcur) per
                 // query chunk, so the [extent, n_head, n_tokens] bias (96 MiB at ub 1024) never exists in the compute
                 // buffer (prefill agent's item 5). Decode keeps the dense bias (tiny there).
-                // LLAMA_INKLING_REL_FACTORS=0 restores the dense bias everywhere (A/B).
+                // Opt-in for now: LLAMA_INKLING_REL_FACTORS=1 (default = the dense bias everywhere).
                 if (inkling_rel_factors(n_tokens)) {
                     cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, nullptr, 1.0f/sqrtf(n_embd_head), layer.attn_rel_bias->ne[1]);
                     ggml_flash_attn_ext_banded_set_rel_factors(cur, layer.attn_rel_bias, ggml_is_contiguous(Rcur) ? Rcur : ggml_cont(ctx0, Rcur));
