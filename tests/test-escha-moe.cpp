@@ -330,6 +330,14 @@ int main(int argc, char ** argv) {
 #else
         setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
 #endif
+        // the prefill kernel also for the small batches (its default minimum is higher), unless the caller sets one
+        if (getenv("GGML_ESCHA_MOE_PREFILL_MIN") == nullptr) {
+#ifdef _WIN32
+            _putenv_s("GGML_ESCHA_MOE_PREFILL_MIN", "9");
+#else
+            setenv("GGML_ESCHA_MOE_PREFILL_MIN", "9", 1);
+#endif
+        }
     }
 
     ggml_context * ctx_data = nullptr;

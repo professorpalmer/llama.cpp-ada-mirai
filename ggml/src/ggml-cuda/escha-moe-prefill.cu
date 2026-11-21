@@ -52,13 +52,18 @@ static constexpr int ESCHA_PF_FOLD = 4;   // fp16 -> fp32 fold cadence of WNT 2
 static constexpr int ESCHA_PF_PF   = 4;   // prefetch ring depth (B in registers, A in shared memory)
 static constexpr int ESCHA_PF_AST  = 24;  // halves per A row in shared memory (16 used): ldmatrix without bank conflicts
 
-// GGML_ESCHA_MOE_PREFILL_RF=2|4: row fragments of 16 rows per block (default 4)
-static int escha_prefill_rf() {
-    static const int rf = [] {
+// Row fragments of 16 rows per block. RTX 4070, Inkling expert shapes (test-escha-moe --prefill-bench, 128 experts,
+// top-8): RF 2 is faster from about 128 to 383 tokens, RF 4 from 384 tokens (0.45x of the GEMV path at 1,024).
+// GGML_ESCHA_MOE_PREFILL_RF=2|4 fixes it.
+static int escha_prefill_rf(const int n_tokens) {
+    static const int rf_env = [] {
         const char * e = getenv("GGML_ESCHA_MOE_PREFILL_RF");
-        return e != nullptr && atoi(e) == 2 ? 2 : 4;
+        return e != nullptr ? atoi(e) : 0;
     }();
-    return rf;
+    if (rf_env == 2 || rf_env == 4) {
+        return rf_env;
+    }
+    return n_tokens >= 384 ? 4 : 2;
 }
 
 // GGML_ESCHA_MOE_PREFILL_SUMS=smem|dst: where the running row sums live (default dst)
@@ -457,7 +462,8 @@ bool ggml_cuda_escha_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int n_rows   = n_ids*n_tokens;
     const int n_x      = x->ne[1];
 
-    if (!escha_prefill_enabled() || n_tokens <= 8 || n_tokens < escha_prefill_min_tokens(9) ||
+    // below about 128 tokens the GEMV path (8-row chunks, 32 warps per block) is faster on the RTX 4070
+    if (!escha_prefill_enabled() || n_tokens <= 8 || n_tokens < escha_prefill_min_tokens(128) ||
             (K != 2 && K != 3) || IC%128 != 0 || OC%128 != 0) {
         return false;
     }
@@ -490,7 +496,7 @@ bool ggml_cuda_escha_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * 
         n_expert, n_tokens, n_ids, n_x, (int) (ids->nb[1]/ggml_element_size(ids)), 1, /*write_inverse =*/ false, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    const int  rf       = escha_prefill_rf();
+    const int  rf       = escha_prefill_rf(n_tokens);
     const int  rows     = 16*rf;
     const bool sums_dst = escha_prefill_sums_dst();
 
