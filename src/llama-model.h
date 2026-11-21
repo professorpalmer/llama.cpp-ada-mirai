@@ -734,6 +734,7 @@ struct llama_model {
     struct ggml_tensor * dspark_joint_proj_b  = nullptr;
     struct ggml_tensor * dspark_hidden_out    = nullptr;
     struct ggml_tensor * dspark_hidden_out_b  = nullptr;
+    struct ggml_tensor * dspark_draft_head    = nullptr; // optional small copy of the target head (draft logits only)
 
     // dspark GIDD log-SNR conditioning (only when hparams.dspark_log_snr_conditioning)
     struct ggml_tensor * dspark_mode_embedding = nullptr;  // selected request mode, added only to draft input

@@ -168,6 +168,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"),   { 3*rank }, 0);
         dspark_hidden_out   = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "weight"), { rank, n_embd }, 0);
         dspark_hidden_out_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "bias"),   { n_embd }, 0);
+        if (const auto * h = ml->get_tensor_meta("dspark_head.weight")) {
+            dspark_draft_head = create_tensor(tn(LLM_TENSOR_DSPARK_DRAFT_HEAD, "weight"), { n_embd, h->ne[1] }, 0);
+            LLAMA_LOG_INFO("%s: Inkling2 DSpark: draft head copy %s [%lld x %lld]\n", __func__, ggml_type_name(h->type),
+                    (long long) h->ne[0], (long long) h->ne[1]);
+        }
         for (int i = 0; i < n_layer; ++i) {
             auto & l = layers[i];
             const int64_t hd = hparams.n_embd_head_k(i);
@@ -529,7 +534,7 @@ static void inkling2_f32_acc(ggml_tensor * t) {
 
 // Inkling 2 DSpark head for one block row: the recurrent state update and the logit correction through the target's head
 // (Unsloth's build_inkling2_head, upstream #32218)
-static ggml_tensor * inkling2_head_row(llm_graph_context & g, const llama_model & model, const llama_model & target,
+static ggml_tensor * inkling2_head_row(llm_graph_context & g, const llama_model & model, ggml_tensor * head, ggml_tensor * head_s,
         ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context) {
     auto * ctx0 = g.ctx0;
     const int64_t rank = model.hparams.dspark_markov_rank;
@@ -544,7 +549,7 @@ static ggml_tensor * inkling2_head_row(llm_graph_context & g, const llama_model 
     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
     auto * latent     = ggml_tanh(ctx0, chunk(2));
     auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    auto * bias = g.build_lora_mm(target.output, correction, target.output_s);
+    auto * bias = g.build_lora_mm(head, correction, head_s);
     inkling2_f32_acc(bias);
     if (bias->ne[0] != base->ne[0]) {
         bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));
@@ -664,29 +669,43 @@ void llama_model_dflash::graph<false>::build_inkling2(const llama_model & model,
         return;
     }
 
-    auto * base = build_lora_mm(target->output, cur, target->output_s);
+    // the draft logits go through the drafter's own small copy of the target head when the file has one (dspark_head:
+    // a draft is a guess the target verifies with its own head), else through the target's head
+    ggml_tensor * head   = model.dspark_draft_head ? model.dspark_draft_head : target->output;
+    ggml_tensor * head_s = model.dspark_draft_head ? nullptr : target->output_s;
+
+    // rows with an output: the first n_keep rows of every block (the caller reads rows 1..n_keep - 1, the draft size):
+    // the chain stops there, and only those rows go through the head
+    int64_t n_keep = block;
+    if (n_outputs > 0 && n_outputs < n_tokens && n_outputs % nb == 0) {
+        n_keep = std::max<int64_t>(1, n_outputs/nb);
+    }
+    auto * cur3 = ggml_reshape_3d(ctx0, cur, n_embd, block, nb);
+    auto * kept = n_keep == block ? cur :
+        ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, cur3, n_embd, n_keep, nb, cur3->nb[1], cur3->nb[2], 0)), n_embd, n_keep*nb);
+    auto * base = build_lora_mm(head, kept, head_s);
     inkling2_f32_acc(base);
 
     // the chain: row i reads the first maximum of row i - 1 (row 1: the anchor), the head's state and its context
     auto * state  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
-    auto * logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, base->ne[0], nb, block*base->nb[1], 0));
-    const auto column = [&](ggml_tensor * t, int64_t i) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
+    auto * logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, base->ne[0], nb, n_keep*base->nb[1], 0));
+    const auto column = [&](ggml_tensor * t, int64_t stride, int64_t i) {
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, stride*t->nb[1], i*t->nb[1]));
     };
     auto * context = ggml_cont(ctx0, ggml_view_2d(ctx0, contexts, n_embd, nb, block*contexts->nb[1], (size_t) n_layer*n_embd*contexts->nb[0]));
     auto * prev = ids;
-    for (int64_t i = 1; i < block; ++i) {
-        auto * col = inkling2_head_row(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
+    for (int64_t i = 1; i < n_keep; ++i) {
+        auto * col = inkling2_head_row(*this, model, head, head_s, prev, state, column(cur, block, i), column(base, n_keep, i), context);
         logits = ggml_concat(ctx0, logits, col, 1);
         // the first maximum: our CUDA argmax breaks ties to the lower column, as the CPU does (Unsloth's mix builds it
         // from a max pool over the 200k columns, which runs one thread per row on CUDA)
         prev = ggml_argmax(ctx0, col->ne[0] == (int64_t) hparams.n_vocab_unpadded ? col :
                 ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0)));
     }
-    // block-major order back: [vocab, nb, block] -> [vocab, block, nb]
-    logits = ggml_reshape_3d(ctx0, logits, logits->ne[0], nb, block);
-    logits = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3)), logits->ne[0], n_tokens);
-    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_tokens, logits->nb[1], 0));
+    // block-major order back: [vocab, nb, n_keep] -> [vocab, n_keep, nb]
+    logits = ggml_reshape_3d(ctx0, logits, logits->ne[0], nb, n_keep);
+    logits = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3)), logits->ne[0], n_keep*nb);
+    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_keep*nb, logits->nb[1], 0));
     ggml_build_forward_expand(gf, res->t_logits);
 }
 

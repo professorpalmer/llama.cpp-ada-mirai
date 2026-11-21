@@ -756,6 +756,7 @@ enum llm_tensor {
     LLM_TENSOR_DSPARK_HIDDEN_OUT,        // recurrent head latent -> hidden correction
     LLM_TENSOR_DSPARK_MASK_EMBD,         // embedding of the masked block rows
     LLM_TENSOR_DSPARK_JOINT_PROJ,        // recurrent head: [state, prev, hidden, context] -> [gate, candidate, latent]
+    LLM_TENSOR_DSPARK_DRAFT_HEAD,        // optional: a small copy of the target head for the draft logits only
     LLM_TENSOR_DFLARE_NORM,              // per draft layer: RMSNorm of its tap mix
     LLM_TENSOR_ATTN_K_CTX,               // per draft layer: context K from the tap mix
     LLM_TENSOR_ATTN_V_CTX,               // per draft layer: context V from the tap mix

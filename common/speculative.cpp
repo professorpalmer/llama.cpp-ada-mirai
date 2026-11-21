@@ -2015,6 +2015,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = params.ctx_dft;
 
         batch_block.n_tokens = 0;
+        // rows 0..n_read - 1 of a block have an output: the graph chains the head that far only (draft size + the anchor)
+        const int32_t n_read = std::min(block_size, params.n_max + 1);
         std::vector<int32_t> i_block_beg(n_seq, -1);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2035,7 +2037,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 batch_block.pos[k]       = dp.n_past + i;
                 batch_block.n_seq_id[k]  = 1;
                 batch_block.seq_id[k][0] = seq_id;
-                batch_block.logits[k]    = true;
+                batch_block.logits[k]    = i < n_read;
                 std::memcpy(batch_block.embd + (size_t) k * n_embd_dec, context_embd.data() + slot * n_embd_dec,
                         (size_t) n_embd_dec * sizeof(float));
             }
@@ -2052,7 +2054,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-        const int32_t n_read  = std::min(block_size, params.n_max + 1);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
