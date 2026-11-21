@@ -61,6 +61,15 @@ static int escha_prefill_rf() {
     return rf;
 }
 
+// GGML_ESCHA_MOE_PREFILL_SUMS=smem|dst: where the running row sums live (default dst)
+static bool escha_prefill_sums_dst() {
+    static const bool d = [] {
+        const char * e = getenv("GGML_ESCHA_MOE_PREFILL_SUMS");
+        return e == nullptr || strcmp(e, "smem") != 0;
+    }();
+    return d;
+}
+
 // xh[row] = f16(T128(x[row] * rin[expert of row])), row = token*n_ids + slot: escha_gemv_had_in_routed of escha-gemv.cu
 static __global__ void escha_prefill_had_in_routed(
         const float   * __restrict__ x,
@@ -124,8 +133,9 @@ static __device__ __forceinline__ void escha_pf_cp_async_wait() {
 }
 
 // grid: [items][size_n/128] in one dimension, 128 threads = 4 warps = 4 column groups of 32 columns
-template <int bits, int RF>
-static __global__ void __launch_bounds__(128, RF == 4 ? 2 : 4) escha_moe_prefill_kernel(
+// SUMS_DST: the running row sums live in the output rows (no 128-column sum buffer in shared memory: more blocks per SM)
+template <int bits, int RF, bool SUMS_DST>
+static __global__ void __launch_bounds__(128, SUMS_DST ? (RF == 4 ? 3 : 4) : (RF == 4 ? 2 : 4)) escha_moe_prefill_kernel(
         const half     * __restrict__ xh,
         const uint16_t * __restrict__ B_all,
         const half     * __restrict__ rout_all,
@@ -208,7 +218,7 @@ static __global__ void __launch_bounds__(128, RF == 4 ? 2 : 4) escha_moe_prefill
     }
 
     // the running row sums over the splits, in split order (the GEMV's sum = 0 + sh_red[0] + ... + sh_red[S-1])
-    __shared__ __align__(16) float sh_sum[ROWS][128];
+    __shared__ __align__(16) float sh_sum[SUMS_DST ? 1 : ROWS][128];
     // the A ring: PF k-slices of ROWS rows x 16 k
     __shared__ __align__(16) half  sh_a[PF][ROWS][AST];
 
@@ -219,6 +229,12 @@ static __global__ void __launch_bounds__(128, RF == 4 ? 2 : 4) escha_moe_prefill
 
     const int group = bx*G + warp;
     const int c0    = warp*WNT*16 + 2*(lane & 3);   // first column of this lane in the block's 128
+
+    // the 128 output columns of the block in compact row r of the item
+    auto out_row = [&](const int r) -> float * {
+        const int orow = ids_dst[r_s + r];
+        return (float *)((char *) dst + (int64_t)(orow%ne1)*nb_d1 + (int64_t)(orow/ne1)*nb_d2) + bx*128;
+    };
 
     for (int ksp = 0; ksp < S; ++ksp) {
         const int ks0 = ksp*chunk;
@@ -361,17 +377,29 @@ static __global__ void __launch_bounds__(128, RF == 4 ? 2 : 4) escha_moe_prefill
         for (int rf = 0; rf < RF; ++rf) {
             if (rf < n_rf) {
 #pragma unroll
-                for (int t = 0; t < WNT; ++t) {
+                for (int h = 0; h < 2; ++h) {
+                    const int r = rf*16 + g + 8*h;
+                    float * srow;
+                    if constexpr (SUMS_DST) {
+                        // rows of other items are not ours to write
+                        if (r >= size_m) {
+                            continue;
+                        }
+                        srow = out_row(r);
+                    } else {
+                        srow = sh_sum[r];
+                    }
 #pragma unroll
-                    for (int f = 0; f < 2; ++f) {
-                        const int col = c0 + t*16 + f*8;
-                        float * s0 = &sh_sum[rf*16 + g    ][col];
-                        float * s1 = &sh_sum[rf*16 + g + 8][col];
-                        const float4 p = acc[rf][t][f];
-                        s0[0] = (ksp == 0 ? 0.0f : s0[0]) + p.x;
-                        s0[1] = (ksp == 0 ? 0.0f : s0[1]) + p.y;
-                        s1[0] = (ksp == 0 ? 0.0f : s1[0]) + p.z;
-                        s1[1] = (ksp == 0 ? 0.0f : s1[1]) + p.w;
+                    for (int t = 0; t < WNT; ++t) {
+#pragma unroll
+                        for (int f = 0; f < 2; ++f) {
+                            float2 * s = (float2 *) (srow + c0 + t*16 + f*8);
+                            const float4 p = acc[rf][t][f];
+                            float2 v = ksp == 0 ? make_float2(0.0f, 0.0f) : *s;
+                            v.x += h == 0 ? p.x : p.z;
+                            v.y += h == 0 ? p.y : p.w;
+                            *s = v;
+                        }
                     }
                 }
             }
@@ -379,11 +407,14 @@ static __global__ void __launch_bounds__(128, RF == 4 ? 2 : 4) escha_moe_prefill
     }
     __syncthreads();
 
-    // T128 and rout of each row, one warp per row (as the GEMV's epilogue)
+    // T128 and rout of each row, one warp per row (as the GEMV's epilogue; in place when the sums are in dst)
     for (int r = warp; r < size_m; r += G) {
-        const int orow = ids_dst[r_s + r];
-        float * dst_row = (float *)((char *) dst + (int64_t)(orow%ne1)*nb_d1 + (int64_t)(orow/ne1)*nb_d2);
-        had_ff_r_128_inner<false, true>(sh_sum[r], dst_row + bx*128, rout + bx*128, ESCHA_PREFILL_RS);
+        float * o = out_row(r);
+        if constexpr (SUMS_DST) {
+            had_ff_r_128_inner<false, true>(o, o, rout + bx*128, ESCHA_PREFILL_RS);
+        } else {
+            had_ff_r_128_inner<false, true>(sh_sum[r], o, rout + bx*128, ESCHA_PREFILL_RS);
+        }
     }
 #else
     GGML_UNUSED_VARS(xh, B_all, rout_all, dst, size_k, size_n, ne1, nb_d1, nb_d2, ids_dst, work, n_work);
@@ -459,8 +490,9 @@ bool ggml_cuda_escha_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * 
         n_expert, n_tokens, n_ids, n_x, (int) (ids->nb[1]/ggml_element_size(ids)), 1, /*write_inverse =*/ false, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    const int rf   = escha_prefill_rf();
-    const int rows = 16*rf;
+    const int  rf       = escha_prefill_rf();
+    const int  rows     = 16*rf;
+    const bool sums_dst = escha_prefill_sums_dst();
 
     // an expert can end with a part chunk, so the item count has a bound only
     const int n_items = (n_rows + rows - 1)/rows + n_expert;
@@ -475,11 +507,18 @@ bool ggml_cuda_escha_moe_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * 
             xh.get(), (const uint16_t *) code->data, (const half *) rout->data, (float *) dst->data,
             IC, OC, n_ids, dst->nb[1], dst->nb[2], ids_dst.get(), work.get(), n_work.get());
     };
-    if (K == 2) {
-        if (rf == 4) { launch(escha_moe_prefill_kernel<2, 4>); } else { launch(escha_moe_prefill_kernel<2, 2>); }
-    } else {
-        if (rf == 4) { launch(escha_moe_prefill_kernel<3, 4>); } else { launch(escha_moe_prefill_kernel<3, 2>); }
+#define ESCHA_PF_LAUNCH(bits) \
+    if (sums_dst) { \
+        if (rf == 4) { launch(escha_moe_prefill_kernel<bits, 4, true>);  } else { launch(escha_moe_prefill_kernel<bits, 2, true>);  } \
+    } else { \
+        if (rf == 4) { launch(escha_moe_prefill_kernel<bits, 4, false>); } else { launch(escha_moe_prefill_kernel<bits, 2, false>); } \
     }
+    if (K == 2) {
+        ESCHA_PF_LAUNCH(2)
+    } else {
+        ESCHA_PF_LAUNCH(3)
+    }
+#undef ESCHA_PF_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
