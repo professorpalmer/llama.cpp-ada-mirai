@@ -13,11 +13,12 @@
 // tensor-core kernel of fattn-banded.cu, which uses this same function for its lower bound. Quantized K/V:
 // GGML_CUDA_BANDED_DEC_MAX_Q_DEFAULT, GGML_CUDA_BANDED_DEC_MAX_Q=n overrides (1-32). The tensor-core kernel costs about
 // the same from 1 to 32 rows (one 32-row block per Q head) and is faster from about 5 rows (RTX 4070, q4_0, 32k cells:
-// decode kernel 288 / 563 / 1,121 us at 2 / 4 / 8 rows, tensor-core 540 us at 8), so the default becomes 4 once the
-// tensor-core kernel takes quantized K/V from 5 rows. f16: 32 (the tensor-core kernel needs 16 rows). Batch-invariant
+// decode kernel 288 / 563 / 1,121 us at 2 / 4 / 8 rows, tensor-core 539-563 us at 1-8; 4k cells: 37 / 65 / 125 us
+// against 96 / 96 / 95 us), so the default is 4: the tensor-core kernel takes quantized K/V from 5 rows. f16: 32 (the
+// tensor-core kernel needs 16 rows). Batch-invariant
 // mode: 32 for every type, so that a query gives the same bits alone and inside a verify batch (one kernel for both).
 #ifndef GGML_CUDA_BANDED_DEC_MAX_Q_DEFAULT
-#define GGML_CUDA_BANDED_DEC_MAX_Q_DEFAULT GGML_CUDA_BANDED_DEC_MAX_Q
+#define GGML_CUDA_BANDED_DEC_MAX_Q_DEFAULT 4
 #endif
 static inline int64_t ggml_cuda_banded_dec_max_q(const ggml_type type_kv) {
     static const int64_t max_q_quant = [] {

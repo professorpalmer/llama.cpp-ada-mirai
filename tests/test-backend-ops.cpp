@@ -11218,8 +11218,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
-    // small batches (drafter verify) on the implicit causal window: the decode kernel against the tensor-core kernel
-    // (GGML_CUDA_BANDED_MMA_MIN_Q), and the sliding-window layers with token positions (ring caches)
+    // small batches (drafter verify) on the implicit causal window: the decode kernel up to ggml_cuda_banded_dec_max_q,
+    // the tensor-core kernel above (GGML_CUDA_BANDED_DEC_MAX_Q), and the sliding-window layers with token positions
     for (int64_t n_q : { 1, 2, 3, 4, 8, 16, 32, }) {
         for (ggml_type kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
             for (int64_t n_kv : { 4096, 32768, }) {
