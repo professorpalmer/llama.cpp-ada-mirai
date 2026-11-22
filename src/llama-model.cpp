@@ -3825,6 +3825,10 @@ bool llama_model_has_dspark_markov_head(const struct llama_model * model) {
     return model->dspark_markov_w1 != nullptr;
 }
 
+bool llama_model_is_inkling2_dspark(const struct llama_model * model) {
+    return model->dspark_hidden_out != nullptr;
+}
+
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
     if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
         return 0;

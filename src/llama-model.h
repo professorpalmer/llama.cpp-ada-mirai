@@ -256,6 +256,12 @@ struct llama_layer {
     struct ggml_tensor * attn_q_norm_b   = nullptr;
     struct ggml_tensor * attn_k_norm     = nullptr;
     struct ggml_tensor * attn_k_norm_b   = nullptr;
+
+    // Inkling 2 DSpark drafter: the context K/V of a draft layer from its own tap mix
+    struct ggml_tensor * dflare_norm     = nullptr;
+    struct ggml_tensor * attn_k_ctx      = nullptr;
+    struct ggml_tensor * attn_v_ctx      = nullptr;
+    struct ggml_tensor * attn_k_ctx_norm = nullptr;
     struct ggml_tensor * attn_out_norm   = nullptr;
     struct ggml_tensor * attn_out_norm_b = nullptr;
     struct ggml_tensor * attn_q_a_norm   = nullptr;
@@ -719,6 +725,16 @@ struct llama_model {
     struct ggml_tensor * dspark_markov_w2   = nullptr;
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
+
+    // Inkling 2 DSpark drafter (upstream #32218): tap mix, recurrent head, mask row embedding
+    struct ggml_tensor * dspark_fuse          = nullptr;
+    struct ggml_tensor * dspark_norm          = nullptr;
+    struct ggml_tensor * dspark_mask_embd     = nullptr;
+    struct ggml_tensor * dspark_joint_proj    = nullptr;
+    struct ggml_tensor * dspark_joint_proj_b  = nullptr;
+    struct ggml_tensor * dspark_hidden_out    = nullptr;
+    struct ggml_tensor * dspark_hidden_out_b  = nullptr;
+    struct ggml_tensor * dspark_draft_head    = nullptr; // optional small copy of the target head (draft logits only)
 
     // dspark GIDD log-SNR conditioning (only when hparams.dspark_log_snr_conditioning)
     struct ggml_tensor * dspark_mode_embedding = nullptr;  // selected request mode, added only to draft input

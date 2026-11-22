@@ -349,9 +349,15 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         ggml_tensor * cur3 = ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs);
         ggml_tensor * dyn3 = dynamic ? ggml_reshape_3d(ctx0, dynamic, dynamic->ne[0], n_seq_tokens, n_seqs) : nullptr;
         ggml_tensor * r = ggml_inkling_conv(ctx0, cur3, past, weight, dyn3, 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
-        ggml_tensor * hist = ggml_view_3d(ctx0, r, n_conv - 1, n_channels, n_seqs,
-                (n_conv - 1)*sizeof(float), (n_conv - 1)*n_channels*sizeof(float), n_channels*n_tokens*sizeof(float));
-        build_conv_state_store(inp, state, hist, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+        if (cparams.n_rs_seq > 0) {
+            // rollback snapshots need the inputs token by token: [past | cur] in time order (drafter verify batches are short)
+            ggml_tensor * x = ggml_concat(ctx0, past, ggml_transpose(ctx0, cur3), 0);
+            build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+        } else {
+            ggml_tensor * hist = ggml_view_3d(ctx0, r, n_conv - 1, n_channels, n_seqs,
+                    (n_conv - 1)*sizeof(float), (n_conv - 1)*n_channels*sizeof(float), n_channels*n_tokens*sizeof(float));
+            build_conv_state_store(inp, state, hist, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+        }
         return ggml_view_2d(ctx0, r, n_channels, n_tokens, n_channels*sizeof(float), 0);
     }
 

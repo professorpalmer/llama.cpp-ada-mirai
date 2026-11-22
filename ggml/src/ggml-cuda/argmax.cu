@@ -24,7 +24,8 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
         const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
         const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-        if (val > maxval) {
+        // ties go to the lower column (the first maximum, as on the CPU), whatever the lane order
+        if (val > maxval || (val == maxval && (unsigned) col < (unsigned) argmax)) {
             maxval = val;
             argmax = col;
         }
@@ -53,7 +54,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
                 const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
                 const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
-                if (val > maxval) {
+                if (val > maxval || (val == maxval && (unsigned) col < (unsigned) argmax)) {
                     maxval = val;
                     argmax = col;
                 }

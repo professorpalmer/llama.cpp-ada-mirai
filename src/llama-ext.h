@@ -131,6 +131,10 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // general.architecture = dflash, so this is how to tell them apart.
 LLAMA_API bool            llama_model_has_dspark_markov_head(const struct llama_model * model);
 
+// returns true if the draft model is an Inkling 2 DSpark drafter (tap mix per draft layer, recurrent head through
+// the target's output; upstream #32218). It also carries a Markov head, so check this first.
+LLAMA_API bool            llama_model_is_inkling2_dspark(const struct llama_model * model);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out
