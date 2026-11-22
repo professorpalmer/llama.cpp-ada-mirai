@@ -6,6 +6,7 @@
 
 static const int    RG_RULE1_TURNS   = 6;
 static const int    RG_RULE2_CALLS   = 8;
+static const size_t RG_RULE2_TURNS   = 4;      // the rule-2 run spans at least this many assistant turns
 static const size_t RG_SHORT_RESULT  = 200;
 static const double RG_SIMILAR       = 0.8;
 static const size_t RG_MAX_ARGS_CMP  = 2000;   // bound the edit-distance cost
@@ -135,9 +136,11 @@ common_repeat_guard_result common_repeat_guard_check(const std::vector<common_ch
         return res;
     }
     std::vector<const rg_call *> calls;
-    for (const auto & t : turns) {
-        for (const auto & c : t) {
+    std::vector<size_t>          call_turn;   // the turn of each call
+    for (size_t k = 0; k < turns.size(); ++k) {
+        for (const auto & c : turns[k]) {
             calls.push_back(&c);
+            call_turn.push_back(k);
         }
     }
     if (calls.empty()) {
@@ -148,6 +151,8 @@ common_repeat_guard_result common_repeat_guard_check(const std::vector<common_ch
     for (auto it = calls.rbegin(); it != calls.rend() && (*it)->name == tool; ++it) {
         ++run;
     }
+    // assistant turns the run spans (parallel calls of one turn are one step, not a loop)
+    const size_t run_turns = call_turn.back() - call_turn[calls.size() - run] + 1;
     const auto short_result = [](const rg_call * c) { return c->has_result && c->result_len <= RG_SHORT_RESULT; };
 
     // rule 1: the last 6 turns, one call each, same tool, near-identical arguments, short results
@@ -172,7 +177,7 @@ common_repeat_guard_result common_repeat_guard_check(const std::vector<common_ch
         }
     }
     // rule 2: >= 8 trailing calls to one tool that does not change files, all with short results
-    if (!res.fire && use_rule2 && run >= RG_RULE2_CALLS && !rg_changes_files(tool)) {
+    if (!res.fire && use_rule2 && run >= RG_RULE2_CALLS && run_turns >= RG_RULE2_TURNS && !rg_changes_files(tool)) {
         bool ok = true;
         for (size_t k = calls.size() - run; k < calls.size(); ++k) {
             if (!short_result(calls[k])) {

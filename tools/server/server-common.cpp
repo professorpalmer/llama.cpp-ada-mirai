@@ -1130,7 +1130,8 @@ static void handle_media(
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    const char * endpoint)
 {
     json llama_params;
 
@@ -1269,11 +1270,15 @@ json oaicompat_chat_params_parse(
         const common_repeat_guard_result rg = common_repeat_guard_check(inputs.messages);
         if (rg.fire) {
             common_chat_msg note;
-            note.role    = "system";
+            // a template without a system role (a model with the guard forced on) gets the note as a user message, so
+            // the guard can never make a request fail; Inkling's template takes a system message at any position
+            const auto it = caps.find("supports_system_role");
+            note.role    = (it != caps.end() && !it->second) ? "user" : "system";
             note.content = common_repeat_guard_note(rg);
             inputs.messages.push_back(note);
-            SRV_WRN("repetition guard: %d calls to '%s' in a row (rule %d, %zu messages): one note added as the newest message of this request\n",
-                    rg.count, rg.tool.c_str(), rg.rule, inputs.messages.size() - 1);
+            // the endpoint is named: count-tokens and apply-template run this parse too, but generate nothing
+            SRV_WRN("repetition guard (%s): %d calls to '%s' in a row (rule %d, %zu messages): one note added as the newest message of this request\n",
+                    endpoint, rg.count, rg.tool.c_str(), rg.rule, inputs.messages.size() - 1);
         }
     }
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);

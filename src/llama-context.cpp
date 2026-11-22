@@ -3935,11 +3935,17 @@ llama_context * llama_init_from_model(
 
     // Inkling 2 in this build always runs with flash attention: its attention (the banded op and the dense per-head-mask
     // path) is built on ggml_flash_attn_ext, which the non-FA cache layout (transposed V) does not match. -fa off / auto
-    // become on (G6 fix gate, 11-22). A WARN line, so the change of a user's setting shows at the default verbosity
-    // (libllama INFO is mapped to TRACE by the common log callback).
+    // become on (G6 fix gate, 11-22). -fa off is a user's explicit setting that is overridden: a WARN line, so it shows
+    // at the default verbosity (libllama INFO is mapped to TRACE by the common log callback). -fa auto (the default)
+    // would choose flash attention anyway: INFO only, no warning noise on every plain start.
     if (model->arch == LLM_ARCH_INKLING2 && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-        LLAMA_LOG_WARN("%s: Inkling 2 Mini in this build needs flash attention: flash_attn %s -> on\n", __func__,
-                       llama_flash_attn_type_name(params.flash_attn_type));
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_WARN("%s: Inkling 2 Mini in this build needs flash attention: flash_attn %s -> on\n", __func__,
+                           llama_flash_attn_type_name(params.flash_attn_type));
+        } else {
+            LLAMA_LOG_INFO("%s: Inkling 2 Mini in this build needs flash attention: flash_attn %s -> on\n", __func__,
+                           llama_flash_attn_type_name(params.flash_attn_type));
+        }
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 

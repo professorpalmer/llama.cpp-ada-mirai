@@ -20,8 +20,9 @@ struct common_repeat_guard_result {
 // without tool calls.
 //   rule 1: the last 6 assistant turns each made exactly one call to the same tool, each call's arguments are within a
 //           small edit of the previous one (digits ignored, similarity >= 0.8), and every result is <= 200 characters
-//   rule 2: the last >= 8 calls (over any number of turns) all went to the same tool, every result is <= 200 characters,
-//           and that tool does not change files (names with edit / write / patch / replace / create / insert / apply)
+//   rule 2: the last >= 8 calls all went to the same tool over >= 4 assistant turns (parallel calls of one turn are one
+//           step), every result is <= 200 characters, and that tool does not change files (names with edit / write /
+//           patch / replace / create / insert / apply)
 common_repeat_guard_result common_repeat_guard_check(const std::vector<common_chat_msg> & msgs, bool use_rule2 = true);
 
 // The note the server appends as the newest message (never into the system prompt).

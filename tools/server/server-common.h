@@ -320,10 +320,12 @@ struct server_chat_params {
 json oaicompat_completion_params_parse(const json & body);
 
 // used by /chat/completions endpoint
+// endpoint: a name for log lines ("chat", "messages", "responses", "count-tokens", "apply-template", ...)
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<raw_buffer> & out_files,
+    const char * endpoint = "chat");
 
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(

@@ -146,6 +146,32 @@ int main() {
         }
         expect("parallel read + glob per turn, short results", m, false);
     }
+    {
+        // one turn with 8 parallel reads of small files (OpenCode / Claude Code do this): one step, not a loop
+        auto m = base();
+        common_chat_msg c; c.role = "assistant";
+        for (int i = 0; i < 8; ++i) {
+            c.tool_calls.push_back({ "read", "{\"filePath\":\"src/m" + std::to_string(i) + ".py\"}", "q" + std::to_string(i) });
+        }
+        m.push_back(c);
+        for (int i = 0; i < 8; ++i) {
+            m.push_back(result("x = 1", "q" + std::to_string(i)));
+        }
+        expect("one turn with 8 parallel read calls, short results", m, false);
+        // the same 8 reads over 2 turns of 4: still under 4 turns
+        auto m2 = base();
+        for (int t = 0; t < 2; ++t) {
+            common_chat_msg c2; c2.role = "assistant";
+            for (int i = 0; i < 4; ++i) {
+                c2.tool_calls.push_back({ "read", "{\"filePath\":\"src/n" + std::to_string(t * 4 + i) + ".py\"}", "s" + std::to_string(t * 4 + i) });
+            }
+            m2.push_back(c2);
+            for (int i = 0; i < 4; ++i) {
+                m2.push_back(result("y = 2", "s" + std::to_string(t * 4 + i)));
+            }
+        }
+        expect("8 parallel reads over 2 turns, short results", m2, false);
+    }
     printf("repeat-guard tests: %s (%d failed)\n", n_fail == 0 ? "PASS" : "FAIL", n_fail);
     return n_fail == 0 ? 0 : 1;
 }

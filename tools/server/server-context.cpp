@@ -5241,7 +5241,8 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            "responses");
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5273,7 +5274,8 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            "transcriptions");
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5291,7 +5293,8 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            "messages");
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5312,7 +5315,8 @@ void server_routes::init_routes() {
         json data = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            "apply-template");
         res->ok({{ "prompt", std::move(data.at("prompt")) }});
         return res;
     };
@@ -5764,7 +5768,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
     json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            "count-tokens");
     json prompt = body_parsed.at("prompt");
     // SRV_DBG("prompt = %s\n", prompt.dump().c_str());
 
