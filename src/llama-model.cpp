@@ -1540,7 +1540,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     // looped layers: the GGUF has one block per layer visit, the visits of a core layer share its weights
-    // (upstream llama.cpp #32694; Unsloth's llama.cpp mix b12588-mix-c0c3de8)
+    // (Unsloth's loop layout, llama.cpp mix b12588-mix-c0c3de8; not upstream #32694)
     ml.get_key(LLM_KV_LOOP_CORE_END, hparams.loop_core_end, false);
     if (hparams.loop_core_end > 0) {
         ml.get_key(LLM_KV_LOOP_CORE_START, hparams.loop_core_start);
@@ -1864,7 +1864,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
-        // looped layers: every visit shares the weights of its physical layer (upstream #32694; Unsloth mix)
+        // looped layers: every visit shares the weights of its physical layer (Unsloth's loop layout)
         for (int il = n_layer_all - 1; il >= 0; --il) {
             const int ip = (int) hparams.loop_layer(il);
             if (ip != il) {
@@ -2375,7 +2375,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // tn.bid numbers the layers that hold weights, which go with their first visit; blocks past them go with the
-    // output (looped layers: upstream #32694; Unsloth's llama.cpp mix b12588-mix-c0c3de8)
+    // output (looped layers: Unsloth's loop layout, llama.cpp mix b12588-mix-c0c3de8)
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {
         buft_list_layer = (uint32_t) tn.bid < hparams.n_layer_weights() ?

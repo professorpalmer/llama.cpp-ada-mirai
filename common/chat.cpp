@@ -3544,7 +3544,8 @@ static common_chat_params common_chat_params_init_inkling(const common_chat_temp
     }
 
     const bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
-    const bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+    // as upstream #32381 (Aldehir Rojas): a json_object response_format with no schema ({}) also gets the JSON grammar
+    const bool has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
     const bool use_tools           = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
     const bool extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 

@@ -1,7 +1,7 @@
 // Inkling 2 (Thinking Machines Inkling 2 Mini): the graph, hparams and tensors.
 // Ported from Unsloth's llama.cpp mix b12588-mix-c0c3de8 (MIT, the ggml authors and Unsloth;
-// https://github.com/unslothai/llama.cpp), which carries upstream llama.cpp #32217 (Inkling 2) and #32694 (the Inkling 2
-// Mini loop layout). Changes for this tree: scalar n_ff_exp / n_expert_used (no per-layer arrays), no
+// https://github.com/unslothai/llama.cpp), which carries upstream llama.cpp #32217 (Inkling 2) and Unsloth's own Inkling 2 Mini
+// loop layout (GGUF keys num_loops / loop.core_*; upstream #32694 uses another format, arch inkling2_loop, not ported). Changes for this tree: scalar n_ff_exp / n_expert_used (no per-layer arrays), no
 // expert_router_f32 / expert_weights_norm_eps flags (the router weights are F32 in the GGUF), one K/V rotation tensor
 // per cache (not per layer), our dense-mask names, precision through ggml_flash_attn_ext_set_prec /
 // ggml_mul_mat_set_prec, and the dense relative-bias path through ggml_flash_attn_ext directly (dense_attn) instead of a

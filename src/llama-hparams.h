@@ -198,7 +198,7 @@ struct llama_hparams {
     uint32_t n_sconv_channels  = 0;
 
     // looped layers: [loop_core_start, loop_core_end) run loop_n_pass times, each visit is its own layer index
-    // (upstream llama.cpp #32694; Unsloth mix b12588-mix-c0c3de8)
+    // (Unsloth's loop layout, mix b12588-mix-c0c3de8; not upstream #32694)
     uint32_t loop_core_start = 0;
     uint32_t loop_core_end   = 0;
     uint32_t loop_n_pass     = 0; // < 2: no loop

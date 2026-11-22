@@ -307,7 +307,7 @@ uint32_t llama_hparams::n_layer() const {
     return n_layer_all - n_layer_nextn;
 }
 
-// looped layers (upstream llama.cpp #32694; Unsloth mix b12588-mix-c0c3de8, MIT)
+// looped layers (Unsloth's loop layout, mix b12588-mix-c0c3de8, MIT; not upstream #32694)
 uint32_t llama_hparams::loop_n_extra() const {
     return loop_n_pass > 1 ? (loop_n_pass - 1)*(loop_core_end - loop_core_start) : 0;
 }
