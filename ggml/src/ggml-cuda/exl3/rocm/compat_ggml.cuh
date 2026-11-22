@@ -56,3 +56,18 @@ __device__ __forceinline__ T __ldcs(const T* p)
     return __builtin_nontemporal_load(p);
 }
 
+
+// v_dot2_f32_f16 (d = a.x b.x + a.y b.y + c), the inner product of the native RDNA GEMV kernels (rocm/quant/); the
+// FMA form where the instruction is missing. From the same compat.h.
+
+template <typename T>
+__device__ __forceinline__ float exl3_fdot2(T a, T b, float c)
+{
+#if !defined(EXL3_FORCE_SCALAR_DOT)
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2))
+        return __builtin_amdgcn_fdot2(a, b, c, false);
+#endif
+    typedef _Float16 h2v __attribute__((ext_vector_type(2)));
+    h2v av = __builtin_bit_cast(h2v, a), bv = __builtin_bit_cast(h2v, b);
+    return fmaf((float) av.x, (float) bv.x, fmaf((float) av.y, (float) bv.y, c));
+}

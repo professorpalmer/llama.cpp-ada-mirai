@@ -41,6 +41,98 @@ union half_uint16 {
 
 #include "exl3/quant/exl3_gemv_kernel.cuh"
 
+#if defined(GGML_USE_HIP)
+// ROCm, one row (decode): exllamav3's native RDNA GEMV (exl3/rocm/quant/exl3_gemv_kernel_rdna.cuh and
+// exl3_gemv_tiles_rdna.cuh, unmodified, MIT, turboderp): fdot2 dot products on decoded 16x16 tiles, split-K over the
+// warps of a block, no emulated tensor-core fragments. GGML_ESCHA_HIP_GEMV=rdna selects it; the default stays the
+// emulated kernel above until the native one is measured on an RDNA card (identity, KL, speed).
+#include "exl3/rocm/quant/exl3_gemv_kernel_rdna.cuh"
+
+// The host helpers the kernels name, from exllamav3's exl3_gemv_rdna.cu (same commit, MIT, turboderp), with its
+// environment switches: EXL3_GEMV_LDS, EXL3_ROCM_GEMV_TILES, EXL3_GEMV_TILES_T, EXL3_GEMV_SPLITK_WARPS.
+bool exl3_gemv_lds_core() {
+    const char * env = std::getenv("EXL3_GEMV_LDS");
+    return env != nullptr && atoi(env) != 0;
+}
+
+int exl3_gemv_core_mode() {
+    if (exl3_gemv_lds_core()) {
+        return EXL3_GEMV_CORE_LDS;
+    }
+    const char * env = std::getenv("EXL3_ROCM_GEMV_TILES");
+    if (env != nullptr && atoi(env) == 0) {
+        return EXL3_GEMV_CORE_DIRECT;
+    }
+    return EXL3_GEMV_CORE_TILES;
+}
+
+int exl3_gemv_tiles_tpb(int core, int device, int n_tiles, int bszm, int warps) {
+    if (core != EXL3_GEMV_CORE_TILES) {
+        return 1;
+    }
+    const char * env = std::getenv("EXL3_GEMV_TILES_T");
+    if (env != nullptr) {
+        return atoi(env) >= 2 ? EXL3_GEMV_TILES_TMAX : 1;
+    }
+    const int sms = device >= 0 ? ggml_cuda_info().devices[device].nsm : 20;
+    const long waves_t2 = (long) (n_tiles / 2) * bszm * warps;
+    return waves_t2 >= 1024L * sms / 20 ? 2 : 1;
+}
+
+static int escha_rdna_splitk_warps(int k_tiles, int n_tiles) {
+    const char * env = std::getenv("EXL3_GEMV_SPLITK_WARPS");
+    if (env != nullptr) {
+        const int w = atoi(env);
+        if (w == 4 || w == 8 || w == 16) {
+            return w;
+        }
+    }
+    if (k_tiles <= 128 || n_tiles >= 1024) {
+        return 4;
+    }
+    return n_tiles < 128 || k_tiles >= 1024 ? 16 : 8;
+}
+
+static bool escha_hip_gemv_rdna() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_ESCHA_HIP_GEMV");
+        return e != nullptr && strcmp(e, "rdna") == 0;
+    }();
+    return on;
+}
+
+// c[OC] (fp32) = xh[IC] . decode(code): the split-K form of exllamav3's launch (exl3_gemv_rdna_launch), which it takes for
+// every output up to 2,048 tiles (32,768 columns): all Kintsugi projections.
+static bool escha_gemv_rdna_m1(const half * xh, const uint16_t * code, float * c, const int IC, const int OC, const int K,
+                               cudaStream_t stream) {
+    const int n_tiles = OC/16;
+    const int k_tiles = IC/16;
+    if (n_tiles > EXL3_GEMV_SPLITK_MAX_TILES) {
+        return false;
+    }
+    const int warps = escha_rdna_splitk_warps(k_tiles, n_tiles);
+    const size_t smem = exl3_gemv_smem_bytes_splitk(warps);
+    const int core = exl3_gemv_core_mode();
+#define ESCHA_RDNA_LAUNCH(bits, w) \
+    exl3_gemv_dot_kernel_splitk<bits, true, 1, w><<<n_tiles, (w)*32, smem, stream>>>(xh, code, c, IC, OC, core)
+#define ESCHA_RDNA_WARPS(bits) \
+    switch (warps) { \
+        case 4:  ESCHA_RDNA_LAUNCH(bits, 4);  break; \
+        case 8:  ESCHA_RDNA_LAUNCH(bits, 8);  break; \
+        default: ESCHA_RDNA_LAUNCH(bits, 16); break; \
+    }
+    if (K == 2) {
+        ESCHA_RDNA_WARPS(2);
+    } else {
+        ESCHA_RDNA_WARPS(3);
+    }
+#undef ESCHA_RDNA_WARPS
+#undef ESCHA_RDNA_LAUNCH
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif // defined(GGML_USE_HIP)
+
 #define ESCHA_GEMV_RS 0.088388347648f   // 1/sqrt(128), the fp32 constant of the format
 
 // xh[row] = f16(T128(x[row] * rin)), one warp per 128 channels. fp32 until the last step, as in the escha reference.
@@ -488,6 +580,18 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         (const float *) x->data, (const half *) rin->data, xh.get(),
         IC, n_rows, (int) x->ne[1], x->nb[1], x->nb[2]);
     CUDA_CHECK(cudaGetLastError());
+
+#if defined(GGML_USE_HIP)
+    if (n_rows == 1 && escha_hip_gemv_rdna()) {
+        ggml_cuda_pool_alloc<float> c1(ctx.pool(), (size_t) OC);
+        if (escha_gemv_rdna_m1(xh.get(), (const uint16_t *) code->data, c1.get(), IC, OC, K, stream)) {
+            escha_gemv_had_out<<<(OC/128 + 7)/8, 256, 0, stream>>>(
+                c1.get(), (const half *) rout->data, (float *) dst->data, OC, 1, (int) x->ne[1], dst->nb[1], dst->nb[2]);
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     // exllamav3 on Ada (exl3_gemv_cfg): narrow up to n = 8192, wide above
     const int cfg = cfg_env != CFG_EXL3 ? cfg_env : OC <= 8192 ? CFG_NARROW : CFG_WIDE;
