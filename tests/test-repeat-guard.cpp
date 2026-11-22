@@ -73,6 +73,19 @@ int main() {
         expect("8 different trivial echo calls (rule 2)", m, true, 2);
         m.resize(m.size() - 2);
         expect("7 different trivial echo calls", m, false);
+        // the G6 shape (capture line 21): a real bash step with a long result, then 8 trivial ones: the long result
+        // ends the run, so the 8 short ones still count
+        auto g = base();
+        g.push_back(call("bash", "{\"command\":\"python -c \\\"print(open('src/textutil.py').read())\\\"\"}", "L0"));
+        g.push_back(result(long_text.substr(0, 900), "L0"));
+        for (int i = 0; i < 8; ++i) {
+            const std::string id = "h" + std::to_string(i);
+            g.push_back(call("bash", std::string("{\"command\":\"") + cmds[i] + "\"}", id));
+            g.push_back(result(std::string(cmds[i]).substr(5), id));
+        }
+        expect("long-result bash, then 8 trivial calls (rule 2)", g, true, 2);
+        g.resize(g.size() - 2);
+        expect("long-result bash, then 7 trivial calls", g, false);
     }
     // 3. negatives: normal agent work
     {

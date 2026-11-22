@@ -147,13 +147,18 @@ common_repeat_guard_result common_repeat_guard_check(const std::vector<common_ch
         return res;
     }
     const std::string tool = calls.back()->name;
+    const auto short_result = [](const rg_call * c) { return c->has_result && c->result_len <= RG_SHORT_RESULT; };
+    // the trailing run: consecutive calls to the last call's tool, each with a short result (a long result ends it:
+    // an earlier real step, e.g. a script that printed a file, must not hide the loop that follows it; RG2 15:0x)
     int run = 0;
-    for (auto it = calls.rbegin(); it != calls.rend() && (*it)->name == tool; ++it) {
+    for (auto it = calls.rbegin(); it != calls.rend() && (*it)->name == tool && short_result(*it); ++it) {
         ++run;
+    }
+    if (run == 0) {
+        return res;
     }
     // assistant turns the run spans (parallel calls of one turn are one step, not a loop)
     const size_t run_turns = call_turn.back() - call_turn[calls.size() - run] + 1;
-    const auto short_result = [](const rg_call * c) { return c->has_result && c->result_len <= RG_SHORT_RESULT; };
 
     // rule 1: the last 6 turns, one call each, same tool, near-identical arguments, short results
     if ((int) turns.size() >= RG_RULE1_TURNS) {
@@ -176,19 +181,10 @@ common_repeat_guard_result common_repeat_guard_check(const std::vector<common_ch
             res.rule = 1;
         }
     }
-    // rule 2: >= 8 trailing calls to one tool that does not change files, all with short results
+    // rule 2: >= 8 trailing short-result calls to one tool that does not change files, over >= 4 assistant turns
     if (!res.fire && use_rule2 && run >= RG_RULE2_CALLS && run_turns >= RG_RULE2_TURNS && !rg_changes_files(tool)) {
-        bool ok = true;
-        for (size_t k = calls.size() - run; k < calls.size(); ++k) {
-            if (!short_result(calls[k])) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) {
-            res.fire = true;
-            res.rule = 2;
-        }
+        res.fire = true;
+        res.rule = 2;
     }
     if (res.fire) {
         res.count = run;
