@@ -1312,10 +1312,18 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
     if (self_pos_kv && self_pos_kv->buffer) {
-        attn_ctx->get_base()->set_input_kv_pos(self_pos_kv, ubatch);
+        if (pos_seq) {
+            attn_ctx->get_base()->set_input_kv_pos_seq(self_pos_kv, ubatch);
+        } else {
+            attn_ctx->get_base()->set_input_kv_pos(self_pos_kv, ubatch);
+        }
     }
     if (self_pos_kv_swa && self_pos_kv_swa->buffer) {
-        attn_ctx->get_swa()->set_input_kv_pos(self_pos_kv_swa, ubatch);
+        if (pos_seq) {
+            attn_ctx->get_swa()->set_input_kv_pos_seq(self_pos_kv_swa, ubatch);
+        } else {
+            attn_ctx->get_swa()->set_input_kv_pos(self_pos_kv_swa, ubatch);
+        }
     }
 }
 
@@ -1353,6 +1361,12 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     // with positions the graph depends only on n_kv (a multiple of 256): the positions are inputs
     res &= self_pos_kv->ne[0]     == attn_ctx->get_base()->get_n_kv();
     res &= self_pos_kv_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    if (pos_seq) {
+        // one row per sequence set: the Q / K / V views of the banded op have n_seqs streams
+        res &= self_pos_kv->ne[1]     == params.ubatch.n_seqs;
+        res &= self_pos_kv_swa->ne[1] == params.ubatch.n_seqs;
+        res &= self_pos_kv->ne[1]*params.ubatch.n_seq_tokens == params.ubatch.n_tokens;
+    }
 
     res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
 
@@ -4032,11 +4046,19 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
-    inp->self_pos_kv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv());
+    // n_seq_max > 1: a row of cell positions per sequence set of the ubatch (the sequence check of the position form);
+    // one sequence keeps the 1-D form unchanged
+    inp->pos_seq = cparams.n_seq_max > 1;
+    if (inp->pos_seq) {
+        inp->self_pos_kv     = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_seqs);
+        inp->self_pos_kv_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(),  ubatch.n_seqs);
+    } else {
+        inp->self_pos_kv     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv());
+        inp->self_pos_kv_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv());
+    }
     ggml_set_input(inp->self_pos_kv);
     ggml_set_name(inp->self_pos_kv, "attn_inp_pos_kv");
 
-    inp->self_pos_kv_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv());
     ggml_set_input(inp->self_pos_kv_swa);
     ggml_set_name(inp->self_pos_kv_swa, "attn_inp_pos_kv_swa");
 

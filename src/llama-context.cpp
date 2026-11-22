@@ -183,12 +183,12 @@ llama_context::llama_context(
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
-    // Inkling 2 in this build serves one sequence: the dense attention does not split queries by stream (a per-slot
-    // cache fails an assert at graph build) and the banded op's position form has no sequence check. Refuse more than
-    // one slot with a clear message instead of a crash or cross-slot attention (G6 fix gate, 11-22).
+    // Inkling 2 with more than one sequence (np2, 11-22): the banded op's position form checks the sequence (one row of
+    // cell positions per sequence set, llm_graph_input_mem_hybrid_iswa_rel::pos_seq) and the dense attention splits
+    // the queries by stream, so n_seq_max > 1 is served. Before np2 it was refused here (c1ab9cd0e).
     if (model.arch == LLM_ARCH_INKLING2 && cparams.n_seq_max > 1) {
-        throw std::runtime_error("Inkling 2 Mini in this build supports one slot (-np 1, n_seq_max 1); parallel slots "
-                                 "come in a later version (requested n_seq_max = " + std::to_string(cparams.n_seq_max) + ")");
+        LLAMA_LOG_INFO("%s: Inkling 2 Mini: %u sequences (%s cache), banded attention with a sequence check\n", __func__,
+                cparams.n_seq_max, cparams.kv_unified ? "unified" : "per-slot");
     }
 
     cparams.n_rs_seq = params.n_rs_seq;

@@ -1142,7 +1142,8 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (q->ne[2] % k->ne[2] != 0 || q->ne[2] % v->ne[2] != 0 || k->ne[2] != v->ne[2]) {
         return false;
     }
-    if (q->ne[3] != k->ne[3] || q->ne[3] != v->ne[3]) {
+    // K / V: one stream per query stream, or one for all (ne3 1: the kernels read it with stride 0, fattn_banded_kv_nb3)
+    if (k->ne[3] != v->ne[3] || (q->ne[3] != k->ne[3] && k->ne[3] != 1)) {
         return false;
     }
     if (q->nb[0] != sizeof(float) || k->nb[0] != ggml_type_size(k->type) ||
@@ -1192,6 +1193,12 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
 }
 
 static constexpr int64_t fattn_banded_mma_min_q = 16;
+
+// the stream stride of K / V for the kernels: 0 when K / V have one stream (ne3 1) for all query streams (a unified
+// cache, llama-server -np > 1); with one query stream the stride is never used (batch index 0), so -np 1 is the same
+static uint64_t fattn_banded_kv_nb3(const ggml_tensor * t) {
+    return t->ne[3] == 1 ? 0 : t->nb[3];
+}
 
 static bool fattn_banded_mma_aligned(const ggml_tensor * t) {
     return (uintptr_t) t->data % 16 == 0 && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
@@ -1290,8 +1297,8 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
 
     const char * k_data = (const char *) k->data;
     const char * v_data = (const char *) v->data;
-    uint64_t k_nb[4] = {k->nb[0], k->nb[1], k->nb[2], k->nb[3]};
-    uint64_t v_nb[4] = {v->nb[0], v->nb[1], v->nb[2], v->nb[3]};
+    uint64_t k_nb[4] = {k->nb[0], k->nb[1], k->nb[2], fattn_banded_kv_nb3(k)};
+    uint64_t v_nb[4] = {v->nb[0], v->nb[1], v->nb[2], fattn_banded_kv_nb3(v)};
     ggml_cuda_pool_alloc<half> k_f16(ctx.pool());
     ggml_cuda_pool_alloc<half> v_f16(ctx.pool());
     auto to_f16 = [&](const ggml_tensor * t, ggml_cuda_pool_alloc<half> & buf, const char *& data, uint64_t (&nb)[4]) {
@@ -1306,7 +1313,7 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
         nb[0] = sizeof(half);
         nb[1] = t->ne[0]*nb[0];
         nb[2] = t->ne[1]*nb[1];
-        nb[3] = t->ne[2]*nb[2];
+        nb[3] = t->ne[3] == 1 ? 0 : t->ne[2]*nb[2];
     };
     // q4_0 / q8_0: read natively unless asked for the f16 copy (or not word aligned)
     ggml_type type_KV = GGML_TYPE_F16;   // K
@@ -1458,8 +1465,8 @@ static void fattn_banded_warp_launch(ggml_backend_cuda_context & ctx, ggml_tenso
                 m ? (const char *) m->data : nullptr, (const char *) rel->data, part.get(), \
                 scale, k->type, v->type, rel->type, q->ne[1], n_kv, q->ne[2], k->ne[2], n_chunks, chunk, \
                 rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
-                q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
-                v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
+                q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], fattn_banded_kv_nb3(k), \
+                v->nb[0], v->nb[1], v->nb[2], fattn_banded_kv_nb3(v), \
                 m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
                 rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], window, \
                 pos_q_t ? (const int32_t *) pos_q_t->data : nullptr, pos_kv_t ? (const int32_t *) pos_kv_t->data : nullptr, \
@@ -1490,8 +1497,8 @@ static void fattn_banded_warp_launch(ggml_backend_cuda_context & ctx, ggml_tenso
         m ? (const char *) m->data : nullptr, (const char *) rel->data, (float *) dst->data, \
         scale, k->type, v->type, rel->type, q->ne[1], k->ne[1], q->ne[2], k->ne[2], q->ne[3], \
         rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
-        q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
-        v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
+        q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], fattn_banded_kv_nb3(k), \
+        v->nb[0], v->nb[1], v->nb[2], fattn_banded_kv_nb3(v), \
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
         sinks ? (const float *) sinks->data : nullptr, \
         sinks && sinks->ne[1] > 1 ? int64_t(sinks->nb[1] / sizeof(float)) : 0, \

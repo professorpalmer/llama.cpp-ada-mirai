@@ -2522,6 +2522,8 @@ extern "C" {
     //   rel_logits: [rel_extent, n_head, n_batch, ne3]; rel_dist = q_idx + (n_kv - n_batch) - kv_idx
     //   score += rel_logits[rel_dist, head, q_idx, batch] iff 0 <= rel_dist < rel_extent
     // sinks (ggml_flash_attn_ext_add_sinks) may be per head [n_head] or per query [n_head, n_batch, 1 or ne3]
+    // k / v have ne3 = q's ne3 or 1 (one K/V for every batch b: a unified cache with the sequence check of the
+    // token positions below)
     // (Inkling 2; ported from Unsloth's llama.cpp mix b12588-mix-c0c3de8, MIT)
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_banded(
             struct ggml_context * ctx,

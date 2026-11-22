@@ -748,8 +748,9 @@ static void banded_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     p.gqa    = Q->ne[2] / K->ne[2];
     p.n_kv   = K->ne[1];
     p.nb01 = Q->nb[1]; p.nb02 = Q->nb[2]; p.nb03 = Q->nb[3];
-    p.nb11 = K->nb[1]; p.nb12 = K->nb[2]; p.nb13 = K->nb[3];
-    p.nb21 = V->nb[1]; p.nb22 = V->nb[2]; p.nb23 = V->nb[3];
+    // K / V with one stream for all query streams (a unified cache, llama-server -np > 1): stride 0 over the streams
+    p.nb11 = K->nb[1]; p.nb12 = K->nb[2]; p.nb13 = K->ne[3] == 1 ? 0 : K->nb[3];
+    p.nb21 = V->nb[1]; p.nb22 = V->nb[2]; p.nb23 = V->ne[3] == 1 ? 0 : V->nb[3];
     p.nb31 = mask ? mask->nb[1] : 0;
     p.nb32 = mask ? mask->nb[2] : 0;
     p.nb33 = mask ? mask->nb[3] : 0;
@@ -794,7 +795,9 @@ static void banded_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         max_blocks_per_sm = 4;
     }
     const int ntiles_dst      = ntiles_x * n_groups * Q->ne[3];
-    const int ntiles_dst_eff  = bi ? n_groups * Q->ne[3] : ntiles_dst;
+    // batch-invariant: the KV split of a sequence does not depend on the query rows nor on the other sequences of the
+    // batch (Q->ne[3] streams, llama-server -np > 1; with one stream this is n_groups * Q->ne[3] as before)
+    const int ntiles_dst_eff  = bi ? n_groups : ntiles_dst;
     const int blocks_per_wave = nsm * max_blocks_per_sm;
     int parallel_blocks       = max_blocks_per_sm;
     const int parallel_blocks_max = bi ? std::max(parallel_blocks, 64) : std::max(1, ntiles_KV);
@@ -928,7 +931,7 @@ bool ggml_cuda_flash_attn_ext_banded_dec_supported(int device, const ggml_tensor
     if (k->ne[2] != v->ne[2] || q->ne[2] % k->ne[2] != 0 || k->ne[1] != v->ne[1]) {
         return false;
     }
-    if (q->ne[3] != k->ne[3] || q->ne[3] != v->ne[3]) {
+    if (k->ne[3] != v->ne[3] || (q->ne[3] != k->ne[3] && k->ne[3] != 1)) {
         return false;
     }
     if (k->ne[1] > INT32_MAX/2) {

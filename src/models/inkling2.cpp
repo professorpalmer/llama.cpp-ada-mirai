@@ -450,6 +450,13 @@ ggml_tensor * llama_model_inkling2::graph::dense_attn(
     } else {
         v = ggml_permute(ctx0, v, 0, 2, 1, 3);
     }
+    // per-slot streams (llama-server -np > 1 without --kv-unified): K / V have one view per stream in ne[3]; the ubatch
+    // holds the same number of rows for each stream, stream after stream, so split the query rows the same way
+    const int64_t n_stream = k->ne[3];
+    if (n_stream > 1) {
+        GGML_ASSERT(q_cur->ne[2] % n_stream == 0);
+        q_cur = ggml_reshape_4d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]/n_stream, n_stream);
+    }
     ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
 
     ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f);
@@ -472,10 +479,17 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
     // covers 1-32 rows) and f16 / q8_0 / q4_0 K/V, with the implicit window instead of a mask tensor.
     // LLAMA_INKLING_MASKED=1 restores Unsloth's choice (dense for ubatches of 32 rows or fewer, the F16 mask tensor).
     static const bool masked_env = [] { const char * e = getenv("LLAMA_INKLING_MASKED"); return e && atoi(e) != 0; }();
-    // the position form (op E) has no sequence check: with more than one sequence in the context (llama-server -np > 1,
-    // a unified cache by default) a query would see the cells of other slots. Then take the masked form, whose mask
-    // (and the contiguity guard of the banded call) checks the sequence. Release launchers run -np 1 (audit 11-22).
-    const bool masked = masked_env || cparams.n_seq_max > 1;
+    // more than one sequence in the context (llama-server -np > 1, unified or per-slot cache): the position form runs
+    // with one stream per sequence set of the ubatch (split_equal: n_seqs sets of n_seq_tokens rows, set after set).
+    // Each stream has its own row of cell positions, and a cell that does not hold the stream's sequence is -1 there
+    // (empty): that is the sequence check (llm_graph_input_mem_hybrid_iswa_rel::pos_seq). Unified cache: K / V are one
+    // view that the op takes for every stream (K / V ne3 1); per-slot cache: its own per-stream views. Before np2 (11-22)
+    // the position form had no sequence check, so n_seq_max > 1 took the masked form (d2e2d04fc) and was refused.
+    const bool    masked  = masked_env;
+    const bool    pos_seq = inp->pos_seq && !masked;
+    const int64_t n_sq    = pos_seq ? (int64_t) ubatch.n_seqs       : 1;          // streams of the banded op
+    const int64_t n_sqt   = pos_seq ? (int64_t) ubatch.n_seq_tokens : n_tokens;   // query rows per stream
+    GGML_ASSERT(n_sq*n_sqt == n_tokens);
     inp->banded = cparams.flash_attn && (!masked || n_tokens > n_tokens_banded_min);
     // decode too: before op E the view of the contiguous cells grew by one cell per token, so the decode graph was
     // rebuilt every token (rig, ef60e363c: 23 tok/s) and a59cd68e2 kept decode dense; with positions that is gone.
@@ -507,7 +521,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         };
         if (!((use_pos || inp->n_kv_banded[swa] > 0) && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
                 type_ok(cache->type_k()) && type_ok(cache->type_v()) &&
-                (swa ? attn->self_kq_mask_swa : attn->self_kq_mask)->ne[3] == 1)) {
+                (pos_seq || (swa ? attn->self_kq_mask_swa : attn->self_kq_mask)->ne[3] == 1))) {
             if (use_pos) {
                 refuse(il, swa, nullptr);
             }
@@ -528,13 +542,16 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         const int64_t nh  = hparams.n_head(il);
         const int64_t nkv = hparams.n_head_kv(il);
         // the probe has the shape of the real call (rows = n_tokens): the kernels differ by row count and K/V type
-        const int64_t nr = masked ? 1 : n_tokens;
-        ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, nr, nh, 1);
-        ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, nr, nkv, 1);
-        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, nr, nkv, 1);
+        // more than one sequence (pos_seq): the rows of one stream, n_sq streams
+        const int64_t nr = masked ? 1 : n_sqt;
+        ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, nr, nh, n_sq);
+        // K / V streams of the real call: the cache's own (a unified cache: 1 for all n_sq sets; per-slot: n_sq)
+        const int64_t ns_kv = pos_seq ? (swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_k(ctx0, il)->ne[3] : 1;
+        ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, nr, nkv, ns_kv);
+        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, nr, nkv, ns_kv);
         ggml_tensor * pm = masked ? ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, nr, nr, 1, 1) : nullptr;
-        const bool factors = inkling_rel_factors(n_tokens);
-        ggml_tensor * pr = factors ? nullptr : ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, nr, 1);
+        const bool factors = inkling_rel_factors(n_tokens) && n_sq == 1;
+        ggml_tensor * pr = factors ? nullptr : ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, nr, n_sq);
         ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
         if (factors) {
             // the real table type (F32 or F16) of the model; the probe's extent is 1
@@ -545,8 +562,10 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         if (!masked) {
             ggml_flash_attn_ext_banded_set_window(op, swa ? (int32_t) hparams.n_swa : INT32_MAX);
         }
-        ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, nr, 1));
-        if (use_pos) {
+        ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, nr, n_sq));
+        if (use_pos && pos_seq) {
+            ggml_flash_attn_ext_banded_set_pos(op, ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, nr, n_sq), ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, nr, n_sq));
+        } else if (use_pos) {
             ggml_flash_attn_ext_banded_set_pos(op, ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nr), ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nr));
         }
         ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
@@ -719,7 +738,11 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 // with positions: the whole (padded) K/V view; without: the position-contiguous cells only
                 const int64_t n_kv_b = use_pos ? k_all->ne[2] : inp->n_kv_banded[is_swa];
                 GGML_ASSERT(n_kv_b <= k_all->ne[2]);
-                ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_tokens, 1), 0, 2, 1, 3);
+                ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_sqt, n_sq), 0, 2, 1, 3);
+                // streams of the K / V views: the cache's own. A per-slot cache has one per sequence set; a unified
+                // cache has one, which the op takes for all n_sq sets (pos_seq: the position rows check the sequence)
+                GGML_ASSERT(k_all->ne[3] == v_all->ne[3]);
+                GGML_ASSERT(k_all->ne[3] == n_sq || k_all->ne[3] == 1);
                 ggml_tensor * k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv_b, k_all->ne[3],
                         k_all->nb[1], k_all->nb[2], k_all->nb[3], 0), 0, 2, 1, 3);
                 ggml_tensor * v_fa;
@@ -743,19 +766,24 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 // query chunk, so the [extent, n_head, n_tokens] bias (96 MiB at ub 1024) never exists in the compute
                 // buffer (prefill agent's item 5). Decode keeps the dense bias (tiny there).
                 // Opt-in for now: LLAMA_INKLING_REL_FACTORS=1 (default = the dense bias everywhere).
-                if (inkling_rel_factors(n_tokens)) {
+                // (the factors take one stream: more than one sequence set keeps the dense bias)
+                if (inkling_rel_factors(n_tokens) && n_sq == 1) {
                     cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, nullptr, 1.0f/sqrtf(n_embd_head), layer.attn_rel_bias->ne[1]);
                     ggml_flash_attn_ext_banded_set_rel_factors(cur, layer.attn_rel_bias, ggml_is_contiguous(Rcur) ? Rcur : ggml_cont(ctx0, Rcur));
                 } else {
                     ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
-                    rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
+                    rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_sqt, n_sq);
                     cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
                 }
                 if (!masked) {
                     ggml_flash_attn_ext_banded_set_window(cur, is_swa ? (int32_t) hparams.n_swa : INT32_MAX);
                 }
-                ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
-                if (use_pos) {
+                ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_sqt, n_sq));
+                if (use_pos && pos_seq) {
+                    // a row per sequence set: the positions of its queries, and of the cells that hold its sequence
+                    ggml_flash_attn_ext_banded_set_pos(cur, ggml_reshape_2d(ctx0, inp_pos, n_sqt, n_sq),
+                            is_swa ? inp->self_pos_kv_swa : inp->self_pos_kv);
+                } else if (use_pos) {
                     // the token position of each query, the position held by each cell of the view (-1 = empty)
                     ggml_flash_attn_ext_banded_set_pos(cur, inp_pos, is_swa ? inp->self_pos_kv_swa : inp->self_pos_kv);
                 }

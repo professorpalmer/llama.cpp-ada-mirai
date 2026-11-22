@@ -242,6 +242,9 @@ public:
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     // the token position held by each cell of the K/V view, -1 for an empty cell (Inkling 2, banded op with positions)
     void set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // more than one sequence (n_seq_max > 1): dst I32 [n_kv, n_seqs], row s for the ubatch's sequence set s, the
+    // cells of that sequence's stream; a cell that does not hold the row's sequence is -1 (the sequence check)
+    void set_input_kv_pos_seq(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -452,6 +455,9 @@ public:
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     // the token position held by each cell of the K/V view, -1 for an empty cell (Inkling 2, banded op with positions)
     void set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // more than one sequence (n_seq_max > 1): dst I32 [n_kv, n_seqs], row s for the ubatch's sequence set s, the
+    // cells of that sequence's stream; a cell that does not hold the row's sequence is -1 (the sequence check)
+    void set_input_kv_pos_seq(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     // K/V cells of the banded attention for the current ubatch, 0 = not position-contiguous (Inkling 2)
     uint32_t get_n_kv_pos_contiguous() const;
     uint32_t get_size() const; // cells of the cache (Inkling 2 dense-bias chunking)
