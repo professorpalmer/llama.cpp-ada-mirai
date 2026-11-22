@@ -1267,7 +1267,9 @@ json oaicompat_chat_params_parse(
     // prompt, so the prompt cache keeps the whole prefix; the client's own history does not contain it). Every firing
     // is a warning line. Here the Anthropic and Responses requests are already in chat-completions form.
     if (opt.repeat_guard) {
-        const common_repeat_guard_result rg = common_repeat_guard_check(inputs.messages);
+        // rule 2 is OFF in the server: the build-2 RG2 gate gave 7 rule-2 firings outside the known loop (the agreed
+        // rule: any rule-2 false positive -> rule 2 is dropped); the detector keeps it for the unit tests only
+        const common_repeat_guard_result rg = common_repeat_guard_check(inputs.messages, /*use_rule2=*/false);
         if (rg.fire) {
             common_chat_msg note;
             // a template without a system role (a model with the guard forced on) gets the note as a user message, so
