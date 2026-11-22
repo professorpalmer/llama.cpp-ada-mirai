@@ -471,7 +471,11 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
     // banded FA needs a position-contiguous cache. This tree: the banded op takes every ubatch size (the decode kernel
     // covers 1-32 rows) and f16 / q8_0 / q4_0 K/V, with the implicit window instead of a mask tensor.
     // LLAMA_INKLING_MASKED=1 restores Unsloth's choice (dense for ubatches of 32 rows or fewer, the F16 mask tensor).
-    static const bool masked = [] { const char * e = getenv("LLAMA_INKLING_MASKED"); return e && atoi(e) != 0; }();
+    static const bool masked_env = [] { const char * e = getenv("LLAMA_INKLING_MASKED"); return e && atoi(e) != 0; }();
+    // the position form (op E) has no sequence check: with more than one sequence in the context (llama-server -np > 1,
+    // a unified cache by default) a query would see the cells of other slots. Then take the masked form, whose mask
+    // (and the contiguity guard of the banded call) checks the sequence. Release launchers run -np 1 (audit 11-22).
+    const bool masked = masked_env || cparams.n_seq_max > 1;
     inp->banded = cparams.flash_attn && (!masked || n_tokens > n_tokens_banded_min);
     // decode too: before op E the view of the contiguous cells grew by one cell per token, so the decode graph was
     // rebuilt every token (rig, ef60e363c: 23 tok/s) and a59cd68e2 kept decode dense; with positions that is gone.
@@ -486,7 +490,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
     const auto use_banded = [&](int il, bool swa) {
         const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
         const int64_t hd = hparams.n_embd_head_k(il);
-        const auto type_ok = [](ggml_type t) {
+        const auto type_ok = [masked](ggml_type t) {
             return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 ||
                 (!masked && (t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0));
         };
