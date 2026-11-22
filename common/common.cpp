@@ -1335,6 +1335,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // Inkling 2 in this build runs one slot (llama_context refuses n_seq_max > 1). When the slot count is llama-server's
+    // auto default and not the user's -np, clamp it to one slot so a plain start works (G6 fix gate, 11-22).
+    if (params.n_parallel_auto && params.n_parallel > 1) {
+        char arch[64] = {0};
+        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+        if (std::string(arch) == "inkling2") {
+            COM_INF("Inkling 2 Mini in this build runs one slot; parallel slots come in a later version (n_parallel %d -> 1)\n",
+                    params.n_parallel);
+            params.n_parallel  = 1;
+            params.kv_unified  = false;
+            cparams.n_seq_max  = 1;
+            cparams.kv_unified = false;
+        }
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters

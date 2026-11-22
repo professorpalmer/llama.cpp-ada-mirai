@@ -154,6 +154,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
             params.n_parallel = 4;
             params.kv_unified = true;
+            params.n_parallel_auto = true; // a model that runs one slot may clamp this (Inkling 2, common_init_result)
         }
     }
 
