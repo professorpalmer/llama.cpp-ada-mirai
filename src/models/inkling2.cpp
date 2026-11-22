@@ -487,6 +487,17 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
     }
     std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
+    // the position form has no dense fallback that is tested (the dense bias path takes the masked form): when the
+    // banded op cannot run a layer, refuse with a clear message. The context reserves graphs of 1 row and n_ubatch rows,
+    // the two kernel classes (decode kernel, prefill kernel), so the refusal comes at start and not on first use.
+    const auto refuse = [&](int il, bool swa, const char * dev_name) {
+        const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+        throw std::runtime_error(format("Inkling 2 Mini in this build needs the banded attention op on each attention "
+                "layer; layer %d (%s, K %s, V %s, head size %d, %d rows) cannot use it on device %s. Use K/V cache types "
+                "f16, q8_0 or q4_0 (q8_0 and q4_0 need an RTX 20 series or newer GPU)",
+                il, swa ? "SWA" : "global", ggml_type_name(cache->type_k()), ggml_type_name(cache->type_v()),
+                (int) hparams.n_embd_head_k(il), (int) n_tokens, dev_name ? dev_name : "none"));
+    };
     const auto use_banded = [&](int il, bool swa) {
         const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
         const int64_t hd = hparams.n_embd_head_k(il);
@@ -497,10 +508,16 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         if (!((use_pos || inp->n_kv_banded[swa] > 0) && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
                 type_ok(cache->type_k()) && type_ok(cache->type_v()) &&
                 (swa ? attn->self_kq_mask_swa : attn->self_kq_mask)->ne[3] == 1)) {
+            if (use_pos) {
+                refuse(il, swa, nullptr);
+            }
             return false;
         }
         ggml_backend_dev_t dev = model.dev_layer(il);
         if (!dev) {
+            if (use_pos) {
+                refuse(il, swa, nullptr);
+            }
             return false;
         }
         for (const auto & [key, ok] : banded_dev_ok) {
@@ -534,6 +551,9 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         }
         ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
         const bool ok = ggml_backend_dev_supports_op(dev, op);
+        if (!ok && use_pos) {
+            refuse(il, swa, ggml_backend_dev_name(dev));
+        }
         banded_dev_ok.push_back({ { swa, dev }, ok });
         return ok;
     };

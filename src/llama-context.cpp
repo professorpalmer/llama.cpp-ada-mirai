@@ -3933,6 +3933,15 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // Inkling 2 in this build always runs with flash attention: its attention (the banded op and the dense per-head-mask
+    // path) is built on ggml_flash_attn_ext, which the non-FA cache layout (transposed V) does not match. -fa off / auto
+    // become on, with an INFO line, like the one-slot clamp (G6 fix gate, 11-22).
+    if (model->arch == LLM_ARCH_INKLING2 && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        LLAMA_LOG_INFO("%s: Inkling 2 Mini in this build needs flash attention: flash_attn %s -> on\n", __func__,
+                       llama_flash_attn_type_name(params.flash_attn_type));
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
