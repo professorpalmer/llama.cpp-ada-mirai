@@ -5659,8 +5659,10 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
         int64_t               rel_extent) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->ne[3] == k->ne[3]);
-    GGML_ASSERT(q->ne[3] == v->ne[3]);
+    // K / V: one stream per query stream, or one stream for all of them (a unified cache with more than one sequence
+    // set, the position form's rows check the sequence)
+    GGML_ASSERT(k->ne[3] == v->ne[3]);
+    GGML_ASSERT(q->ne[3] == k->ne[3] || k->ne[3] == 1);
     GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
     GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
 

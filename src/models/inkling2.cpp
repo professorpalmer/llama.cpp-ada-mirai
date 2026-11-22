@@ -483,7 +483,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
     // with one stream per sequence set of the ubatch (split_equal: n_seqs sets of n_seq_tokens rows, set after set).
     // Each stream has its own row of cell positions, and a cell that does not hold the stream's sequence is -1 there
     // (empty): that is the sequence check (llm_graph_input_mem_hybrid_iswa_rel::pos_seq). Unified cache: K / V are one
-    // view repeated over the streams (stride 0); per-slot cache: the cache's own per-stream views. Before np2 (11-22)
+    // view that the op takes for every stream (K / V ne3 1); per-slot cache: its own per-stream views. Before np2 (11-22)
     // the position form had no sequence check, so n_seq_max > 1 took the masked form (d2e2d04fc) and was refused.
     const bool    masked  = masked_env;
     const bool    pos_seq = inp->pos_seq && !masked;
@@ -545,8 +545,10 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         // more than one sequence (pos_seq): the rows of one stream, n_sq streams
         const int64_t nr = masked ? 1 : n_sqt;
         ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, nr, nh, n_sq);
-        ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, nr, nkv, n_sq);
-        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, nr, nkv, n_sq);
+        // K / V streams of the real call: the cache's own (a unified cache: 1 for all n_sq sets; per-slot: n_sq)
+        const int64_t ns_kv = pos_seq ? (swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_k(ctx0, il)->ne[3] : 1;
+        ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, nr, nkv, ns_kv);
+        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, nr, nkv, ns_kv);
         ggml_tensor * pm = masked ? ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, nr, nr, 1, 1) : nullptr;
         const bool factors = inkling_rel_factors(n_tokens) && n_sq == 1;
         ggml_tensor * pr = factors ? nullptr : ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, nr, n_sq);
@@ -737,24 +739,20 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 const int64_t n_kv_b = use_pos ? k_all->ne[2] : inp->n_kv_banded[is_swa];
                 GGML_ASSERT(n_kv_b <= k_all->ne[2]);
                 ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_sqt, n_sq), 0, 2, 1, 3);
-                // streams of the K / V views: the cache's own (one, or one per slot of a per-slot cache), or the one
-                // view of a unified cache repeated over the n_sq sequence sets with stride 0 (pos_seq)
+                // streams of the K / V views: the cache's own. A per-slot cache has one per sequence set; a unified
+                // cache has one, which the op takes for all n_sq sets (pos_seq: the position rows check the sequence)
                 GGML_ASSERT(k_all->ne[3] == v_all->ne[3]);
                 GGML_ASSERT(k_all->ne[3] == n_sq || k_all->ne[3] == 1);
-                const bool    kv_rep = k_all->ne[3] != n_sq;
-                const int64_t kv_ns  = kv_rep ? n_sq : k_all->ne[3];
-                const size_t  k_nb3  = kv_rep ? 0 : k_all->nb[3];
-                const size_t  v_nb3  = kv_rep ? 0 : v_all->nb[3];
-                ggml_tensor * k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv_b, kv_ns,
-                        k_all->nb[1], k_all->nb[2], k_nb3, 0), 0, 2, 1, 3);
+                ggml_tensor * k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv_b, k_all->ne[3],
+                        k_all->nb[1], k_all->nb[2], k_all->nb[3], 0), 0, 2, 1, 3);
                 ggml_tensor * v_fa;
                 if (v_all->nb[1] > v_all->nb[2]) { // transposed V
-                    v_fa = ggml_view_4d(ctx0, v_all, n_kv_b, v_all->ne[1], v_all->ne[2], kv_ns,
-                            v_all->nb[1], v_all->nb[2], v_nb3, 0);
+                    v_fa = ggml_view_4d(ctx0, v_all, n_kv_b, v_all->ne[1], v_all->ne[2], v_all->ne[3],
+                            v_all->nb[1], v_all->nb[2], v_all->nb[3], 0);
                     v_fa = ggml_transpose(ctx0, ggml_permute(ctx0, v_fa, 0, 2, 1, 3));
                 } else {
-                    v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_b, kv_ns,
-                            v_all->nb[1], v_all->nb[2], v_nb3, 0), 0, 2, 1, 3);
+                    v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_b, v_all->ne[3],
+                            v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
                 }
                 // the implicit window (causal for the global layers, n_swa for the SWA layers) replaces the mask tensor
                 ggml_tensor * m = nullptr;

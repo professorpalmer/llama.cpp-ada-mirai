@@ -7886,7 +7886,8 @@ struct test_flash_attn_ext_banded_pos : public test_flash_attn_ext_banded {
 // banded FA with token positions over n_seq sequence sets (llama-server -np > 1, Inkling 2 np2): Q [d, n_q, n_head,
 // n_seq], one row of query positions and one row of cell positions per set (ggml_flash_attn_ext_banded_set_pos with
 // ne[1] = n_seq). A cell that does not hold the row's sequence is -1 in that row (the sequence check).
-//   unified 1: one K/V cache for all sets, viewed n_seq times with stride 0 (the graph's view of a unified cache); its
+//   unified 1: one K/V cache for all sets (K / V ne3 1, which the op takes for every set, as the graph's view of a
+//              unified cache); its
 //              cells are interleaved between the sequences in blocks of 1, 3, 5, ... cells, and the first cells are a
 //              prefix that both sequences hold (a copied prompt, llama_memory_seq_cp); pad cells at the end are empty
 //   unified 0: one K/V cache per set (a per-slot cache), each with its own fill level
@@ -7929,10 +7930,8 @@ struct test_flash_attn_ext_banded_seq : public test_case {
         ggml_set_name(q, "q");
         ggml_set_name(kc, "k_cache");
         ggml_set_name(vc, "v_cache");
-        ggml_tensor * k = ggml_permute(ctx, ggml_view_4d(ctx, kc, d, n_head_kv, n_kv, n_seq, kc->nb[1], kc->nb[2],
-                unified ? 0 : kc->nb[3], 0), 0, 2, 1, 3);
-        ggml_tensor * v = ggml_permute(ctx, ggml_view_4d(ctx, vc, d, n_head_kv, n_kv, n_seq, vc->nb[1], vc->nb[2],
-                unified ? 0 : vc->nb[3], 0), 0, 2, 1, 3);
+        ggml_tensor * k = ggml_permute(ctx, kc, 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx, vc, 0, 2, 1, 3);
         ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, rel_extent, n_head, n_q, n_seq);
         ggml_set_name(r, "rel_logits");
         ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, nullptr, r, 1.0f/float(d), rel_extent);
