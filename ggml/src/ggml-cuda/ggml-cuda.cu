@@ -224,6 +224,53 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// A card with no native code in this build runs the newest PTX at or under its compute capability, compiled by the
+// driver (JIT) at first use. The host then must choose kernels for the PTX's arch, not the card's: the kernels' tile
+// sizes, configs and fused paths are picked on the host from cc (ggml_cuda_highest_compiled_arch, cc == ... checks) and
+// compiled on the device from __CUDA_ARCH__, and the two must agree. Example: a release build for 75/86/89/90/120 plus
+// compute_90 PTX on a compute capability 12.1 card (GB10): ggml's CMake turns 120 into 120a, which runs on 12.0 only, so
+// the card runs the compute_90 PTX while the host would pick 12.0 / GB10 paths.
+static __global__ void ggml_cuda_arch_probe_kernel() {}
+
+// true if this build has native code (a cubin) that the driver loads for this compute capability: a cubin for X.y runs
+// on X.z with z >= y, except 12X, which ggml's CMake always builds as the arch-specific 12Xa (that exact card only)
+static bool ggml_cuda_cc_has_native_code(const int cc) {
+#ifdef __CUDA_ARCH_LIST__
+    constexpr int archs[] = { __CUDA_ARCH_LIST__ };
+    for (const int a : archs) {
+        if (a/100 == cc/100 && a <= cc && (a/100 != 12 || a == cc)) {
+            return true;
+        }
+    }
+    return false;
+#else
+    GGML_UNUSED(cc);
+    return true;
+#endif // __CUDA_ARCH_LIST__
+}
+
+// The arch (100*major + 10*minor) of the code the driver runs for this build's kernels on the device: the PTX version of
+// a loaded kernel. 0 if no kernel loads (no code for the card: the usual error comes at the first real kernel).
+static int ggml_cuda_probe_kernel_arch(const int device) {
+    int prev = -1;
+    (void) cudaGetDevice(&prev);
+    if (cudaSetDevice(device) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    cudaFuncAttributes attr = {};
+    const cudaError_t err = cudaFuncGetAttributes(&attr, ggml_cuda_arch_probe_kernel);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+    if (prev >= 0) {
+        (void) cudaSetDevice(prev);
+    }
+    return err == cudaSuccess ? 10*attr.ptxVersion : 0;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -361,6 +408,17 @@ static ggml_cuda_device_info ggml_cuda_init() {
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s, VRAM: %zu MiB\n",
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
                       device_vram_mib);
+        // no native code for this card (or CUDA_FORCE_PTX_JIT set): kernel choices follow the arch of the PTX it runs.
+        // Cards with native code are not probed, so their cc and their paths do not change.
+        if (!ggml_cuda_cc_has_native_code(info.devices[id].cc) || getenv("CUDA_FORCE_PTX_JIT") != nullptr) {
+            const int run_arch = ggml_cuda_probe_kernel_arch(physical_id);
+            if (run_arch > 0 && run_arch < info.devices[id].cc) {
+                GGML_LOG_INFO("  Device %d: no native code for compute capability %d.%d in this build: it runs the "
+                              "compute_%d PTX (compiled by the driver at first use, then cached); kernel choices use %d.%d\n",
+                              id, prop.major, prop.minor, run_arch/10, run_arch/100, (run_arch%100)/10);
+                info.devices[id].cc = run_arch;
+            }
+        }
         std::string device_name(prop.name);
         if (device_name == "NVIDIA GeForce MX450") {
             turing_devices_without_mma.push_back({ id, device_name });
