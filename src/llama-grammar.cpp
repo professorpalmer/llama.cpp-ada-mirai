@@ -396,6 +396,13 @@ size_t llama_grammar_trigger_pattern::find(const std::string & input) const {
         if (std::regex_match(input, match, regex)) {
             return find_start_pos(match);
         }
+        // some regex implementations match ^/$ at line breaks
+        // (from upstream llama.cpp #32381 by Aldehir Rojas, "chat : implement inkling parser", 4ddf2b947: an anchored
+        // pattern must not fall through to the search below. With MSVC's std::regex, "^[^<]+$" (the Inkling trigger for
+        // an output that starts with a tool name) then matched a lone "\n" after a blank line inside a text block, the
+        // lazy tool-call grammar started there and the next piece emptied its stacks: HTTP 500 "Unexpected empty grammar
+        // stack after accepting piece: \n" in the G6 harness runs, 11-22)
+        return std::string::npos;
     }
 
     // search anywhere
