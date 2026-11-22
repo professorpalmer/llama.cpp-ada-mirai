@@ -166,6 +166,7 @@ static __global__ void fwht_quantize_q8_1(
     GGML_UNUSED_VARS(x_ptr, signs, vy_ptr, ne00, ne0, ne1, ne2, scale);
     NO_DEVICE_CODE;
 #else
+#line 164 // the lines of the file before the ROCm branches: __LINE__ in the CUDA code, and so the CUDA objects, stay as they were
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0 && NT % QK8_1 == 0, "bad fused FWHT shape");
@@ -258,6 +259,7 @@ static __global__ void fwht_quantize_q8_1(
         }
     }
 #endif // defined(GGML_USE_HIP) && (defined(CDNA) || defined(GCN))
+#line 255 // the lines of the file before the ROCm branches (see above)
 }
 
 template <int N, typename T>
@@ -306,6 +308,7 @@ bool ggml_cuda_fwht_quantize_supported(const int n, const int64_t ne00) {
         return false; // wave64: the fused kernel reduces one 32-block per warp
     }
 #endif // defined(GGML_USE_HIP)
+#line 298 // the lines of the file before the ROCm branches (see above)
     switch (n) {
         case 64: case 128: case 256: case 512: case 1024: case 2048:
             break;
