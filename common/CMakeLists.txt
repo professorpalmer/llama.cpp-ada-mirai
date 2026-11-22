@@ -100,6 +100,8 @@ add_library(${TARGET}
     preset.h
     reasoning-budget.cpp
     reasoning-budget.h
+    repeat-guard.cpp
+    repeat-guard.h
     sampling.cpp
     sampling.h
     speculative.cpp

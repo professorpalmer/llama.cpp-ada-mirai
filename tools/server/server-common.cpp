@@ -5,6 +5,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "chat.h"
+#include "repeat-guard.h"
 #include "base64.hpp"
 
 #include "server-common.h"
@@ -1260,6 +1261,21 @@ json oaicompat_chat_params_parse(
 
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
+    // repetition guard (--repeat-guard): a run of nearly the same tool call with short results at the end of the chat
+    // gets one short note as the newest message of THIS request only (after the last tool result, never in the system
+    // prompt, so the prompt cache keeps the whole prefix; the client's own history does not contain it). Every firing
+    // is a warning line. Here the Anthropic and Responses requests are already in chat-completions form.
+    if (opt.repeat_guard) {
+        const common_repeat_guard_result rg = common_repeat_guard_check(inputs.messages);
+        if (rg.fire) {
+            common_chat_msg note;
+            note.role    = "system";
+            note.content = common_repeat_guard_note(rg);
+            inputs.messages.push_back(note);
+            SRV_WRN("repetition guard: %d calls to '%s' in a row (rule %d, %zu messages): one note added as the newest message of this request\n",
+                    rg.count, rg.tool.c_str(), rg.rule, inputs.messages.size() - 1);
+        }
+    }
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();

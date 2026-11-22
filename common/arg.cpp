@@ -3773,6 +3773,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_MAX_TOKENS_FLOOR"));
     add_opt(common_arg(
+        {"--repeat-guard"},
+        {"--no-repeat-guard"},
+        "repetition guard: when the end of a chat is a run of nearly the same tool call with short results (6 calls with\n"
+        "near-identical arguments, or 8+ calls to one tool that does not change files), add one short note as the newest\n"
+        "message of that request (logged as a warning). default: on for Inkling 2 Mini, off for other models",
+        [](common_params & params, bool value) {
+            params.repeat_guard = value ? 1 : 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REPEAT_GUARD"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"

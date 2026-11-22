@@ -671,6 +671,8 @@ struct common_params {
     std::string              reasoning_effort_fallback = "medium";
     // server: with thinking on, raise a client output cap below this (0 = off)
     int32_t reasoning_max_tokens_floor = 0;
+    // server: repetition guard (common/repeat-guard.h): -1 = auto (on for Inkling 2 only), 0 = off, 1 = on
+    int repeat_guard = -1;
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 

@@ -313,6 +313,7 @@ struct server_chat_params {
     std::vector<std::string> reasoning_effort_allow;    // --reasoning-effort-allow (empty = pass everything)
     std::string              reasoning_effort_fallback; // --reasoning-effort-fallback
     int                      reasoning_max_tokens_floor = 0; // --reasoning-max-tokens-floor (0 = off)
+    bool                     repeat_guard = false;           // --repeat-guard (common/repeat-guard.h)
 };
 
 // used by /completions endpoint

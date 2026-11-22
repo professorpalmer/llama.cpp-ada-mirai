@@ -1549,8 +1549,18 @@ private:
                 /* force_pure_content    */ params_base.force_pure_content_parser,
                 /* reasoning_effort_allow    */ params_base.reasoning_effort_allow,
                 /* reasoning_effort_fallback */ params_base.reasoning_effort_fallback,
-                /* reasoning_max_tok_floor   */ params_base.reasoning_max_tokens_floor
+                /* reasoning_max_tok_floor   */ params_base.reasoning_max_tokens_floor,
+                /* repeat_guard              */ false,
             };
+            // repetition guard: on by default for Inkling 2 only (its v1.0 known limit: degenerate runs of trivial tool
+            // calls); --repeat-guard / --no-repeat-guard (env LLAMA_ARG_REPEAT_GUARD) decide for any model
+            {
+                char arch[64] = { 0 };
+                llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch));
+                chat_params.repeat_guard = params_base.repeat_guard == 1 ||
+                                           (params_base.repeat_guard == -1 && std::string(arch) == "inkling2");
+                SRV_INF("repetition guard: %s (architecture %s)\n", chat_params.repeat_guard ? "on" : "off", arch);
+            }
 
             {
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
