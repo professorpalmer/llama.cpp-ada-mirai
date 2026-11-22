@@ -7883,6 +7883,127 @@ struct test_flash_attn_ext_banded_pos : public test_flash_attn_ext_banded {
     }
 };
 
+// banded FA with token positions over n_seq sequence sets (llama-server -np > 1, Inkling 2 np2): Q [d, n_q, n_head,
+// n_seq], one row of query positions and one row of cell positions per set (ggml_flash_attn_ext_banded_set_pos with
+// ne[1] = n_seq). A cell that does not hold the row's sequence is -1 in that row (the sequence check).
+//   unified 1: one K/V cache for all sets, viewed n_seq times with stride 0 (the graph's view of a unified cache); its
+//              cells are interleaved between the sequences in blocks of 1, 3, 5, ... cells, and the first cells are a
+//              prefix that both sequences hold (a copied prompt, llama_memory_seq_cp); pad cells at the end are empty
+//   unified 0: one K/V cache per set (a per-slot cache), each with its own fill level
+// K / V have the cache layout [d, n_head_kv, n_kv, streams] permuted to [d, n_kv, n_head_kv, streams], as in the graph.
+// Sinks per query [n_head, n_q, n_seq]; rel_logits [rel_extent, n_head, n_q, n_seq].
+struct test_flash_attn_ext_banded_seq : public test_case {
+    const int64_t   n_q;
+    const int64_t   n_kv;
+    const int64_t   n_seq;
+    const int32_t   window;
+    const bool      unified;
+    const ggml_type kv_type;
+    const int64_t   d         = 128;
+    const int64_t   n_head    = 24;
+    const int64_t   n_head_kv = 8;
+    const int64_t   rel_extent = 1024;
+    const int64_t   pad       = 256;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_q, n_kv, n_seq, window, unified, kv_type);
+    }
+
+    double max_nmse_err() override {
+        return n_kv > 8192 ? 1e-3 : 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 4*n_head*n_q*n_kv*d*n_seq;
+    }
+
+    test_flash_attn_ext_banded_seq(int64_t n_q, int64_t n_kv, int64_t n_seq, int32_t window, bool unified, ggml_type kv_type)
+        : n_q(n_q), n_kv(n_kv), n_seq(n_seq), window(window), unified(unified), kv_type(kv_type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ns = unified ? 1 : n_seq;   // streams of the cache
+        ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, n_seq);
+        ggml_tensor * kc = ggml_new_tensor_4d(ctx, kv_type, d, n_head_kv, n_kv, ns);
+        ggml_tensor * vc = ggml_new_tensor_4d(ctx, kv_type, d, n_head_kv, n_kv, ns);
+        ggml_set_name(q, "q");
+        ggml_set_name(kc, "k_cache");
+        ggml_set_name(vc, "v_cache");
+        ggml_tensor * k = ggml_permute(ctx, ggml_view_4d(ctx, kc, d, n_head_kv, n_kv, n_seq, kc->nb[1], kc->nb[2],
+                unified ? 0 : kc->nb[3], 0), 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx, ggml_view_4d(ctx, vc, d, n_head_kv, n_kv, n_seq, vc->nb[1], vc->nb[2],
+                unified ? 0 : vc->nb[3], 0), 0, 2, 1, 3);
+        ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, rel_extent, n_head, n_q, n_seq);
+        ggml_set_name(r, "rel_logits");
+        ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, nullptr, r, 1.0f/float(d), rel_extent);
+        ggml_flash_attn_ext_banded_set_window(out, window);
+        ggml_tensor * sk = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_head, n_q, n_seq);
+        ggml_set_name(sk, "sinks");
+        ggml_flash_attn_ext_add_sinks(out, sk);
+        ggml_tensor * pq = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_q, n_seq);
+        ggml_tensor * pk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_seq);
+        ggml_set_name(pq, "pos_q");
+        ggml_set_name(pk, "pos_kv");
+        ggml_flash_attn_ext_banded_set_pos(out, pq, pk);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t n_real = n_kv - pad;
+        std::vector<int32_t> pk(n_kv*n_seq, -1);
+        std::vector<int32_t> pq(n_q*n_seq);
+        if (unified) {
+            // shared prefix, then blocks of 1, 3, 5, ... cells, owner s = block % n_seq
+            const int64_t n_pre = n_real/8;
+            std::vector<int32_t> next(n_seq, (int32_t) n_pre);
+            for (int64_t s = 0; s < n_seq; ++s) {
+                for (int64_t j = 0; j < n_pre; ++j) {
+                    pk[s*n_kv + j] = (int32_t) j;
+                }
+            }
+            int64_t j = n_pre;
+            for (int64_t b = 0; j < n_real; ++b) {
+                const int64_t owner = b % n_seq;
+                for (int64_t c = 0; c < 2*(b % 4) + 1 && j < n_real; ++c, ++j) {
+                    pk[owner*n_kv + j] = next[owner]++;
+                }
+            }
+            for (int64_t s = 0; s < n_seq; ++s) {
+                GGML_ASSERT(next[s] - n_q >= n_pre);   // the queries are tokens of the set's own cells
+                for (int64_t i = 0; i < n_q; ++i) {
+                    pq[s*n_q + i] = next[s] - (int32_t) n_q + (int32_t) i;
+                }
+            }
+        } else {
+            // per-slot cache: stream s holds P_s tokens in its first cells (P differs by stream), the rest empty
+            for (int64_t s = 0; s < n_seq; ++s) {
+                const int64_t P = std::max<int64_t>(n_q, n_real - 97*s - 13);
+                for (int64_t j = 0; j < P; ++j) {
+                    pk[s*n_kv + j] = (int32_t) j;
+                }
+                for (int64_t i = 0; i < n_q; ++i) {
+                    pq[s*n_q + i] = (int32_t) (P - n_q + i);
+                }
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pos_q") == 0) {
+                ggml_backend_tensor_set(t, pq.data(), 0, pq.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "pos_kv") == 0) {
+                ggml_backend_tensor_set(t, pk.data(), 0, pk.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "rel_logits") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (strcmp(t->name, "sinks") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t, -0.25f, 0.25f);
+            }
+        }
+    }
+};
+
 // banded FA with the band bias from its factors (ggml_flash_attn_ext_banded_set_rel_factors): table [d_rel, rel_extent]
 // (F32 or F16) and rcur [d_rel, n_head, n_q] instead of rel_logits; on the window rule (use_pos false) or with the token
 // positions of test_flash_attn_ext_banded_pos. The backend builds the bias per query chunk: n_q 300 has a part chunk.
@@ -11360,6 +11481,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // banded FA (Inkling 2; Unsloth's llama.cpp mix b12588-mix-c0c3de8)
+    // banded FA with token positions over 2 sequence sets (llama-server -np 2, unified or per-slot cache; np2 11-22):
+    // decode (1 and 4 rows: the decode kernel) and prefill (300 rows: the tensor-core kernel), global and SWA windows
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (bool unified : { true, false }) {
+            for (int32_t window : { INT32_MAX, 1024 }) {
+                for (int64_t n_q : { 1, 4, 300 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_banded_seq(n_q, 2304, 2, window, unified, t));
+                }
+            }
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 2, 1,  8,  8,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 16, 16,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2,  1, 64,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32));

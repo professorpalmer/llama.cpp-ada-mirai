@@ -891,9 +891,12 @@ public:
 
     // the token position held by each cell of the K/V view, -1 = empty (the banded op with positions, op E): any cell
     // order, the SWA ring past its wrap included
-    ggml_tensor * self_pos_kv     = nullptr; // I32 [n_kv]
-    ggml_tensor * self_pos_kv_swa = nullptr; // I32 [n_kv_swa]
+    ggml_tensor * self_pos_kv     = nullptr; // I32 [n_kv]     ([n_kv,     n_seqs] when pos_seq)
+    ggml_tensor * self_pos_kv_swa = nullptr; // I32 [n_kv_swa] ([n_kv_swa, n_seqs] when pos_seq)
     bool          use_pos         = false;
+    // more than one sequence in the context (n_seq_max > 1, llama-server -np > 1): one row of cell positions per
+    // sequence set of the ubatch, -1 for the cells of other sequences (the sequence check of the position form)
+    bool          pos_seq         = false;
 
     const uint32_t extent;
     const uint32_t extent_swa;

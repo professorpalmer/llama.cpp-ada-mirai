@@ -1393,6 +1393,26 @@ void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ub
     }
 }
 
+void llama_kv_cache::set_input_kv_pos_seq(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_rows = dst->ne[1];
+    // the ubatch holds n_seqs sequence sets of n_seq_tokens tokens each, set after set (split_equal)
+    GGML_ASSERT(n_rows == (int64_t) ubatch->n_seqs);
+    GGML_ASSERT(ubatch->n_tokens == ubatch->n_seqs*ubatch->n_seq_tokens);
+    int32_t * data = (int32_t *) dst->data;
+    for (int64_t s = 0; s < n_rows; ++s) {
+        // the first sequence id of the set's tokens, as the KQ mask (set_input_kq_mask) checks it
+        const llama_seq_id seq_id = ubatch->seq_id[s*ubatch->n_seq_tokens][0];
+        const auto & cells = v_cells.at(seq_to_stream.at(seq_id));
+        int32_t * row = data + s*n_kv;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            row[j] = (j >= (int64_t) cells.size() || cells.is_empty(j) || !cells.seq_has(j, seq_id)) ? -1 : (int32_t) cells.pos_get(j);
+        }
+    }
+}
+
 void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     const int64_t n_kv = dst->ne[0];
@@ -3098,6 +3118,10 @@ uint32_t llama_kv_cache_context::get_size() const {
 
 void llama_kv_cache_context::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_kv_pos(dst, ubatch);
+}
+
+void llama_kv_cache_context::set_input_kv_pos_seq(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_kv_pos_seq(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {

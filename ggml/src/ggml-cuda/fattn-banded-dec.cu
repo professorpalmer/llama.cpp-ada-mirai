@@ -794,7 +794,9 @@ static void banded_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         max_blocks_per_sm = 4;
     }
     const int ntiles_dst      = ntiles_x * n_groups * Q->ne[3];
-    const int ntiles_dst_eff  = bi ? n_groups * Q->ne[3] : ntiles_dst;
+    // batch-invariant: the KV split of a sequence does not depend on the query rows nor on the other sequences of the
+    // batch (Q->ne[3] streams, llama-server -np > 1; with one stream this is n_groups * Q->ne[3] as before)
+    const int ntiles_dst_eff  = bi ? n_groups : ntiles_dst;
     const int blocks_per_wave = nsm * max_blocks_per_sm;
     int parallel_blocks       = max_blocks_per_sm;
     const int parallel_blocks_max = bi ? std::max(parallel_blocks, 64) : std::max(1, ntiles_KV);
