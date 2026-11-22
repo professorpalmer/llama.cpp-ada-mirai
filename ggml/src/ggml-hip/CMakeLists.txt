@@ -61,6 +61,9 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+# No Mirai S kernels on ROCm (they need cublasLt): the same as GGML_CUDA_MIRAI=OFF on CUDA
+list(FILTER GGML_SOURCES_ROCM EXCLUDE REGEX ".*/mirai-s\\.cu$")
+add_compile_definitions(GGML_CUDA_NO_MIRAI)
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
@@ -89,6 +92,11 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+
+# escha-gemv.cu (the exllamav3 small-batch GEMV) includes <cuda_fp16.h> and <cooperative_groups.h> through the exl3/
+# headers: ROCm stand-ins for those two, on the include path of this one file only
+set_source_files_properties(../ggml-cuda/escha-gemv.cu PROPERTIES
+    INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/exl3/rocm/include)
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)

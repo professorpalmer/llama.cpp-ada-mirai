@@ -8,7 +8,16 @@
 // The escha code tensor has the layout of the exllamav3 trellis tensor [k/16][n/16][16K], so the kernel reads it as it is.
 // exllamav3 runs the three stages in one cooperative launch with grid.sync. A cooperative launch does not work in a CUDA graph capture, so the stages are plain kernels here.
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
+
+#if defined(GGML_USE_HIP)
+// ROCm: the exllamav3 headers take their ROCm branches (USE_ROCM). The tensor-core fragment ops (mma.sync m16n8k16,
+// ldmatrix.x4) are emulated with lane shuffles and FMAs in exl3/rocm/ptx_rocm.cuh, and exl3/rocm/compat_ggml.cuh
+// supplies the CUDA intrinsics HIP lacks; both from exllamav3 v1.6.7 (MIT, turboderp). The emulation sums each fragment
+// product in fp32 and rounds once, so results are close to, not bit-equal with, the NVIDIA build; and it is not fast.
+#define USE_ROCM 1
+#include "exl3/rocm/compat_ggml.cuh"
+#endif // defined(GGML_USE_HIP)
 
 // The exllamav3 headers take these from their util.cuh and util.h, which include PyTorch headers.
 #define CEIL_DIVIDE(x, size) (((x) + (size) - 1) / (size))
@@ -415,6 +424,14 @@ static bool escha_gemv_rows_aligned(const ggml_tensor * t) {
     return (uintptr_t) t->data%16 == 0 && t->nb[1]%16 == 0 && t->nb[2]%16 == 0;
 }
 
+// ROCm: every kernel in this file works on 32-lane warps (threadIdx.x/32, indexed shuffles within 32 lanes, the emulated
+// fragments of exl3/rocm/ptx_rocm.cuh). RDNA (wave32) takes them; wave64 devices (CDNA, GCN) take the fallbacks of the callers.
+#if defined(GGML_USE_HIP)
+#define ESCHA_GEMV_WAVE32_OR_RETURN(ctx) if (ggml_cuda_info().devices[(ctx).device].warp_size != 32) { return false; }
+#else
+#define ESCHA_GEMV_WAVE32_OR_RETURN(ctx)
+#endif // defined(GGML_USE_HIP)
+
 // GGML_ESCHA_GEMV_MAX_ROWS=n (default 48, 8 = one chunk only): a batch of 9 to n rows runs as chunks of 8 rows.
 // A chunk costs about as much as 1 row, and the tiled prefill kernel costs the same for 1 to 128 rows (about 6 chunks). A row has the same bits alone and in a chunk.
 int ggml_cuda_escha_gemv_max_rows() {
@@ -453,9 +470,13 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (!enabled || n_rows < 1 || n_rows > ggml_cuda_escha_gemv_max_rows() || (K != 2 && K != 3) || IC%128 != 0 || OC%128 != 0) {
         return false;
     }
+#if defined(GGML_USE_HIP)
+    ESCHA_GEMV_WAVE32_OR_RETURN(ctx);
+#else
     if (!ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
         return false;
     }
+#endif // defined(GGML_USE_HIP)
     if (!escha_gemv_rows_aligned(x) || !escha_gemv_rows_aligned(dst)) {
         return false;
     }
@@ -517,6 +538,7 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 bool ggml_cuda_escha_had_in(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * rin, half * xh) {
+    ESCHA_GEMV_WAVE32_OR_RETURN(ctx);
     if (!escha_gemv_rows_aligned(x) || (uintptr_t) xh%16 != 0) {
         return false;
     }
@@ -530,6 +552,7 @@ bool ggml_cuda_escha_had_in(ggml_backend_cuda_context & ctx, const ggml_tensor *
 }
 
 bool ggml_cuda_escha_had_out(ggml_backend_cuda_context & ctx, const float * mid, const ggml_tensor * rout, ggml_tensor * dst) {
+    ESCHA_GEMV_WAVE32_OR_RETURN(ctx);
     if (!escha_gemv_rows_aligned(dst) || (uintptr_t) mid%16 != 0) {
         return false;
     }
@@ -543,6 +566,7 @@ bool ggml_cuda_escha_had_out(ggml_backend_cuda_context & ctx, const float * mid,
 }
 
 bool ggml_cuda_escha_had_out_i32(ggml_backend_cuda_context & ctx, const int32_t * acc, const float * scales, const ggml_tensor * rout, ggml_tensor * dst) {
+    ESCHA_GEMV_WAVE32_OR_RETURN(ctx);
     if (!escha_gemv_rows_aligned(dst) || (uintptr_t) acc%16 != 0) {
         return false;
     }
@@ -557,6 +581,7 @@ bool ggml_cuda_escha_had_out_i32(ggml_backend_cuda_context & ctx, const int32_t 
 
 bool ggml_cuda_escha_swiglu_out(ggml_backend_cuda_context & ctx, const void * g, const void * u, const float * sg, const float * su,
                                 const ggml_tensor * rout_g, const ggml_tensor * rout_u, ggml_tensor * dst) {
+    ESCHA_GEMV_WAVE32_OR_RETURN(ctx);
     if (!escha_gemv_rows_aligned(dst) || (uintptr_t) g%16 != 0 || (uintptr_t) u%16 != 0) {
         return false;
     }
@@ -579,6 +604,7 @@ bool ggml_cuda_escha_swiglu_out(ggml_backend_cuda_context & ctx, const void * g,
 bool ggml_cuda_escha_swiglu_xh(ggml_backend_cuda_context & ctx, const void * g, const void * u, const float * sg, const float * su,
                                const ggml_tensor * rout_g, const ggml_tensor * rout_u, const ggml_tensor * rin, half * xh,
                                const int OC, const int n_rows) {
+    ESCHA_GEMV_WAVE32_OR_RETURN(ctx);
     if ((uintptr_t) g%16 != 0 || (uintptr_t) u%16 != 0 || (uintptr_t) xh%16 != 0) {
         return false;
     }
@@ -635,4 +661,4 @@ bool ggml_cuda_escha_had_out(ggml_backend_cuda_context & ctx, const float * mid,
     return false;
 }
 
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)

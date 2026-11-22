@@ -161,6 +161,11 @@ __launch_bounds__(NT, 1)
 static __global__ void fwht_quantize_q8_1(
         const T * x_ptr, const float * signs, void * vy_ptr,
         const int64_t ne00, const int64_t ne0, const uint32_t ne1, const uint3 ne2, const float scale) {
+#if defined(GGML_USE_HIP) && (defined(CDNA) || defined(GCN))
+    // wave64 devices: no fused quantizer (it reduces one 32-block per warp); ggml_cuda_fwht_quantize_supported is false there
+    GGML_UNUSED_VARS(x_ptr, signs, vy_ptr, ne00, ne0, ne1, ne2, scale);
+    NO_DEVICE_CODE;
+#else
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0 && NT % QK8_1 == 0, "bad fused FWHT shape");
@@ -252,6 +257,7 @@ static __global__ void fwht_quantize_q8_1(
             }
         }
     }
+#endif // defined(GGML_USE_HIP) && (defined(CDNA) || defined(GCN))
 }
 
 template <int N, typename T>
@@ -295,6 +301,11 @@ static void fwht_quantize_launch(
 }
 
 bool ggml_cuda_fwht_quantize_supported(const int n, const int64_t ne00) {
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 32) {
+        return false; // wave64: the fused kernel reduces one 32-block per warp
+    }
+#endif // defined(GGML_USE_HIP)
     switch (n) {
         case 64: case 128: case 256: case 512: case 1024: case 2048:
             break;

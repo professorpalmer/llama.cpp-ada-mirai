@@ -3,7 +3,9 @@
 #include "escha-gemv.cuh"
 #include "mmid.cuh"
 #include "mma.cuh"
+#if !defined(GGML_USE_HIP)
 #include <cuda_pipeline.h>
+#endif // !defined(GGML_USE_HIP)
 
 // Fused decode + routed matmul for Escha ESCHAM experts.
 //
@@ -59,6 +61,19 @@
 #define ESCHA_MMA_BN 128   //   BM*BN/256, so BM drives register pressure and occupancy.
 #define ESCHA_TM   8
 #define ESCHA_TN   8
+// Paths by vendor. AMD cc values carry GGML_CUDA_CC_OFFSET_AMD, so a plain "cc >= GGML_CUDA_CC_TURING" test is true on ROCm.
+//   ESCHA_MMA_TILES(cc): the tensor-core tile kernel (escha_matmul_dense_tiled_mma). NVIDIA only (no device code on ROCm).
+//   ESCHA_RECON_OK(cc):  the prefill by reconstruction (decode + BLAS GEMM). Turing and newer on NVIDIA; every ROCm device (hipBLAS).
+//   ESCHA_FUSE_OK:       the fused SwiGLU epilogue of the reconstruction path. Off on ROCm until it is checked on AMD.
+#if defined(GGML_USE_HIP)
+#define ESCHA_MMA_TILES(cc) false
+#define ESCHA_RECON_OK(cc)  true
+#define ESCHA_FUSE_OK       false
+#else
+#define ESCHA_MMA_TILES(cc) ((cc) >= GGML_CUDA_CC_TURING)
+#define ESCHA_RECON_OK(cc)  ((cc) >= GGML_CUDA_CC_TURING)
+#define ESCHA_FUSE_OK       true
+#endif // defined(GGML_USE_HIP)
 // prefill by reconstruction (escha_mul_mat_recon); the environment can change each value
 #define ESCHA_PREFILL_DEFAULT       ESCHA_PREFILL_RECON
 #define ESCHA_I8_WSCALE             32.0f   // int8 weights of the i8 path: round(w*32)
@@ -75,12 +90,19 @@
 // same QTIP-family trick as 3INST but with its own multiplier and no addend. Recovered
 // from escham_reconstruct_kernel<1, K> and checked against all 65536 entries.
 // The fp16 add must stay in fp16 to match the table bit for bit.
+//
+// (x & 0x8fff8fff) ^ 0x3b603b60 is one 3-input logic op; spelling it as lop3 stops
+// ptxas from splitting it across the two 16-bit lanes. immLut 0x6a = (a & b) ^ c.
+// ROCm has no inline PTX: the same function in C.
+#if defined(GGML_USE_HIP)
+#define ESCHA_LOP3_6A(x) (x) = ((x) & 0x8fff8fffu) ^ 0x3b603b60u
+#else
+#define ESCHA_LOP3_6A(x) asm("lop3.b32 %0, %1, %2, %3, 0x6a;" : "=r"(x) : "r"(x), "n"(0x8fff8fffu), "n"(0x3b603b60u))
+#endif // defined(GGML_USE_HIP)
+
 static __device__ __forceinline__ float escha_codebook(uint32_t idx) {
-    // (x & 0x8fff8fff) ^ 0x3b603b60 is one 3-input logic op; spelling it as lop3 stops
-    // ptxas from splitting it across the two 16-bit lanes. immLut 0x6a = (a & b) ^ c.
     uint32_t x = idx*0xcbac1fedu;
-    asm("lop3.b32 %0, %1, %2, %3, 0x6a;"
-        : "=r"(x) : "r"(x), "n"(0x8fff8fffu), "n"(0x3b603b60u));
+    ESCHA_LOP3_6A(x);
     __half2 h;
     memcpy(&h, &x, sizeof(h));
     return __half2float(__hadd(__low2half(h), __high2half(h)));
@@ -90,8 +112,7 @@ static __device__ __forceinline__ float escha_codebook(uint32_t idx) {
 // an fp16 add, so the fp16 weight is exact -- only the ACTIVATIONS lose precision below.
 static __device__ __forceinline__ half escha_codebook_h(uint32_t idx) {
     uint32_t x = idx*0xcbac1fedu;
-    asm("lop3.b32 %0, %1, %2, %3, 0x6a;"
-        : "=r"(x) : "r"(x), "n"(0x8fff8fffu), "n"(0x3b603b60u));
+    ESCHA_LOP3_6A(x);
     __half2 h;
     memcpy(&h, &x, sizeof(h));
     return __hadd(__low2half(h), __high2half(h));
@@ -1270,6 +1291,13 @@ static escha_prefill_mode escha_prefill() {
         if (e == nullptr) {
             return ESCHA_PREFILL_DEFAULT;
         }
+#if defined(GGML_USE_HIP)
+        // ROCm: the int8 read is not checked on AMD yet. It takes the exact read, unless GGML_ESCHA_HIP_I8=1 (test switch).
+        if (strcmp(e, "i8") == 0 && getenv("GGML_ESCHA_HIP_I8") == nullptr) {
+            GGML_LOG_WARN("escha: GGML_ESCHA_PREFILL=i8 is off on ROCm, using the exact read (recon); GGML_ESCHA_HIP_I8=1 to test it\n");
+            return ESCHA_PREFILL_RECON;
+        }
+#endif // defined(GGML_USE_HIP)
         return strcmp(e, "i8") == 0 ? ESCHA_PREFILL_I8 : strcmp(e, "recon") == 0 ? ESCHA_PREFILL_RECON : ESCHA_PREFILL_MMA;
     }();
     return mode;
@@ -1371,7 +1399,7 @@ static escha_prefill_mode escha_prefill_for(ggml_backend_cuda_context & ctx, con
     const bool want_i8 = escha_prefill() == ESCHA_PREFILL_I8;
 
     if (n_rows <= ESCHA_GEN_MAX_ROWS || n_rows < (want_i8 ? escha_i8_min_rows() : escha_recon_min_rows())
-            || ggml_cuda_info().devices[ctx.device].cc < GGML_CUDA_CC_TURING
+            || !ESCHA_RECON_OK(ggml_cuda_info().devices[ctx.device].cc)
             || OC % ESCHA_MMA_BN != 0
             || getenv("ESCHA_NO_MMA") != nullptr) {
         return ESCHA_PREFILL_MMA;
@@ -1469,7 +1497,7 @@ static bool escha_ranges_overlap(const void * a, const void * b, const size_t by
 // GGML_ESCHA_FUSE_SWIGLU=0: no fused epilogue (each node runs alone). GGML_ESCHA_FUSE_SWIGLU=1: the form without down only.
 bool ggml_cuda_op_escha_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * mul, ggml_tensor * down) {
     static const int level = getenv("GGML_ESCHA_FUSE_SWIGLU") == nullptr ? 2 : atoi(getenv("GGML_ESCHA_FUSE_SWIGLU"));
-    if (level <= 0 || (down != nullptr && level < 2)) {
+    if (!ESCHA_FUSE_OK || level <= 0 || (down != nullptr && level < 2)) {
         return false;
     }
 
@@ -1576,7 +1604,7 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const bool specb   = n_rows > 1 && n_rows <= ESCHA_GEN_MAX_ROWS;
     const bool gen     = decode1 || specb;
     const bool use_mma = !gen
-                      && ggml_cuda_info().devices[ctx.device].cc >= GGML_CUDA_CC_TURING
+                      && ESCHA_MMA_TILES(ggml_cuda_info().devices[ctx.device].cc)
                       && OC % ESCHA_MMA_BN == 0
                       && getenv("ESCHA_NO_MMA") == nullptr;
 
