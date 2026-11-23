@@ -232,8 +232,19 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_inp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,     "weight", i), {n_embd, n_expert}, 0);
         layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
         if (escha_version != 0) {
-            load_escha_exps(layer.ffn_gate_up_escha, LLM_TENSOR_FFN_GATE_UP_EXPS, i, n_embd,   2*n_ff_exp);
-            load_escha_exps(layer.ffn_down_escha,    LLM_TENSOR_FFN_DOWN_EXPS,    i, n_ff_exp, n_embd);
+            // per tensor: escha code where the file has it, else a plain ggml tensor (with its per-expert .scale, loaded
+            // by the generic code), e.g. the official NVFP4 values of a down projection in an escha file (M2+)
+            const auto has_code = [&](llm_tensor t) { return ml.get_weight(tn(t, "escha_code", i).str().c_str()) != nullptr; };
+            if (has_code(LLM_TENSOR_FFN_GATE_UP_EXPS)) {
+                load_escha_exps(layer.ffn_gate_up_escha, LLM_TENSOR_FFN_GATE_UP_EXPS, i, n_embd, 2*n_ff_exp);
+            } else {
+                layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
+            }
+            if (has_code(LLM_TENSOR_FFN_DOWN_EXPS)) {
+                load_escha_exps(layer.ffn_down_escha, LLM_TENSOR_FFN_DOWN_EXPS, i, n_ff_exp, n_embd);
+            } else {
+                layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+            }
         } else {
             layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
             layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
@@ -913,7 +924,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
                 layer.ffn_gate_exps_s,
                 layer.ffn_down_exps_s,
                 nullptr,
-                escha.active() ? &escha : nullptr);
+                (escha.down.active() || escha.gate_up.active()) ? &escha : nullptr);   // M2+: either matrix may be plain
 
         cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
         cb(cur, "ffn_out", il);
