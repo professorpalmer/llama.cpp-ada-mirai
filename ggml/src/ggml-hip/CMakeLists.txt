@@ -97,6 +97,12 @@ ggml_add_backend_library(ggml-hip
 # headers: ROCm stand-ins for those two, on the include path of this one file only
 set_source_files_properties(../ggml-cuda/escha-gemv.cu PROPERTIES
     INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/exl3/rocm/include)
+# Windows: the ROCm of TheRock's wheels has no libhipcxx, so <cuda/atomic> (also named by the exl3/ headers) comes from
+# a stand-in too; Linux keeps libhipcxx's header
+if (WIN32)
+    set_property(SOURCE ../ggml-cuda/escha-gemv.cu APPEND PROPERTY
+        INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/exl3/rocm/include-win)
+endif()
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)

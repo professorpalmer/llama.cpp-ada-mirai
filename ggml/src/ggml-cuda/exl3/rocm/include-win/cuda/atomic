@@ -1,0 +1,44 @@
+// ROCm stand-in for <cuda/atomic>, which exl3/ptx.cuh includes. The ROCm of TheRock's Windows wheels has no libhipcxx
+// (the Linux ROCm has it, and the Linux build uses it: this folder is on the include path of escha-gemv.cu in the
+// Windows HIP build only, ggml/src/ggml-hip/CMakeLists.txt). It has the part of the header that ptx.cuh names:
+// cuda::atomic_ref with load / store / fetch_add, on the clang HIP scoped atomic builtins (group_barrier in ptx.cuh;
+// the Kintsugi engine does not call it).
+#pragma once
+#include <hip/hip_runtime.h>
+
+namespace cuda {
+
+enum thread_scope { thread_scope_system, thread_scope_device, thread_scope_block, thread_scope_thread };
+
+enum memory_order {
+    memory_order_relaxed = __ATOMIC_RELAXED,
+    memory_order_consume = __ATOMIC_CONSUME,
+    memory_order_acquire = __ATOMIC_ACQUIRE,
+    memory_order_release = __ATOMIC_RELEASE,
+    memory_order_acq_rel = __ATOMIC_ACQ_REL,
+    memory_order_seq_cst = __ATOMIC_SEQ_CST,
+};
+
+template <typename T, thread_scope S = thread_scope_system>
+struct atomic_ref {
+    static constexpr int hip_scope =
+        S == thread_scope_system ? __HIP_MEMORY_SCOPE_SYSTEM :
+        S == thread_scope_device ? __HIP_MEMORY_SCOPE_AGENT :
+        S == thread_scope_block  ? __HIP_MEMORY_SCOPE_WORKGROUP : __HIP_MEMORY_SCOPE_SINGLETHREAD;
+
+    T * p;
+
+    __host__ __device__ explicit atomic_ref(T & r) : p(&r) {}
+
+    __device__ T load(memory_order o = memory_order_seq_cst) const {
+        return __hip_atomic_load(p, o, hip_scope);
+    }
+    __device__ void store(T v, memory_order o = memory_order_seq_cst) const {
+        __hip_atomic_store(p, v, o, hip_scope);
+    }
+    __device__ T fetch_add(T v, memory_order o = memory_order_seq_cst) const {
+        return __hip_atomic_fetch_add(p, v, o, hip_scope);
+    }
+};
+
+} // namespace cuda
