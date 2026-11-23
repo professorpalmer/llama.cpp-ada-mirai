@@ -377,6 +377,23 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
 
 enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head };
 
+#ifdef GGML_USE_HIP
+static bool ggml_cuda_hip_gdn_mma_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_HIP_GDN_MMA");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+static int64_t ggml_cuda_hip_gdn_mma_min() {
+    static const int64_t n = [] {
+        const char * e = getenv("GGML_HIP_GDN_MMA_MIN");
+        return (int64_t) (e != nullptr ? std::max(64, atoi(e)) : 64);
+    }();
+    return n;
+}
+#endif // GGML_USE_HIP
+
 static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     if (!a.eligible || a.H_k != 16 || (a.H != 16 && a.H != 32 && a.H != 48 && a.H != 64) || a.n_tokens < 64 ||
@@ -385,7 +402,11 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
     }
     const auto & info = ggml_cuda_info().devices[device];
 #ifdef GGML_USE_HIP
-    if (!GGML_CUDA_CC_IS_RDNA3_5(info.cc) || a.n_tokens < 2048) {
+    // GGML_HIP_GDN_MMA=1 (test switch, amd-test-3): RDNA3.0 (gfx1100 / gfx1101, the same gfx11 WMMA device code as
+    // RDNA3.5) takes the chunked kernel too, from GGML_HIP_GDN_MMA_MIN tokens in one call (default 64; RDNA3.5 keeps
+    // its 2048 when the switch is not set). Not on RDNA4: the kernel has device code for gfx11 only.
+    if (!(GGML_CUDA_CC_IS_RDNA3_5(info.cc) || (GGML_CUDA_CC_IS_RDNA3_0(info.cc) && ggml_cuda_hip_gdn_mma_on()))
+            || a.n_tokens < (ggml_cuda_hip_gdn_mma_on() ? ggml_cuda_hip_gdn_mma_min() : 2048)) {
         return gdn_path::ar;
     }
     return init<16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
@@ -415,7 +436,7 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
 bool ggml_cuda_gdn_mma_device_supported(int device) {
     const int cc = ggml_cuda_info().devices[device].cc;
 #ifdef GGML_USE_HIP
-    return GGML_CUDA_CC_IS_RDNA3_5(cc);
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) || (GGML_CUDA_CC_IS_RDNA3_0(cc) && ggml_cuda_hip_gdn_mma_on());
 #elif defined(GGML_USE_MUSA)
     GGML_UNUSED(cc);
     return false;

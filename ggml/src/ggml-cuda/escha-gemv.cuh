@@ -19,3 +19,5 @@ bool ggml_cuda_escha_swiglu_out(ggml_backend_cuda_context & ctx, const void * g,
 bool ggml_cuda_escha_swiglu_xh(ggml_backend_cuda_context & ctx, const void * g, const void * u, const float * sg, const float * su,
                                const ggml_tensor * rout_g, const ggml_tensor * rout_u, const ggml_tensor * rin, half * xh,
                                int OC, int n_rows);
+//   ROCm (GGML_ESCHA_HIP_GEMM=f16): dst[row] = T128(mid[row]) * rout with mid in fp16; returns false off ROCm or when not aligned
+bool ggml_cuda_escha_had_out_h(ggml_backend_cuda_context & ctx, const half * mid, const ggml_tensor * rout, ggml_tensor * dst);

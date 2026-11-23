@@ -64,11 +64,11 @@
 // Paths by vendor. AMD cc values carry GGML_CUDA_CC_OFFSET_AMD, so a plain "cc >= GGML_CUDA_CC_TURING" test is true on ROCm.
 //   ESCHA_MMA_TILES(cc): the tensor-core tile kernel (escha_matmul_dense_tiled_mma). NVIDIA only (no device code on ROCm).
 //   ESCHA_RECON_OK(cc):  the prefill by reconstruction (decode + BLAS GEMM). Turing and newer on NVIDIA; every ROCm device (hipBLAS).
-//   ESCHA_FUSE_OK:       the fused SwiGLU epilogue of the reconstruction path. Off on ROCm until it is checked on AMD.
+//   ESCHA_FUSE_OK:       the fused SwiGLU epilogue of the reconstruction path. On ROCm: off unless GGML_ESCHA_HIP_FUSE=1.
 #if defined(GGML_USE_HIP)
 #define ESCHA_MMA_TILES(cc) false
 #define ESCHA_RECON_OK(cc)  true
-#define ESCHA_FUSE_OK       false
+#define ESCHA_FUSE_OK       escha_hip_fuse()   // GGML_ESCHA_HIP_FUSE=1 (amd-test-3 switch); default off
 #else
 #define ESCHA_MMA_TILES(cc) ((cc) >= GGML_CUDA_CC_TURING)
 #define ESCHA_RECON_OK(cc)  ((cc) >= GGML_CUDA_CC_TURING)
@@ -1335,7 +1335,7 @@ static size_t escha_recon_max_bytes() {
 //   q != nullptr: the int8 rows of escha_quantize_rows_i8, int8 weights, int32 sum (partial has int32 values)
 static void escha_mul_mat_recon(
         ggml_backend_cuda_context & ctx, const int16_t * code, const half * u, const int8_t * q, float * partial,
-        const int K, const int IC, const int OC, const int n_rows) {
+        const int K, const int IC, const int OC, const int n_rows, half * partial_h = nullptr) {
     cudaStream_t stream = ctx.stream();
 
     const bool   i8 = q != nullptr;
@@ -1379,15 +1379,38 @@ static void escha_mul_mat_recon(
         } else {
             const float alpha = 1.0f;
             const float beta  = 0.0f;
+            // partial_h (ROCm, GGML_ESCHA_HIP_GEMM=f16): the same GEMM with fp16 output
             CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n_oc, n_rows, IC,
                 &alpha, w_buf.get(),   CUDA_R_16F, IC,
                         u,             CUDA_R_16F, IC,
-                &beta,  partial + oc0, CUDA_R_32F, OC,
+                &beta,  partial_h ? (void *) (partial_h + oc0) : (void *) (partial + oc0), partial_h ? CUDA_R_16F : CUDA_R_32F, OC,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         }
     }
 }
 
+#if defined(GGML_USE_HIP)
+// amd-test-3 switches of the prompt read on ROCm (each one is off by default until the AMD self-test passes it on a card)
+//   GGML_ESCHA_HIP_FUSE=1:    the fused SwiGLU epilogue (ggml_cuda_op_escha_swiglu) on the fp32 GEMM path
+//   GGML_ESCHA_HIP_GEMM=f16:  the exact read's GEMM writes fp16 (fp32 sums, one rounding at the end: HHS), then the output
+//                             rotation reads fp16. rocBLAS has more tuned RDNA3 kernels for fp16 output than for fp32 output
+//                             (upstream ggml takes fp16 output on RDNA3 for the same reason, ggml-cuda.cu prefer_f32_output).
+static bool escha_hip_fuse() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_ESCHA_HIP_FUSE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+static bool escha_hip_gemm_f16() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_ESCHA_HIP_GEMM");
+        return e != nullptr && strcmp(e, "f16") == 0;
+    }();
+    return on;
+}
+#endif // defined(GGML_USE_HIP)
+#line 1392
 // The prefill path of a projection node for its batch: recon or i8, or mma when the batch does not take the reconstruction path
 static escha_prefill_mode escha_prefill_for(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     const ggml_tensor * code = dst->src[0];
@@ -1419,7 +1442,7 @@ static escha_prefill_mode escha_prefill_for(ggml_backend_cuda_context & ctx, con
 // i8: the rows are quantized first, partial has int32 sums and scales[row] is their fp32 factor.
 // xh_ready: the rotated input in fp16 when a fused epilogue made it already.
 static void escha_recon_stage(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const bool i8, float * partial, float * scales,
-                              const half * xh_ready = nullptr) {
+                              const half * xh_ready = nullptr, half * partial_h = nullptr) {
     const ggml_tensor * code = dst->src[0];
     const ggml_tensor * rin  = dst->src[1];
     const ggml_tensor * x    = dst->src[5];
@@ -1450,7 +1473,7 @@ static void escha_recon_stage(ggml_backend_cuda_context & ctx, const ggml_tensor
         CUDA_CHECK(cudaGetLastError());
         escha_mul_mat_recon(ctx, (const int16_t *) code->data, nullptr, q_buf.get(), partial, K, IC, OC, n_rows);
     } else {
-        escha_mul_mat_recon(ctx, (const int16_t *) code->data, xh, nullptr, partial, K, IC, OC, n_rows);
+        escha_mul_mat_recon(ctx, (const int16_t *) code->data, xh, nullptr, partial, K, IC, OC, n_rows, partial_h);
     }
 }
 
@@ -1465,6 +1488,17 @@ static void escha_recon_node(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
     // the GEMM writes into dst when its rows are contiguous, and the output rotation then works in place
     const bool in_place = dst->nb[1] == (size_t) OC*sizeof(float) && dst->nb[2] == dst->nb[1]*dst->ne[1];
 
+#if defined(GGML_USE_HIP)
+    // GGML_ESCHA_HIP_GEMM=f16: fp16 GEMM output in a scratch buffer, then the output rotation from fp16
+    if (!i8 && escha_hip_gemm_f16()) {
+        ggml_cuda_pool_alloc<half> h_buf(ctx.pool(), (size_t) n_rows*OC);
+        escha_recon_stage(ctx, dst, false, nullptr, nullptr, xh_ready, h_buf.get());
+        if (ggml_cuda_escha_had_out_h(ctx, h_buf.get(), rout, dst)) {
+            return;
+        }
+        GGML_ABORT("escha: GGML_ESCHA_HIP_GEMM=f16 needs 16-byte aligned rows");
+    }
+#endif // defined(GGML_USE_HIP)
     ggml_cuda_pool_alloc<float> p_buf(ctx.pool());
     ggml_cuda_pool_alloc<float> s_buf(ctx.pool());
     float * partial = in_place ? (float *) dst->data : p_buf.alloc((size_t) n_rows*OC);

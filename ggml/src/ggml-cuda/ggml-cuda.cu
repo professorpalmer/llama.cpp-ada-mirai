@@ -6159,7 +6159,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     CUDA_CHECK(cudaEventDestroy(pe.second));
                 }
                 CUDA_CHECK(cudaEventDestroy(end));
-                if (++n_graphs % 100 == 0) {
+                // GGML_CUDA_OP_TIMING=n (n >= 2): print every n graphs (a prompt read of 8,192 tokens at ub 1024 is 8 graphs); else every 100
+                static const int every = [] { const int n = atoi(getenv("GGML_CUDA_OP_TIMING")); return n >= 2 ? n : 100; }();
+                if (++n_graphs % every == 0) {
                     std::vector<std::pair<std::string, acc>> v(totals.begin(), totals.end());
                     std::sort(v.begin(), v.end(), [](auto & x, auto & y) { return x.second.ms > y.second.ms; });
                     GGML_LOG_WARN("op timing over %lld graphs: %.3f ms per graph\n", (long long) n_graphs, ms_graphs / n_graphs);

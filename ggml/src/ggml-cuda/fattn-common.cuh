@@ -1385,7 +1385,7 @@ void launch_fattn(
         const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
         // a chunk launch keeps one block per output tile: every block writes its partial result and meta
-        const bool use_stream_k = !chunk && (cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75);
+        const bool use_stream_k = !chunk && (cc >= GGML_CUDA_CC_ADA_LOVELACE && !(amd_wmma_available(cc) && DV != 64 && [] { static const bool on = getenv("GGML_HIP_FA_MMA256") != nullptr && atoi(getenv("GGML_HIP_FA_MMA256")) != 0; return on; }()) || amd_wmma_available(cc) && DV == 64 || tiles_efficiency_percent < 75);   // GGML_HIP_FA_MMA256: the AMD WMMA rule of ggml-org/llama.cpp#28102
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;

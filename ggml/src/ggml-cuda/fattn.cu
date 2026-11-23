@@ -10,6 +10,18 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#if defined(GGML_USE_HIP)
+// GGML_HIP_FA_MMA256=1: the amd-test-3 switch for the WMMA flash-attention kernel with head size 256 on RDNA3 / RDNA4
+// (upstream ggml-org/llama.cpp#28102, ilintar). Off by default until it passes the AMD self-test (KL) on a card.
+static bool ggml_cuda_hip_fa_mma256() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_HIP_FA_MMA256");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+#endif // defined(GGML_USE_HIP)
+#line 13
 
 template <int DKQ, int DV, int ncols2, ggml_type type_KV = GGML_TYPE_F16>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -71,7 +83,26 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
-    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    const int gqa_ratio = Q->ne[2] / K->ne[2];  // ncols2 on AMD WMMA: see GGML_HIP_FA_MMA256 below
+#if defined(GGML_USE_HIP)
+    // GGML_HIP_FA_MMA256=1 (amd-test-3 switch): on RDNA the GQA columns are the smallest power of 2 that divides the
+    // ratio (less wasted compute than padding to 8), from upstream ggml-org/llama.cpp#28102 (ilintar, gfx1201 tuning).
+    if (amd_wmma_available(cc) && ggml_cuda_hip_fa_mma256()) {
+        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, type_KV>(ctx, dst);
+            return;
+        }
+        if (use_gqa_opt && gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, type_KV>(ctx, dst);
+            return;
+        }
+        if (use_gqa_opt && gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_KV>(ctx, dst);
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+#line 75
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
@@ -575,7 +606,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
         return BEST_FATTN_KERNEL_MMA_F16;
+    }  // AMD WMMA, head size <= 128
+#if defined(GGML_USE_HIP)
+    // GGML_HIP_FA_MMA256=1 (amd-test-3 switch): head size 256 on the WMMA kernel when the tile is wide (Q columns x GQA
+    // > 16, i.e. prompt reads), from upstream ggml-org/llama.cpp#28102 (ilintar). Default: the tile kernel, as before.
+    if (amd_wmma_available(cc) && ggml_cuda_hip_fa_mma256() && gqa_opt_applies && Q->ne[0] == 256 && Q->ne[1] * gqa_ratio_eff > 16) {
+        return BEST_FATTN_KERNEL_MMA_F16;
     }
+#endif // defined(GGML_USE_HIP)
+#line 579
 
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
