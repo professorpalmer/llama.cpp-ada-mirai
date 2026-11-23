@@ -96,10 +96,12 @@ static int escha_rdna_splitk_warps(int k_tiles, int n_tiles) {
 // GGML_ESCHA_HIP_GEMV: (not set) = the exact fp32 kernels of escha-moe.cu; rdna = the native one-row kernel below for 1 row;
 // rdna8 (amd-test-3) = the multi-row direct core for 1 to GGML_ESCHA_GEMV_MAX_ROWS rows (chunks of 8): verify rows give
 // the same bits as a row decoded alone, so drafting on / off stays identical.
+// split (amd-test-4) = rdna for 1 row and the multi-row core for 2 to GGML_ESCHA_GEMV_MAX_ROWS rows: the faster kernel of
+// each (RX 7900 XTX: 1 row 36.6 vs 29.9 tok/s, 4 rows 75 vs 56); verify rows and decode rows then differ in the last bits.
 static int escha_hip_gemv_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_ESCHA_HIP_GEMV");
-        return e == nullptr ? 0 : strcmp(e, "rdna") == 0 ? 1 : strcmp(e, "rdna8") == 0 ? 2 : 0;
+        return e == nullptr ? 0 : strcmp(e, "rdna") == 0 ? 1 : strcmp(e, "rdna8") == 0 ? 2 : strcmp(e, "split") == 0 ? 3 : 0;
     }();
     return mode;
 }
@@ -726,7 +728,7 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // calls that the native RDNA one-row GEMV (escha_gemv_rdna_m1) handles; every other call returns false here, before
     // any work, and the caller takes the exact fp32 kernels of escha-moe.cu.
     GGML_UNUSED(cfg_env);
-    if (escha_hip_gemv_mode() == 0 || (n_rows != 1 && escha_hip_gemv_mode() != 2) || OC/16 > EXL3_GEMV_SPLITK_MAX_TILES) {
+    if (escha_hip_gemv_mode() == 0 || (n_rows != 1 && escha_hip_gemv_mode() < 2) || OC/16 > EXL3_GEMV_SPLITK_MAX_TILES) {
         return false;
     }
 #else
@@ -751,8 +753,9 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // ROCm: the native RDNA one-row GEMV only (the checks above made sure that it takes this call). escha_gemv_kernel is
     // not instantiated on ROCm, so no trap code is in the build.
     ggml_cuda_pool_alloc<float> c1(ctx.pool(), (size_t) n_rows*OC);
-    if (escha_hip_gemv_mode() == 2) {
-        // rdna8: chunks of up to 8 rows on the multi-row direct core (also for 1 row, so verify = decode bit for bit)
+    if (escha_hip_gemv_mode() == 2 || (escha_hip_gemv_mode() == 3 && n_rows > 1)) {
+        // rdna8: chunks of up to 8 rows on the multi-row direct core (also for 1 row, so verify = decode bit for bit);
+        // split: the same for 2+ rows, the one-row kernel below for 1 row
         for (int row0 = 0; row0 < n_rows; row0 += 8) {
             escha_gemv_rdna_mr(xh.get() + (size_t) row0*IC, (const uint16_t *) code->data, c1.get() + (size_t) row0*OC,
                                IC, OC, K, MIN(8, n_rows - row0), stream);
