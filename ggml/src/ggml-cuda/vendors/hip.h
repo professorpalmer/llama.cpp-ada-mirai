@@ -49,6 +49,9 @@
 #define cublasHandle_t hipblasHandle_t
 #define cublasSetMathMode(handle, mode) CUBLAS_STATUS_SUCCESS
 #define cublasSetStream hipblasSetStream
+#if HIP_VERSION >= 70000000
+#define cublasSetWorkspace hipblasSetWorkspace   // ggml-org/llama.cpp#31838 (fox5611); used only with GGML_HIP_BLAS_WS=1
+#endif // HIP_VERSION >= 70000000
 #define cublasSgemm hipblasSgemm
 #define cublasSgemmBatched hipblasSgemmBatched
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
