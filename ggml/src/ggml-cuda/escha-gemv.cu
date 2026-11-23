@@ -564,7 +564,16 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #if defined(GGML_USE_HIP)
     ESCHA_GEMV_WAVE32_OR_RETURN(ctx);
+    // ROCm: escha_gemv_kernel has a body only under AMPERE_MMA_AVAILABLE, which HIP never defines; on ROCm it is
+    // NO_DEVICE_CODE (a trap at run time: HSA error 0x1016 on an RX 7900 XTX, 11-22). So on ROCm this path takes only the
+    // calls that the native RDNA one-row GEMV (escha_gemv_rdna_m1) handles; every other call returns false here, before
+    // any work, and the caller takes the exact fp32 kernels of escha-moe.cu.
+    GGML_UNUSED(cfg_env);
+    if (n_rows != 1 || !escha_hip_gemv_rdna() || OC/16 > EXL3_GEMV_SPLITK_MAX_TILES) {
+        return false;
+    }
 #else
+#line 568
     if (!ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
         return false;
     }
@@ -582,16 +591,18 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     CUDA_CHECK(cudaGetLastError());
 
 #if defined(GGML_USE_HIP)
-    if (n_rows == 1 && escha_hip_gemv_rdna()) {
-        ggml_cuda_pool_alloc<float> c1(ctx.pool(), (size_t) OC);
-        if (escha_gemv_rdna_m1(xh.get(), (const uint16_t *) code->data, c1.get(), IC, OC, K, stream)) {
-            escha_gemv_had_out<<<(OC/128 + 7)/8, 256, 0, stream>>>(
-                c1.get(), (const half *) rout->data, (float *) dst->data, OC, 1, (int) x->ne[1], dst->nb[1], dst->nb[2]);
-            CUDA_CHECK(cudaGetLastError());
-            return true;
-        }
+    // ROCm: the native RDNA one-row GEMV only (the checks above made sure that it takes this call). escha_gemv_kernel is
+    // not instantiated on ROCm, so no trap code is in the build.
+    ggml_cuda_pool_alloc<float> c1(ctx.pool(), (size_t) OC);
+    if (!escha_gemv_rdna_m1(xh.get(), (const uint16_t *) code->data, c1.get(), IC, OC, K, stream)) {
+        return false;   // not reached (the same tile limit is checked above); dst is not written, the caller recomputes it
     }
-#endif // defined(GGML_USE_HIP)
+    escha_gemv_had_out<<<(OC/128 + 7)/8, 256, 0, stream>>>(
+        c1.get(), (const half *) rout->data, (float *) dst->data, OC, 1, (int) x->ne[1], dst->nb[1], dst->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+#else
+#line 595
 
     // exllamav3 on Ada (exl3_gemv_cfg): narrow up to n = 8192, wide above
     const int cfg = cfg_env != CFG_EXL3 ? cfg_env : OC <= 8192 ? CFG_NARROW : CFG_WIDE;
@@ -639,6 +650,8 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
     return true;
+#endif // defined(GGML_USE_HIP)
+#line 642
 }
 
 bool ggml_cuda_escha_had_in(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * rin, half * xh) {
