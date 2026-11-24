@@ -1315,7 +1315,9 @@ static __global__ void __launch_bounds__(256) escha_i8_fused_kernel(
     __shared__ __align__(16) int s_w[128*ESCHA_F8_STRIDE];
     __shared__ __align__(16) int s_q[BM*ESCHA_F8_STRIDE];
 
-    const int tid  = threadIdx.x;
+    // blocks of (32, 8): the tile types of mma.cuh read threadIdx.x as the lane (amd-test-5 launched 256 x 1 and wrote
+    // past the output on gfx1100: tools/amd_speed/fused_bounds_check.py)
+    const int tid  = threadIdx.y*32 + threadIdx.x;
     const int kt   = tid/128;         // which of the two k-tiles of a k-step this thread decodes
     const int t    = tid%128;
     const int grp  = t/ESCHA_TILE;
@@ -1421,10 +1423,10 @@ static bool escha_i8_fused(ggml_backend_cuda_context & ctx, const int16_t * code
     cudaStream_t stream = ctx.stream();
     const dim3 grid(OC/128, (n_rows + bm - 1)/bm);
     switch (2*K + (bm == 256 ? 1 : 0)) {
-        case 4: escha_i8_fused_kernel<2, 128><<<grid, 256, 0, stream>>>(code, q, out, IC, OC, n_rows); break;
-        case 5: escha_i8_fused_kernel<2, 256><<<grid, 256, 0, stream>>>(code, q, out, IC, OC, n_rows); break;
-        case 6: escha_i8_fused_kernel<3, 128><<<grid, 256, 0, stream>>>(code, q, out, IC, OC, n_rows); break;
-        case 7: escha_i8_fused_kernel<3, 256><<<grid, 256, 0, stream>>>(code, q, out, IC, OC, n_rows); break;
+        case 4: escha_i8_fused_kernel<2, 128><<<grid, dim3(32, 8), 0, stream>>>(code, q, out, IC, OC, n_rows); break;
+        case 5: escha_i8_fused_kernel<2, 256><<<grid, dim3(32, 8), 0, stream>>>(code, q, out, IC, OC, n_rows); break;
+        case 6: escha_i8_fused_kernel<3, 128><<<grid, dim3(32, 8), 0, stream>>>(code, q, out, IC, OC, n_rows); break;
+        case 7: escha_i8_fused_kernel<3, 256><<<grid, dim3(32, 8), 0, stream>>>(code, q, out, IC, OC, n_rows); break;
         default: return false;
     }
     CUDA_CHECK(cudaGetLastError());
