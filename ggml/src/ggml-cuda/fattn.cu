@@ -1623,7 +1623,32 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (mask_in && mask_in->type == GGML_TYPE_I32 && best_for_mask != BEST_FATTN_KERNEL_MMA_F16) {
         const int64_t n_words = mask_in->ne[0];
         const int64_t rows    = mask_in->ne[1]*mask_in->ne[2]*mask_in->ne[3];
+#if defined(GGML_USE_HIP)
+        // amd-rc1: HIP builds have no VMM pool. The fp16 copy grows with the prompt (n_kv x rows x 2 bytes, one micro-
+        // batch more each step), so a long read asked the legacy pool for a larger block again and again: a new
+        // allocation, and with the trim of amd-test-5c a device sync and frees, at every 5 % of growth. On a desktop
+        // RX 7900 XTX (amd-test-5c, Lazm) the 245,000-token read then stopped at 202,752 tokens with the GPU idle and a
+        // host thread spinning in the HIP runtime. A prompt micro-batch (32+ rows: the mask is packed only then) now
+        // asks for the copy of the FULL window of this cache (its cells x rows x 2 bytes, the size the launcher's plan
+        // counts) from its first use: the pool keeps that one block, and the read makes no new allocation, trim or sync
+        // as it grows. GGML_HIP_MASK_GROW=1 = the amd-test-5c behavior. Decode (under 32 rows) is not changed.
+        int64_t n_mask = n_words*32*rows;
+        {
+            static const bool grow = getenv("GGML_HIP_MASK_GROW") != nullptr;
+            const ggml_tensor * Kc = dst->src[1];
+            const ggml_tensor * Kr = Kc ? (Kc->view_src ? Kc->view_src : Kc) : nullptr;
+            // the cache tensor: [n_embd_k_gqa, cells] or [n_embd_k_gqa, cells, n_stream]; K of the op is a view of it
+            const int64_t cells = Kr ? Kr->ne[1] : 0;
+            if (!grow && rows >= 32 && cells >= n_words*32 && cells <= ((int64_t) 1 << 22)) {
+                n_mask = ((cells + 31)/32)*32*rows;
+            }
+        }
+        mask_buf.alloc(n_mask);
+#else
+#line 1587
         mask_buf.alloc(n_words*32*rows);
+#endif // defined(GGML_USE_HIP)
+#line 1588
         const int64_t total = n_words*rows;
         expand_kq_mask_bits<<<(unsigned) ((total + 255)/256), 256, 0, ctx.stream()>>>((const uint32_t *) mask_in->data, mask_buf.get(), total);
         mask_f16 = *mask_in;

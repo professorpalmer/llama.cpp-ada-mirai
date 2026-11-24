@@ -1236,6 +1236,108 @@ static bool escha_hip_gemv_v5(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
     return true;
 }
+
+#include <set>
+
+// amd-rc1 diagnosis (GGML_ESCHA_HIP_ROWCHECK=1, with GGML_CUDA_DISABLE_GRAPHS=1; never in a default run): in the real
+// model graph, each call of the tiles / lut path with 2+ rows is computed again one row at a time (each row alone,
+// the decode path), and the rows are compared bit for bit. One INFO line per shape and row count with a difference
+// (at most 64 lines), and one line per shape for a call that leaves this path (the exact kernel of escha-moe.cu takes
+// it: a row that is not 16-byte aligned), with the row count: a 1-row call and a verify call of the same shape on
+// different paths have other bits. The amd-test-5c identity miss (tiles-fout, prompt 6, a 0.0057-nat near tie) was not
+// seen by step 8 of the meter, which compares row 0 of a 4-row call only, on contiguous tensors.
+static bool escha_gemv_rows_aligned(const ggml_tensor * t);
+
+static int escha_hip_rowcheck() {
+    static const int on = [] {
+        const char * e = getenv("GGML_ESCHA_HIP_ROWCHECK");
+        return e != nullptr && atoi(e) != 0 ? 1 : 0;
+    }();
+    return on;
+}
+
+static void escha_hip_rowcheck_note(const char * what, const ggml_tensor * dst, const int n_rows, const char * extra) {
+    static std::mutex mu;
+    static std::set<std::string> seen;
+    static int n_lines = 0;
+    const ggml_tensor * code = dst->src[0];
+    char key[256];
+    snprintf(key, sizeof(key), "%s %lldx%lld r%d %s", what, (long long) (code->ne[2]*16), (long long) (code->ne[1]*16), n_rows, extra);
+    std::lock_guard<std::mutex> lock(mu);
+    if (n_lines >= 64 || !seen.insert(key).second) {
+        return;
+    }
+    n_lines++;
+    GGML_LOG_INFO("escha rowcheck: %s (%s, IC %lld, OC %lld, rows %d)%s%s\n", what, dst->name, (long long) (code->ne[2]*16),
+                  (long long) (code->ne[1]*16), n_rows, *extra ? ": " : "", extra);
+}
+
+// the call was done (dst written); each row again alone, compared with its row of dst
+static void escha_hip_rowcheck_call(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[5];
+    const int n_rows = x->ne[1]*x->ne[2];
+    const int OC = dst->src[0]->ne[1]*16;
+    cudaStream_t stream = ctx.stream();
+    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(stream, &cs) != hipSuccess || cs != hipStreamCaptureStatusNone) {
+        (void) hipGetLastError();
+        escha_hip_rowcheck_note("skipped (a captured graph: set GGML_CUDA_DISABLE_GRAPHS=1)", dst, n_rows, "");
+        return;
+    }
+    ggml_cuda_pool_alloc<float> one(ctx.pool(), (size_t) OC);
+    std::vector<float> a((size_t) OC), b((size_t) OC);
+    int n_bad = 0, first_bad = -1, vals_bad = 0;
+    float dmax = 0.0f;
+    for (int r = 0; r < n_rows; ++r) {
+        ggml_tensor x1 = *x;
+        x1.ne[1] = 1;
+        x1.ne[2] = 1;
+        x1.data = (char *) x->data + (int64_t) (r % x->ne[1])*x->nb[1] + (int64_t) (r / x->ne[1])*x->nb[2];
+        x1.nb[2] = x1.nb[1];
+        x1.nb[3] = x1.nb[2];
+        ggml_tensor d1 = *dst;
+        d1.ne[1] = 1;
+        d1.ne[2] = 1;
+        d1.data = one.get();
+        d1.nb[1] = (size_t) OC*sizeof(float);
+        d1.nb[2] = d1.nb[1];
+        d1.nb[3] = d1.nb[2];
+        d1.view_src = nullptr;
+        d1.src[5] = &x1;
+        if (!escha_gemv_rows_aligned(&x1) || !escha_hip_gemv_v5(ctx, &d1)) {
+            escha_hip_rowcheck_note("row alone not on this path", dst, n_rows, "");
+            return;
+        }
+        const char * drow = (const char *) dst->data + (int64_t) (r % dst->ne[1])*dst->nb[1] + (int64_t) (r / dst->ne[1])*dst->nb[2];
+        CUDA_CHECK(cudaMemcpyAsync(a.data(), drow, (size_t) OC*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(b.data(), one.get(), (size_t) OC*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (memcmp(a.data(), b.data(), (size_t) OC*sizeof(float)) != 0) {
+            n_bad++;
+            if (first_bad < 0) {
+                first_bad = r;
+                for (int i = 0; i < OC; ++i) {
+                    if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+                        vals_bad++;
+                        dmax = fmaxf(dmax, fabsf(a[i] - b[i]));
+                    }
+                }
+            }
+        }
+    }
+    char extra[192];
+    snprintf(extra, sizeof(extra), "dst contiguous %d, fuse %d, T %d, U %d, DEC %d", ggml_is_contiguous(dst) ? 1 : 0,
+             escha_hip_gemv_fuse(), escha_hip_gemv_t(), escha_hip_gemv_u(), escha_hip_gemv_dec());
+    if (n_bad) {
+        char t[384];
+        snprintf(t, sizeof(t), "%d of %d rows differ from the row alone (first: row %d, %d of %d values, max |d| %.3g); %s",
+                 n_bad, n_rows, first_bad, vals_bad, OC, (double) dmax, extra);
+        escha_hip_rowcheck_note("VERIFY ROWS DIFFER", dst, n_rows, t);
+    } else {
+        escha_hip_rowcheck_note("rows equal", dst, n_rows, extra);
+    }
+}
+#line 1222
 #endif // defined(GGML_USE_HIP)
 #line 515
 // the Hadamard kernels load and store 4 floats at a time
@@ -1302,10 +1404,25 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (escha_hip_gemv_mode() >= 4) {
         // amd-test-5 variants (tiles, lut): the whole projection in escha_hip_gemv_v5
         if (!escha_gemv_rows_aligned(x) || !escha_gemv_rows_aligned(dst)) {
+            if (escha_hip_rowcheck()) {
+                char t[160];
+                snprintf(t, sizeof(t), "x data %% 16 = %d, nb1 %% 16 = %d; dst data %% 16 = %d, nb1 %% 16 = %d",
+                         (int) ((uintptr_t) x->data % 16), (int) (x->nb[1] % 16), (int) ((uintptr_t) dst->data % 16), (int) (dst->nb[1] % 16));
+                escha_hip_rowcheck_note("LEAVES the tiles path (exact kernel)", dst, n_rows, t);
+            }
             return false;
         }
-        return escha_hip_gemv_v5(ctx, dst);
+        const bool done = escha_hip_gemv_v5(ctx, dst);
+        if (escha_hip_rowcheck()) {
+            if (!done) {
+                escha_hip_rowcheck_note("LEAVES the tiles path (shape)", dst, n_rows, "");
+            } else if (n_rows > 1) {
+                escha_hip_rowcheck_call(ctx, dst);
+            }
+        }
+        return done;
     }
+#line 583
 #else
 #line 568
     if (!ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
