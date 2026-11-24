@@ -730,6 +730,184 @@ static int escha_hip_gemv_warps(const int k_tiles, const int n_tiles) {
     return w ? w : escha_rdna_splitk_warps(k_tiles, n_tiles);
 }
 
+// GGML_ESCHA_HIP_DEC (tiles mode): 1 (default) = the tiles core below with one change to exllamav3's pair decoder
+// (exl3_decode_pair<1>): the two fp16 halves of each hashed word are added as two scalar fp16 adds, which gfx11 / gfx12
+// code does as two v_add_f16 on the 16-bit halves of a register (true16), where __lows2half2 / __highs2half2 + __hadd2
+// takes three v_mov_b16 and one v_pk_add_f16 (gfx1100 code of the 1-row loop: 48 v_mov_b16 + 16 v_pk_add_f16 of 238
+// VALU instructions for 32 weights a lane). Same fp16 adds, same order: the same bits. 0 = exllamav3's decoder unchanged
+// (the control: the code of GGML_ESCHA_HIP_GEMV=rdna for 1 row).
+static int escha_hip_gemv_dec() {
+    static const int d = escha_hip_env_choice("GGML_ESCHA_HIP_DEC", 1, {0, 1, 2});
+    return d;
+}
+
+template <bool HI0, bool HI1, int DEC>
+static __device__ __forceinline__ half2 escha_dq_pair_h(const uint32_t src0, const uint32_t src1) {
+    half2_uint32 a(exl3_lop3_6a(exl3_hash16<1, HI0>(src0), 0x8fff8fffu, 0x3b603b60u));
+    half2_uint32 b(exl3_lop3_6a(exl3_hash16<1, HI1>(src1), 0x8fff8fffu, 0x3b603b60u));
+    if constexpr (DEC == 2) {
+        // two fp16 adds on the 16-bit halves (true16, VOP3 form: every VGPR can take .h)
+        uint32_t r;
+        asm("v_add_f16_e64 %0.l, %1.l, %1.h\n\tv_add_f16_e64 %0.h, %2.l, %2.h" : "=&v"(r) : "v"(a.as_uint32), "v"(b.as_uint32));
+        half2_uint32 o(r);
+        return o.as_half2;
+    }
+    // [a.lo | b.lo] + [a.hi | b.hi]: two v_perm_b32 and one v_pk_add_f16
+    half2_uint32 lo(__builtin_amdgcn_perm(b.as_uint32, a.as_uint32, 0x05040100u));
+    half2_uint32 hi(__builtin_amdgcn_perm(b.as_uint32, a.as_uint32, 0x07060302u));
+    return __hadd2(lo.as_half2, hi.as_half2);
+}
+
+// exl3_dq_tile_decode<bits, 1> for bits 2 and 3 (exl3_dq8_2bits_fast, exl3_dq8_3bits_fast), DEC = 1: escha_dq_pair_h
+template <int bits, int DEC>
+static __device__ __forceinline__ void escha_dq_tile_decode(const uint32_t * raw, const Exl3LanePlan<bits> & lp, FragB & frag0, FragB & frag1) {
+    if constexpr (DEC == 0) {
+        exl3_dq_tile_decode<bits, 1>(raw, lp, frag0, frag1);
+    } else if constexpr (bits == 2) {
+        const uint32_t b = __funnelshift_r(raw[1], raw[0], lp.sh[0]);
+        frag0[0] = escha_dq_pair_h<false, false, DEC>(b >> 14, b >> 12);
+        frag0[1] = escha_dq_pair_h<false, false, DEC>(b >> 10, b >> 8);
+        frag1[0] = escha_dq_pair_h<false, false, DEC>(b >> 6,  b >> 4);
+        frag1[1] = escha_dq_pair_h<false, false, DEC>(b >> 2,  b);
+    } else {
+        const uint32_t w7 = fshift(raw[1], raw[0], lp.sh[0]);
+        const uint32_t w6 = w7 >> bits;
+        const uint32_t w5 = w6 >> bits;
+        const uint32_t w4 = w5 >> bits;
+        const uint32_t w3 = fshift(raw[1], raw[0], lp.sh[0] + bits*4);
+        const uint32_t w2 = w3 >> bits;
+        const uint32_t w1 = w2 >> bits;
+        const uint32_t w0 = w1 >> bits;
+        frag0[0] = escha_dq_pair_h<false, false, DEC>(w0, w1);
+        frag0[1] = escha_dq_pair_h<false, false, DEC>(w2, w3);
+        frag1[0] = escha_dq_pair_h<false, false, DEC>(w4, w5);
+        frag1[1] = escha_dq_pair_h<false, false, DEC>(w6, w7);
+    }
+}
+
+// exllamav3's exl3_tiles_step and exl3_gemv_dot_tile_tiles (exl3_gemv_tiles_rdna.cuh, MIT, turboderp) with the decode
+// of escha_dq_tile_decode<bits, DEC>; the loads, the addressing and the fdot2 order are unchanged.
+template <int bits, int M, bool A_LDS, int U, int T, int DEC>
+static __device__ __forceinline__ void escha_tiles_step(const char * A_c, const uint32_t * a_row, exl3_g_char * b_c, const uint32_t b_stride,
+        uint32_t * off, uint32_t & a_off, const Exl3LanePlan<bits> & lp, float * accA, float * accB) {
+    constexpr int R = Exl3LanePlan<bits>::R;
+    constexpr int tile_bytes = Exl3Width<bits>::tile_bytes;
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        exl3_opaque(off[i]);
+    }
+    exl3_opaque(a_off);
+    uint32_t raw[U][T][R];
+    uint32_t w01[U][M], w89[U][M];
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                raw[u][t][i] = exl3_ld_g(b_c + (size_t) u*b_stride + t*tile_bytes, off[i]);
+            }
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            const char * a = A_c + a_row[r] + u*32;
+            if constexpr (A_LDS) {
+                w01[u][r] = exl3_ld_l(a, a_off);
+                w89[u][r] = exl3_ld_l(a + 16, a_off);
+            } else {
+                w01[u][r] = exl3_ld_g((exl3_g_char *) a, a_off);
+                w89[u][r] = exl3_ld_g((exl3_g_char *) a + 16, a_off);
+            }
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            FragB frag0, frag1;
+            escha_dq_tile_decode<bits, DEC>(raw[u][t], lp, frag0, frag1);
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                half2_uint32 a01(w01[u][r]);
+                half2_uint32 a89(w89[u][r]);
+                float & aA = accA[t*M + r];
+                float & aB = accB[t*M + r];
+                aA = exl3_fdot2(a01.as_half2, frag0[0], aA);
+                aA = exl3_fdot2(a89.as_half2, frag0[1], aA);
+                aB = exl3_fdot2(a01.as_half2, frag1[0], aB);
+                aB = exl3_fdot2(a89.as_half2, frag1[1], aB);
+            }
+        }
+    }
+}
+
+template <int bits, int M, bool A_LDS, int U, int T, int DEC>
+static __device__ __forceinline__ void escha_dot_tile_tiles(const half * __restrict__ A, const int lda, const uint16_t * __restrict__ B,
+        const int n_tiles, const int tile_n, const int lane, const int kb_begin, const int kb_end, float * out, const int rows_valid) {
+    if constexpr (DEC == 0) {
+        exl3_gemv_dot_tile_tiles<bits, 1, M, A_LDS, U, T>(A, lda, B, n_tiles, tile_n, lane, kb_begin, kb_end, out, rows_valid);
+        return;
+    }
+    A = exl3_uni_ptr(A);
+    B = exl3_uni_ptr(B);
+    const int n_tiles_u  = exl3_uni(n_tiles);
+    const int tile_n_u   = exl3_uni(tile_n);
+    const int kb_begin_u = exl3_uni(kb_begin);
+    const int kb_end_u   = exl3_uni(kb_end);
+    const int lda_u      = exl3_uni(lda);
+    constexpr int tile_bytes = Exl3Width<bits>::tile_bytes;
+    const Exl3LanePlan<bits> lp = exl3_lane_plan<bits>(lane);
+    constexpr int R = Exl3LanePlan<bits>::R;
+    uint32_t off[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        off[i] = lp.off[i];
+    }
+    uint32_t a_off = (uint32_t) (lane & 3)*4;
+    float accA[T*M], accB[T*M];
+#pragma unroll
+    for (int r = 0; r < T*M; ++r) {
+        accA[r] = 0.0f;
+        accB[r] = 0.0f;
+    }
+    const uint32_t b_stride = (uint32_t) n_tiles_u*tile_bytes;
+    exl3_g_char * b_c = (exl3_g_char *) (const char *) B + ((size_t) kb_begin_u*n_tiles_u + tile_n_u)*tile_bytes;
+    const char * a_c = (const char *) (A + kb_begin_u*16);
+    const int lda_b = lda_u*2;
+    const int row_last = exl3_uni(rows_valid) - 1;
+    uint32_t a_row[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+        a_row[r] = (uint32_t) ((r < row_last ? r : row_last)*lda_b);
+    }
+    int k = kb_begin_u;
+    if constexpr (U > 1) {
+        for (; k + U <= kb_end_u; k += U) {
+            escha_tiles_step<bits, M, A_LDS, U, T, DEC>(a_c, a_row, b_c, b_stride, off, a_off, lp, accA, accB);
+            b_c += (size_t) U*b_stride;
+            a_c += U*32;
+        }
+    }
+    for (; k < kb_end_u; k++) {
+        escha_tiles_step<bits, M, A_LDS, 1, T, DEC>(a_c, a_row, b_c, b_stride, off, a_off, lp, accA, accB);
+        b_c += b_stride;
+        a_c += 32;
+    }
+#pragma unroll
+    for (int r = 0; r < T*M; ++r) {
+        accA[r] += __shfl_xor(accA[r], 1, 32);
+        accA[r] += __shfl_xor(accA[r], 2, 32);
+        accB[r] += __shfl_xor(accB[r], 1, 32);
+        accB[r] += __shfl_xor(accB[r], 2, 32);
+        const float vA = __shfl(accA[r], (lane & 7)*4, 32);
+        const float vB = __shfl(accB[r], (lane & 7)*4, 32);
+        out[r] = (lane & 8) ? vB : vA;
+    }
+}
+
 // The multi-row fused epilogue of exllamav3 (exl3_gemv_multirow_rdna.cu, exl3_gemv_fused_epilogue_mr, MIT, turboderp),
 // fp32 C with row stride ldc: store the rows < rows, arrive at the segment counter, the last of the 8 tiles rotates each
 // row's 128 columns in place (exl3_gemv_had_out_128_f = had_ff_r_128_inner<false, true>, the arithmetic of escha_gemv_had_out).
@@ -768,7 +946,7 @@ static __device__ __forceinline__ void escha_rdna_epilogue_mr(const float * acc,
     }
 }
 
-template <int bits, int M, int W, int U, int T, bool FIN, bool FOUT>
+template <int bits, int M, int W, int U, int T, bool FIN, bool FOUT, int DEC>
 static __global__ void __launch_bounds__(W*32) escha_rdna_gemv_t(
         const half * __restrict__ A, const float * __restrict__ X, const half * __restrict__ rin,
         const uint16_t * __restrict__ B, const half * __restrict__ rout, float * __restrict__ C,
@@ -801,7 +979,7 @@ static __global__ void __launch_bounds__(W*32) escha_rdna_gemv_t(
         acc[i] = 0.0f;
     }
     if (kb0 < kb1) {
-        exl3_gemv_dot_tile_tiles<bits, 1, M, FIN, U, T>(Ae, size_k, B, n_tiles, tile_n0, lane, kb0, kb1, acc, rows);
+        escha_dot_tile_tiles<bits, M, FIN, U, T, DEC>(Ae, size_k, B, n_tiles, tile_n0, lane, kb0, kb1, acc, rows);
     }
     if (lane < 16) {
 #pragma unroll
@@ -963,8 +1141,10 @@ static void escha_rdna_launch_w(const half * xh, const float * x, const half * r
     }
     const int T = escha_hip_gemv_t();
     const int U = escha_hip_gemv_u();
-#define ESCHA_T_LAUNCH(m, u, t, fi, fo) \
-    escha_rdna_gemv_t<bits, m, W, u, t, fi, fo><<<n_tiles/(t), W*32, (size_t) W*(t)*(m)*16*sizeof(float) + ((fi) ? (size_t) IC*sizeof(half) : 0), stream>>>( \
+    const int D = escha_hip_gemv_dec();
+#define ESCHA_T_LAUNCH(m, u, t, fi, fo) if (D == 2) { ESCHA_T_LAUNCH1(m, u, t, fi, fo, 2); } else if (D == 1) { ESCHA_T_LAUNCH1(m, u, t, fi, fo, 1); } else { ESCHA_T_LAUNCH1(m, u, t, fi, fo, 0); }
+#define ESCHA_T_LAUNCH1(m, u, t, fi, fo, d) \
+    escha_rdna_gemv_t<bits, m, W, u, t, fi, fo, d><<<n_tiles/(t), W*32, (size_t) W*(t)*(m)*16*sizeof(float) + ((fi) ? (size_t) IC*sizeof(half) : 0), stream>>>( \
         xh, x, rin, code, rout, C, IC, OC, rows)
     if (M == 1) {
         if (fin) {
@@ -989,6 +1169,7 @@ static void escha_rdna_launch_w(const half * xh, const float * x, const half * r
         }
     }
 #undef ESCHA_T_LAUNCH
+#undef ESCHA_T_LAUNCH1
 }
 
 template <int bits>
