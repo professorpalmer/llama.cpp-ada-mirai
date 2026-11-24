@@ -590,6 +590,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+#if defined(GGML_USE_HIP)
+    // amd-rc1: batch-invariant mode on AMD. The rule "the same (vector) kernel for 1 to 8 queries" above is inside the
+    // Turing tensor-core block, so AMD never took it: with a quantized K/V the vector kernel ran 1-2 queries and the tile
+    // kernel (K/V converted to fp16) ran the 4-row MTP verify, so a token verified in a batch attended with other
+    // arithmetic than alone (RX 9070 XT, q4_0 K/V, amd-rc1 R1: MTP on / off 11/12 at a 0.0005-nat tie). 9 to 48 queries
+    // run as groups of 8 (bi_groups), so this covers every verify batch of MTP + lookup drafting.
+    if (ggml_cuda_batch_invariant() && can_use_vector_kernel && Q->ne[1] <= 8 && Q->ne[3] == 1) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+#endif // defined(GGML_USE_HIP)
+#line 562
     // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
     if ((amd_mfma_available(cc) && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if ((Q->ne[0] <= 64 && Q->ne[1] * gqa_ratio_eff > 8)) {
