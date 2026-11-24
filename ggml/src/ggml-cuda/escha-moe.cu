@@ -1276,6 +1276,162 @@ static __global__ void escha_quantize_rows_i8(
         scales[row] = amax/(127.0f*ESCHA_I8_WSCALE);
     }
 }
+#if defined(GGML_USE_HIP)
+// amd-test-5: the fused int8 read (GGML_ESCHA_HIP_READ=fused | fused128, with GGML_ESCHA_PREFILL=i8): one kernel decodes
+// the trellis codes straight into int8 tiles in LDS and multiplies them with WMMA (the int8 tile types and mma() of
+// mma.cuh, as the q8_0 MMQ kernel uses them on RDNA3 / RDNA4), so no int8 weight buffer is written and read. The decode
+// is that of escha_reconstruct_dense<K, int8_t> (the same int8 weights) and the sums are int32, so the result is bit for
+// bit the one of the hipBLAS int8 path. A block has 128 output columns and BM rows (256 = fused, 128 = fused128); the
+// weights are decoded once per block, so n_rows/BM times per projection (the hipBLAS path: once).
+// GGML_ESCHA_PROF_SKIP=unpack | gemm (read profile of the self-test meter only, results wrong): the recon / i8 read
+// without its decode kernel or without its GEMM. Both are read for each call.
+static int escha_hip_read_fused() {
+    const char * e = getenv("GGML_ESCHA_HIP_READ");
+    return e == nullptr ? 0 : strcmp(e, "fused") == 0 ? 256 : strcmp(e, "fused128") == 0 ? 128 : 0;
+}
+static int escha_hip_prof_skip() {
+    const char * e = getenv("GGML_ESCHA_PROF_SKIP");
+    return e == nullptr ? 0 : strcmp(e, "unpack") == 0 ? 1 : strcmp(e, "gemm") == 0 ? 2 : 0;
+}
+
+#define ESCHA_F8_STRIDE 12   // ints per LDS row: 8 (32 int8 of k) + 4 of padding (16-byte loads, as the MMQ tiles)
+
+template <int K, int BM>
+static __global__ void __launch_bounds__(256) escha_i8_fused_kernel(
+        const int16_t * __restrict__ code, const int8_t * __restrict__ q, int32_t * __restrict__ out,
+        const int IC, const int OC, const int n_rows) {
+    using namespace ggml_cuda_mma;
+    constexpr data_layout dl_in = get_input_data_layout();
+    typedef tile<16,  8, int, dl_in>               tile_A;
+    typedef tile<16,  8, int, dl_in>               tile_B;
+    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
+    constexpr int RB = BM/4;          // rows of a warp (warps: 2 column halves x 4 row groups)
+    constexpr int NB = RB/16;         // B tiles of a warp
+    constexpr int NW = 8*K;           // uint32 words of a 16x16 code tile
+    constexpr int NBITS = 32*NW;
+    constexpr int NPW = (8*K + ESCHA_TILE - 1)/ESCHA_TILE;
+
+    __shared__ uint2 s_pay[2][ESCHA_GROUPS*ESCHA_MAX_W];
+    __shared__ __align__(16) int s_w[128*ESCHA_F8_STRIDE];
+    __shared__ __align__(16) int s_q[BM*ESCHA_F8_STRIDE];
+
+    const int tid  = threadIdx.x;
+    const int kt   = tid/128;         // which of the two k-tiles of a k-step this thread decodes
+    const int t    = tid%128;
+    const int grp  = t/ESCHA_TILE;
+    const int cc   = t%ESCHA_TILE;
+    const int nct  = OC/ESCHA_TILE;
+    const int tj   = blockIdx.x*ESCHA_GROUPS + grp;
+    const int oc0  = blockIdx.x*128;
+    const int row0 = blockIdx.y*BM;
+    const int warp = tid/32;
+    const int wo   = warp%2;
+    const int wr   = warp/2;
+    uint2 * pay = s_pay[kt] + grp*ESCHA_MAX_W;
+
+    int s0 = ((32 - K) - K*(32*cc + 4*(cc >> 3))) % NBITS;
+    if (s0 < 0) {
+        s0 += NBITS;
+    }
+
+    tile_C C[4][NB];
+
+    for (int k0 = 0; k0 < IC; k0 += 32) {
+        // the payload of this thread's code tile (k-tile k0/16 + kt, n-tile tj)
+        const int ti = k0/ESCHA_TILE + kt;
+        const uint32_t * src = (const uint32_t *)(code + (int64_t)(ti*nct + tj)*(16*K));
+#pragma unroll
+        for (int i = 0; i < NPW; ++i) {
+            const int wd = cc + i*ESCHA_TILE;
+            if (wd < NW) {
+                const uint32_t v = src[wd];
+                pay[wd].y = v;
+                pay[wd + 1 == NW ? 0 : wd + 1].x = v;
+            }
+        }
+        // the activations: BM rows x 32 int8, 16 bytes per load
+        for (int i = tid; i < BM*2; i += 256) {
+            const int j = i/2;
+            const int h = i%2;
+            int4 v = make_int4(0, 0, 0, 0);
+            if (row0 + j < n_rows) {
+                v = *(const int4 *)(q + (int64_t)(row0 + j)*IC + k0 + 16*h);
+            }
+            *(int4 *)(s_q + j*ESCHA_F8_STRIDE + 4*h) = v;
+        }
+        __syncthreads();
+        // the 16 int8 weights of column t in k-tile kt, as escha_reconstruct_dense<K, int8_t> computes them
+        uint32_t v[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+        for (int r = 0; r < ESCHA_TILE; ++r) {
+            int sp = s0 - K*escha_dep_pi(r);
+            if (sp < 0) {
+                sp += NBITS;
+            }
+            const int g0 = sp >> 5;
+            const int w0 = g0 ? (NW - g0) : 0;
+            const uint2 p = pay[w0];
+            const half  hv = escha_codebook_h(__funnelshift_r(p.y, p.x, sp & 31) & 0xffffu);
+            const int qv = max(-127, min(127, __float2int_rn(__half2float(hv)*ESCHA_I8_WSCALE)));
+            v[r/4] |= (uint32_t) (qv & 0xff) << (8*(r & 3));
+        }
+        *(uint4 *)(s_w + t*ESCHA_F8_STRIDE + 4*kt) = make_uint4(v[0], v[1], v[2], v[3]);
+        __syncthreads();
+
+        tile_A A[4];
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            load_ldmatrix(A[n], s_w + (wo*64 + n*16)*ESCHA_F8_STRIDE, ESCHA_F8_STRIDE);
+        }
+#pragma unroll
+        for (int m = 0; m < NB; ++m) {
+            tile_B B;
+            load_ldmatrix(B, s_q + (wr*RB + m*16)*ESCHA_F8_STRIDE, ESCHA_F8_STRIDE);
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                mma(C[n][m], A[n], B);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int n = 0; n < 4; ++n) {
+#pragma unroll
+        for (int m = 0; m < NB; ++m) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i   = wo*64 + n*16 + tile_C::get_i(l);
+                const int row = row0 + wr*RB + m*16 + tile_C::get_j(l);
+                if (row < n_rows) {
+                    out[(int64_t) row*OC + oc0 + i] = C[n][m].x[l];
+                }
+            }
+        }
+    }
+}
+
+// out[row][c] (int32) = q[row] . int8(decode(code))[c]; false when the device has no WMMA (the caller then takes hipBLAS)
+static bool escha_i8_fused(ggml_backend_cuda_context & ctx, const int16_t * code, const int8_t * q, int32_t * out,
+                           const int K, const int IC, const int OC, const int n_rows, const int bm) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!amd_wmma_available(cc) || OC%128 != 0 || IC%32 != 0) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    const dim3 grid(OC/128, (n_rows + bm - 1)/bm);
+    switch (2*K + (bm == 256 ? 1 : 0)) {
+        case 4: escha_i8_fused_kernel<2, 128><<<grid, 256, 0, stream>>>(code, q, out, IC, OC, n_rows); break;
+        case 5: escha_i8_fused_kernel<2, 256><<<grid, 256, 0, stream>>>(code, q, out, IC, OC, n_rows); break;
+        case 6: escha_i8_fused_kernel<3, 128><<<grid, 256, 0, stream>>>(code, q, out, IC, OC, n_rows); break;
+        case 7: escha_i8_fused_kernel<3, 256><<<grid, 256, 0, stream>>>(code, q, out, IC, OC, n_rows); break;
+        default: return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif // defined(GGML_USE_HIP)
+#line 1279
 
 // GGML_ESCHA_PREFILL=recon|mma|i8: the prefill path for rows >= GGML_ESCHA_RECON_MIN_ROWS
 //   recon: exact read. Exact weights in fp16, fp16 activations, fp32 sum.
@@ -1340,6 +1496,53 @@ static void escha_mul_mat_recon(
 
     const bool   i8 = q != nullptr;
     const size_t ws = i8 ? sizeof(int8_t) : sizeof(half);
+#if defined(GGML_USE_HIP)
+    // amd-test-5: the fused int8 read, or the read profile switches (the same loop without one of its two parts)
+    if (i8 && escha_hip_read_fused() && escha_i8_fused(ctx, code, q, (int32_t *) partial, K, IC, OC, n_rows, escha_hip_read_fused())) {
+        return;
+    }
+    if (const int skip = escha_hip_prof_skip()) {
+        const int64_t fit5     = MAX((int64_t) 1, (int64_t) (escha_recon_max_bytes()/((size_t) IC*ws))/ESCHA_NT);
+        const int64_t n_grp5   = OC/ESCHA_NT;
+        const int64_t n_chunk5 = (n_grp5 + fit5 - 1)/fit5;
+        const int     step5    = (int) ((n_grp5 + n_chunk5 - 1)/n_chunk5)*ESCHA_NT;
+        ggml_cuda_pool_alloc<char> wb5(ctx.pool(), (size_t) step5*IC*ws);
+        const int n_sl5 = MAX(1, IC/ESCHA_TILE/32);
+        cublasHandle_t h5 = ctx.cublas_handle();
+        for (int oc0 = 0; oc0 < OC; oc0 += step5) {
+            const int n_oc = MIN(step5, OC - oc0);
+            if (skip != 1) {
+                const dim3 grid(n_oc/ESCHA_NT, n_sl5);
+                switch (2*K + (i8 ? 1 : 0)) {
+                    case 4: escha_reconstruct_dense<2, half>  <<<grid, ESCHA_NT, 0, stream>>>(code, (half *)   wb5.get(), IC, OC, oc0, n_sl5); break;
+                    case 5: escha_reconstruct_dense<2, int8_t><<<grid, ESCHA_NT, 0, stream>>>(code, (int8_t *) wb5.get(), IC, OC, oc0, n_sl5); break;
+                    case 6: escha_reconstruct_dense<3, half>  <<<grid, ESCHA_NT, 0, stream>>>(code, (half *)   wb5.get(), IC, OC, oc0, n_sl5); break;
+                    case 7: escha_reconstruct_dense<3, int8_t><<<grid, ESCHA_NT, 0, stream>>>(code, (int8_t *) wb5.get(), IC, OC, oc0, n_sl5); break;
+                    default: GGML_ABORT("escha: unsupported K=%d", K);
+                }
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if (skip != 2) {
+                if (i8) {
+                    const int alpha = 1;
+                    const int beta  = 0;
+                    CUBLAS_CHECK(cublasGemmEx(h5, CUBLAS_OP_T, CUBLAS_OP_N, n_oc, n_rows, IC,
+                        &alpha, wb5.get(), CUDA_R_8I, IC, q, CUDA_R_8I, IC,
+                        &beta,  partial + oc0, CUDA_R_32I, OC, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                } else {
+                    const float alpha = 1.0f;
+                    const float beta  = 0.0f;
+                    CUBLAS_CHECK(cublasGemmEx(h5, CUBLAS_OP_T, CUBLAS_OP_N, n_oc, n_rows, IC,
+                        &alpha, wb5.get(), CUDA_R_16F, IC, u, CUDA_R_16F, IC,
+                        &beta,  partial_h ? (void *) (partial_h + oc0) : (void *) (partial + oc0), partial_h ? CUDA_R_16F : CUDA_R_32F, OC,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                }
+            }
+        }
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
+#line 1343
 
     // equal chunks of whole 128-column groups
     const int64_t fit     = MAX((int64_t) 1, (int64_t) (escha_recon_max_bytes()/((size_t) IC*ws))/ESCHA_NT);

@@ -47,6 +47,7 @@ union half_uint16 {
 // warps of a block, no emulated tensor-core fragments. GGML_ESCHA_HIP_GEMV=rdna selects it; the default stays the
 // emulated kernel above until the native one is measured on an RDNA card (identity, KL, speed).
 #include "exl3/rocm/quant/exl3_gemv_kernel_rdna.cuh"
+#include <initializer_list>
 
 // The host helpers the kernels name, from exllamav3's exl3_gemv_rdna.cu (same commit, MIT, turboderp), with its
 // environment switches: EXL3_GEMV_LDS, EXL3_ROCM_GEMV_TILES, EXL3_GEMV_TILES_T, EXL3_GEMV_SPLITK_WARPS.
@@ -98,10 +99,17 @@ static int escha_rdna_splitk_warps(int k_tiles, int n_tiles) {
 // the same bits as a row decoded alone, so drafting on / off stays identical.
 // split (amd-test-4) = rdna for 1 row and the multi-row core for 2 to GGML_ESCHA_GEMV_MAX_ROWS rows: the faster kernel of
 // each (RX 7900 XTX: 1 row 36.6 vs 29.9 tok/s, 4 rows 75 vs 56); verify rows and decode rows then differ in the last bits.
+// tiles (amd-test-5) = exllamav3's "tiles" core (exl3_gemv_tiles_rdna.cuh) for 1 to 8 rows in one kernel family
+// (escha_rdna_gemv_t below; the multi-row form is the design of exllamav3's exl3_gemv_multirow_rdna.cu), with the
+// knobs GGML_ESCHA_HIP_U, GGML_ESCHA_HIP_T and GGML_ESCHA_HIP_FUSE_GEMV. The tiles core gives the bits of the
+// one-row rdna kernel for every row count, so verify rows = decode rows again.
+// lut (amd-test-5) = the decode by a gather from the model's codebook table (escha_lut, 128 KB, in L1 / L2), same
+// lane layout and fdot2 order as the tiles core (same bits); the test of "table vs arithmetic" for the code unpack.
 static int escha_hip_gemv_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_ESCHA_HIP_GEMV");
-        return e == nullptr ? 0 : strcmp(e, "rdna") == 0 ? 1 : strcmp(e, "rdna8") == 0 ? 2 : strcmp(e, "split") == 0 ? 3 : 0;
+        return e == nullptr ? 0 : strcmp(e, "rdna") == 0 ? 1 : strcmp(e, "rdna8") == 0 ? 2 : strcmp(e, "split") == 0 ? 3
+            : strcmp(e, "tiles") == 0 ? 4 : strcmp(e, "lut") == 0 ? 5 : 0;
     }();
     return mode;
 }
@@ -668,6 +676,385 @@ static __global__ void escha_gemv_had_out_h(
     float * dst_row = (float *)((char *) dst + (int64_t)(row%ne1)*nb_d1 + (int64_t)(row/ne1)*nb_d2);
     ((float4 *)(dst_row + blk*128))[t] = v;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// amd-test-5: the RDNA GEMV variants (all behind GGML_ESCHA_HIP_GEMV=tiles | lut; the amd-test-4 modes do not change)
+//
+// escha_rdna_gemv_t<bits, M, W, U, T, FIN, FOUT>: one block per T adjacent 16-column tiles, W warps split K, M rows
+// (1, 2, 4, 8) on exllamav3's tiles core (exl3_gemv_dot_tile_tiles, MIT, turboderp). The split-K chunks and the
+// reduction order are those of exllamav3's exl3_gemv_dot_tile_splitk_t, so with M = 1, U = 4, T = 1 the kernel gives the
+// bits of escha_gemv_rdna_m1 (GGML_ESCHA_HIP_GEMV=rdna), and every row of an M-row call gives the bits of that row alone.
+//   U    k-tiles whose loads are in flight together (GGML_ESCHA_HIP_U=2|4|8, default 4 = exllamav3's table for M = 1)
+//   T    adjacent n-tiles per wave: they share the A loads and read 2 x 96 contiguous bytes (GGML_ESCHA_HIP_T=2; U = 2)
+//   W    warps per block = GGML_ESCHA_HIP_WARPS / EXL3_GEMV_SPLITK_WARPS = 4 | 8 | 16 (default: escha_rdna_splitk_warps)
+//   FOUT the output rotation in the epilogue (GGML_ESCHA_HIP_FUSE_GEMV=out): the last of the 8 tiles of a 128-column
+//        segment rotates it in place (exllamav3's fused epilogue, exl3_gemv_fused_epilogue / _mr, counters that reset
+//        themselves); 2 kernels per projection instead of 3
+//   FIN  also the input rotation in the prologue (GGML_ESCHA_HIP_FUSE_GEMV=both, 1 row): each block rotates x (fp32) into
+//        LDS with had_fh_r_128_inner, the arithmetic of escha_gemv_had_in; 1 kernel per projection
+// All forms give the same bits as the separate kernels (same functions, same order); W changes the split-K sums.
+#define ESCHA_RDNA_NSEG 1024   // segment counters of the fused epilogue: OC/128 <= 1024
+static __device__ int escha_rdna_seg_counters[ESCHA_RDNA_NSEG];
+
+static int escha_hip_env_choice(const char * name, const int def, std::initializer_list<int> ok) {
+    const char * e = getenv(name);
+    if (e == nullptr) {
+        return def;
+    }
+    const int v = atoi(e);
+    for (const int o : ok) {
+        if (v == o) {
+            return v;
+        }
+    }
+    return def;
+}
+static int escha_hip_gemv_u() {
+    static const int u = escha_hip_env_choice("GGML_ESCHA_HIP_U", 4, {2, 4, 8});
+    return u;
+}
+static int escha_hip_gemv_t() {
+    static const int t = escha_hip_env_choice("GGML_ESCHA_HIP_T", 1, {1, 2});
+    return t;
+}
+// 0 = off, 1 = out, 3 = both (in + out)
+static int escha_hip_gemv_fuse() {
+    static const int f = [] {
+        const char * e = getenv("GGML_ESCHA_HIP_FUSE_GEMV");
+        return e == nullptr ? 0 : strcmp(e, "out") == 0 ? 1 : strcmp(e, "both") == 0 ? 3 : 0;
+    }();
+    return f;
+}
+static int escha_hip_gemv_warps(const int k_tiles, const int n_tiles) {
+    static const int w = escha_hip_env_choice("GGML_ESCHA_HIP_WARPS", 0, {4, 8, 16});
+    return w ? w : escha_rdna_splitk_warps(k_tiles, n_tiles);
+}
+
+// The multi-row fused epilogue of exllamav3 (exl3_gemv_multirow_rdna.cu, exl3_gemv_fused_epilogue_mr, MIT, turboderp),
+// fp32 C with row stride ldc: store the rows < rows, arrive at the segment counter, the last of the 8 tiles rotates each
+// row's 128 columns in place (exl3_gemv_had_out_128_f = had_ff_r_128_inner<false, true>, the arithmetic of escha_gemv_had_out).
+template <int M>
+static __device__ __forceinline__ void escha_rdna_epilogue_mr(const float * acc, float * C, const int ldc, const int rows,
+        const int tile_n, const int lane, const half * __restrict__ rout, int * seg_counter) {
+    if (lane < 16) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            if (r >= rows) {
+                break;
+            }
+            C[(int64_t) r*ldc + tile_n*16 + lane] = acc[r];
+        }
+    }
+    __threadfence();
+    int old = 0;
+    if (lane == 0) {
+        old = atomicAdd(seg_counter, 1);
+    }
+    old = __shfl(old, 0, 32);
+    if (old != 7) {
+        return;
+    }
+    __threadfence();
+    if (lane == 0) {
+        *seg_counter = 0;
+    }
+    const int seg = tile_n/8;
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+        if (r >= rows) {
+            break;
+        }
+        exl3_gemv_had_out_128_f(C + (int64_t) r*ldc + (int64_t) seg*128, rout + seg*128, ESCHA_GEMV_RS, lane);
+    }
+}
+
+template <int bits, int M, int W, int U, int T, bool FIN, bool FOUT>
+static __global__ void __launch_bounds__(W*32) escha_rdna_gemv_t(
+        const half * __restrict__ A, const float * __restrict__ X, const half * __restrict__ rin,
+        const uint16_t * __restrict__ B, const half * __restrict__ rout, float * __restrict__ C,
+        const int size_k, const int size_n, const int rows) {
+    static_assert(!FIN || M == 1, "the fused input rotation is for one row");
+    extern __shared__ float sh_t[];   // [W][T*M][16] partial sums, then (FIN) the rotated row: size_k halves
+    const int warp_id = threadIdx.x/32;
+    const int lane    = threadIdx.x%32;
+    const int n_tiles = size_n/16;
+    const int tile_n0 = blockIdx.x*T;
+
+    const half * Ae = A;
+    if constexpr (FIN) {
+        half * sh_a = (half *) (sh_t + W*T*M*16);
+        for (int seg = warp_id; seg < size_k/128; seg += W) {
+            had_fh_r_128_inner<true, false>(X + seg*128, sh_a + seg*128, rin + seg*128, ESCHA_GEMV_RS);
+        }
+        __syncthreads();
+        Ae = sh_a;
+    }
+
+    const int num_k_tiles = size_k/16;
+    const int chunk = (num_k_tiles + W - 1)/W;
+    const int kb0 = exl3_uni(warp_id)*chunk;
+    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
+
+    float acc[T*M];
+#pragma unroll
+    for (int i = 0; i < T*M; ++i) {
+        acc[i] = 0.0f;
+    }
+    if (kb0 < kb1) {
+        exl3_gemv_dot_tile_tiles<bits, 1, M, FIN, U, T>(Ae, size_k, B, n_tiles, tile_n0, lane, kb0, kb1, acc, rows);
+    }
+    if (lane < 16) {
+#pragma unroll
+        for (int i = 0; i < T*M; ++i) {
+            sh_t[(warp_id*T*M + i)*16 + lane] = acc[i];
+        }
+    }
+    __syncthreads();
+    if (warp_id != 0) {
+        return;
+    }
+    float out[T*M];
+#pragma unroll
+    for (int i = 0; i < T*M; ++i) {
+        float total = 0.0f;
+        if (lane < 16) {
+#pragma unroll
+            for (int w = 0; w < W; ++w) {
+                total += sh_t[(w*T*M + i)*16 + lane];
+            }
+        }
+        out[i] = total;
+    }
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+        if constexpr (FOUT) {
+            escha_rdna_epilogue_mr<M>(out + t*M, C, size_n, rows, tile_n0 + t, lane, rout, escha_rdna_seg_counters + (tile_n0 + t)/8);
+        } else if (lane < 16) {
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                if (r < rows) {
+                    C[(size_t) r*size_n + (tile_n0 + t)*16 + lane] = out[t*M + r];
+                }
+            }
+        }
+    }
+}
+
+// The lut core: the 8 16-bit windows of a lane as in exl3_dq8_2bits_fast / exl3_dq8_3bits_fast, then lut[window]
+// (escha_lut = the codebook bit for bit, checked for all 65536 entries) instead of the hash arithmetic.
+template <int bits>
+static __device__ __forceinline__ void escha_lut_decode(const uint32_t * raw, const Exl3LanePlan<bits> & lp,
+        const half * __restrict__ lut, FragB & f0, FragB & f1) {
+    uint32_t w[8];
+    if constexpr (bits == 2) {
+        const uint32_t b = __funnelshift_r(raw[1], raw[0], lp.sh[0]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            w[i] = b >> (14 - 2*i);
+        }
+    } else {
+        const uint32_t w7 = fshift(raw[1], raw[0], lp.sh[0]);
+        const uint32_t w3 = fshift(raw[1], raw[0], lp.sh[0] + 12);
+        w[7] = w7; w[6] = w7 >> 3; w[5] = w7 >> 6; w[4] = w7 >> 9;
+        w[3] = w3; w[2] = w3 >> 3; w[1] = w3 >> 6; w[0] = w3 >> 9;
+    }
+    half h[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        h[i] = lut[w[i] & 0xffffu];
+    }
+    f0[0] = __halves2half2(h[0], h[1]);
+    f0[1] = __halves2half2(h[2], h[3]);
+    f1[0] = __halves2half2(h[4], h[5]);
+    f1[1] = __halves2half2(h[6], h[7]);
+}
+
+template <int bits, int M, int W>
+static __global__ void __launch_bounds__(W*32) escha_rdna_gemv_lut(
+        const half * __restrict__ A, const uint16_t * __restrict__ B, const half * __restrict__ lut, float * __restrict__ C,
+        const int size_k, const int size_n, const int rows) {
+    extern __shared__ float sh_l[];   // [W][M][16]
+    const int warp_id = threadIdx.x/32;
+    const int lane    = threadIdx.x%32;
+    const int tile_n  = blockIdx.x;
+    const int n_tiles = size_n/16;
+    const int num_k_tiles = size_k/16;
+    const int chunk = (num_k_tiles + W - 1)/W;
+    const int kb0 = exl3_uni(warp_id)*chunk;
+    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
+    const Exl3LanePlan<bits> lp = exl3_lane_plan<bits>(lane);
+    const int r0 = (lane & 3)*2;
+    const int row_last = rows - 1;
+
+    float accA[M], accB[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+        accA[r] = 0.0f;
+        accB[r] = 0.0f;
+    }
+    for (int k_tile = kb0; k_tile < kb1; ++k_tile) {
+        const char * tb = (const char *) (B + ((size_t) k_tile*n_tiles + tile_n)*16*bits);
+        uint32_t raw[2];
+        raw[0] = *(const uint32_t *) (tb + lp.off[0]);
+        raw[1] = *(const uint32_t *) (tb + lp.off[1]);
+        FragB f0, f1;
+        escha_lut_decode<bits>(raw, lp, lut, f0, f1);
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            const half2 * a2 = (const half2 *) (A + (size_t) (r < row_last ? r : row_last)*size_k + k_tile*16);
+            const half2 a01 = a2[r0 >> 1];
+            const half2 a89 = a2[(r0 >> 1) + 4];
+            accA[r] = exl3_fdot2(a01, f0[0], accA[r]);
+            accA[r] = exl3_fdot2(a89, f0[1], accA[r]);
+            accB[r] = exl3_fdot2(a01, f1[0], accB[r]);
+            accB[r] = exl3_fdot2(a89, f1[1], accB[r]);
+        }
+    }
+    float acc[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+        accA[r] += __shfl_xor(accA[r], 1, 32);
+        accA[r] += __shfl_xor(accA[r], 2, 32);
+        accB[r] += __shfl_xor(accB[r], 1, 32);
+        accB[r] += __shfl_xor(accB[r], 2, 32);
+        const float vA = __shfl(accA[r], (lane & 7)*4, 32);
+        const float vB = __shfl(accB[r], (lane & 7)*4, 32);
+        acc[r] = (lane & 8) ? vB : vA;
+    }
+    if (lane < 16) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            sh_l[(warp_id*M + r)*16 + lane] = acc[r];
+        }
+    }
+    __syncthreads();
+    if (warp_id == 0 && lane < 16) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            if (r >= rows) {
+                break;
+            }
+            float total = 0.0f;
+#pragma unroll
+            for (int w = 0; w < W; ++w) {
+                total += sh_l[(w*M + r)*16 + lane];
+            }
+            C[(size_t) r*size_n + tile_n*16 + lane] = total;
+        }
+    }
+}
+
+// One chunk of up to 8 rows. fin / fout: the caller checked that the fused forms apply (1 row for fin, a contiguous
+// dst for fout); C is then dst (fout) or the mid buffer.
+template <int bits, int W>
+static void escha_rdna_launch_w(const half * xh, const float * x, const half * rin, const uint16_t * code, const half * rout,
+        const half * lut, float * C, const int IC, const int OC, const int rows, const bool fin, const bool fout, cudaStream_t stream) {
+    const int n_tiles = OC/16;
+    const int M = rows <= 1 ? 1 : rows <= 2 ? 2 : rows <= 4 ? 4 : 8;
+    if (escha_hip_gemv_mode() == 5) {
+        const int ML = M == 2 ? 4 : M;   // lut: M = 1, 4, 8 (2 rows take M = 4 with 2 valid rows)
+        const size_t smem = (size_t) W*ML*16*sizeof(float);
+        switch (ML) {
+            case 1:  escha_rdna_gemv_lut<bits, 1, W><<<n_tiles, W*32, smem, stream>>>(xh, code, lut, C, IC, OC, rows); break;
+            case 4:  escha_rdna_gemv_lut<bits, 4, W><<<n_tiles, W*32, smem, stream>>>(xh, code, lut, C, IC, OC, rows); break;
+            default: escha_rdna_gemv_lut<bits, 8, W><<<n_tiles, W*32, smem, stream>>>(xh, code, lut, C, IC, OC, rows); break;
+        }
+        return;
+    }
+    const int T = escha_hip_gemv_t();
+    const int U = escha_hip_gemv_u();
+#define ESCHA_T_LAUNCH(m, u, t, fi, fo) \
+    escha_rdna_gemv_t<bits, m, W, u, t, fi, fo><<<n_tiles/(t), W*32, (size_t) W*(t)*(m)*16*sizeof(float) + ((fi) ? (size_t) IC*sizeof(half) : 0), stream>>>( \
+        xh, x, rin, code, rout, C, IC, OC, rows)
+    if (M == 1) {
+        if (fin) {
+            if (T == 2) { ESCHA_T_LAUNCH(1, 2, 2, true, true); } else { ESCHA_T_LAUNCH(1, 4, 1, true, true); }
+        } else if (fout) {
+            if (T == 2) { ESCHA_T_LAUNCH(1, 2, 2, false, true); } else { ESCHA_T_LAUNCH(1, 4, 1, false, true); }
+        } else if (T == 2) {
+            ESCHA_T_LAUNCH(1, 2, 2, false, false);
+        } else if (U == 2) {
+            ESCHA_T_LAUNCH(1, 2, 1, false, false);
+        } else if (U == 8) {
+            ESCHA_T_LAUNCH(1, 8, 1, false, false);
+        } else {
+            ESCHA_T_LAUNCH(1, 4, 1, false, false);
+        }
+    } else {
+        // the U of exllamav3's table (exl3_tiles_u_splitk): 4 for M = 2, 4; 1 for M = 8
+        switch (M) {
+            case 2:  if (fout) { ESCHA_T_LAUNCH(2, 4, 1, false, true); } else { ESCHA_T_LAUNCH(2, 4, 1, false, false); } break;
+            case 4:  if (fout) { ESCHA_T_LAUNCH(4, 4, 1, false, true); } else { ESCHA_T_LAUNCH(4, 4, 1, false, false); } break;
+            default: if (fout) { ESCHA_T_LAUNCH(8, 1, 1, false, true); } else { ESCHA_T_LAUNCH(8, 1, 1, false, false); } break;
+        }
+    }
+#undef ESCHA_T_LAUNCH
+}
+
+template <int bits>
+static void escha_rdna_launch_v5(const half * xh, const float * x, const half * rin, const uint16_t * code, const half * rout,
+        const half * lut, float * C, const int IC, const int OC, const int rows, const bool fin, const bool fout, cudaStream_t stream) {
+    switch (escha_hip_gemv_warps(IC/16, OC/16)) {
+        case 4:  escha_rdna_launch_w<bits, 4>(xh, x, rin, code, rout, lut, C, IC, OC, rows, fin, fout, stream); break;
+        case 8:  escha_rdna_launch_w<bits, 8>(xh, x, rin, code, rout, lut, C, IC, OC, rows, fin, fout, stream); break;
+        default: escha_rdna_launch_w<bits, 16>(xh, x, rin, code, rout, lut, C, IC, OC, rows, fin, fout, stream); break;
+    }
+}
+
+// The whole projection for GGML_ESCHA_HIP_GEMV=tiles | lut (rows 1 to GGML_ESCHA_GEMV_MAX_ROWS, chunks of 8): the input
+// rotation (or FIN), the GEMV, the output rotation (or FOUT). Returns false before any work when a call does not fit.
+static bool escha_hip_gemv_v5(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * code = dst->src[0];
+    const ggml_tensor * rin  = dst->src[1];
+    const ggml_tensor * rout = dst->src[2];
+    const ggml_tensor * lut  = dst->src[3];
+    const ggml_tensor * x    = dst->src[5];
+    const int K  = code->ne[0]/16;
+    const int OC = code->ne[1]*16;
+    const int IC = code->ne[2]*16;
+    const int n_rows = x->ne[1]*x->ne[2];
+    if (OC/128 > ESCHA_RDNA_NSEG || OC/16 > EXL3_GEMV_SPLITK_MAX_TILES) {
+        return false;
+    }
+    const bool lutm  = escha_hip_gemv_mode() == 5;
+    const int  fuse  = lutm ? 0 : escha_hip_gemv_fuse();
+    // FOUT writes dst rows directly (row stride OC); FIN reads x row 0 (1 row only, the rotated row in LDS: <= 48 KB)
+    const bool fout = (fuse & 1) && ggml_is_contiguous(dst);
+    const bool fin  = (fuse & 2) && fout && n_rows == 1 && (size_t) IC*sizeof(half) <= 48u*1024u;
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<half> xh(ctx.pool());
+    if (!fin) {
+        xh.alloc((size_t) n_rows*IC);
+        escha_gemv_had_in<<<(n_rows*(IC/128) + 7)/8, 256, 0, stream>>>(
+            (const float *) x->data, (const half *) rin->data, xh.get(),
+            IC, n_rows, (int) x->ne[1], x->nb[1], x->nb[2]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ggml_cuda_pool_alloc<float> mid(ctx.pool());
+    if (!fout) {
+        mid.alloc((size_t) n_rows*OC);
+    }
+    float * C = fout ? (float *) dst->data : mid.get();
+    for (int row0 = 0; row0 < n_rows; row0 += 8) {
+        const int rows = MIN(8, n_rows - row0);
+        const half * xr = fin ? nullptr : xh.get() + (size_t) row0*IC;
+        if (K == 2) {
+            escha_rdna_launch_v5<2>(xr, (const float *) x->data, (const half *) rin->data, (const uint16_t *) code->data, (const half *) rout->data,
+                                    (const half *) lut->data, C + (size_t) row0*OC, IC, OC, rows, fin, fout, stream);
+        } else {
+            escha_rdna_launch_v5<3>(xr, (const float *) x->data, (const half *) rin->data, (const uint16_t *) code->data, (const half *) rout->data,
+                                    (const half *) lut->data, C + (size_t) row0*OC, IC, OC, rows, fin, fout, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (!fout) {
+        escha_gemv_had_out<<<(n_rows*(OC/128) + 7)/8, 256, 0, stream>>>(
+            mid.get(), (const half *) rout->data, (float *) dst->data, OC, n_rows, (int) x->ne[1], dst->nb[1], dst->nb[2]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return true;
+}
 #endif // defined(GGML_USE_HIP)
 #line 515
 // the Hadamard kernels load and store 4 floats at a time
@@ -730,6 +1117,13 @@ bool ggml_cuda_escha_gemv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(cfg_env);
     if (escha_hip_gemv_mode() == 0 || (n_rows != 1 && escha_hip_gemv_mode() < 2) || OC/16 > EXL3_GEMV_SPLITK_MAX_TILES) {
         return false;
+    }
+    if (escha_hip_gemv_mode() >= 4) {
+        // amd-test-5 variants (tiles, lut): the whole projection in escha_hip_gemv_v5
+        if (!escha_gemv_rows_aligned(x) || !escha_gemv_rows_aligned(dst)) {
+            return false;
+        }
+        return escha_hip_gemv_v5(ctx, dst);
     }
 #else
 #line 568

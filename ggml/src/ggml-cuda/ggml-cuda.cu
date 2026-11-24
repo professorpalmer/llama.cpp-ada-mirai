@@ -33,6 +33,8 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/head2.cuh"
+#include "ggml-cuda/escha-bw.cuh"   // amd-test-5: the bandwidth meter of the AMD self-test
+#line 36
 #include "ggml-cuda/wddm.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -7653,6 +7655,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_gather_bench") == 0) {
         return (void *)ggml_backend_cuda_gather_bench;
     }
+    // amd-test-5: the bandwidth meter of the AMD self-test (escha-bw.cuh)
+    if (strcmp(name, "ggml_backend_cuda_bw_probe") == 0) {
+        return (void *)ggml_backend_cuda_bw_probe;
+    }
+#line 7656
     return nullptr;
 }
 
