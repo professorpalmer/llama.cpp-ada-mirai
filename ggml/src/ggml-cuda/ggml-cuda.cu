@@ -558,6 +558,41 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             b.size = 0;
             return ptr;
         }
+#if defined(GGML_USE_HIP)
+        // amd-test-5c: HIP builds have no VMM pool, so a request that grows (the fp16 copy of the packed mask of each
+        // attention op of the tile kernel: n_kv x rows x 2 bytes, larger with each micro-batch of a long prompt) gets a
+        // new block each time, and every older, smaller block stays cached: 5.3 GiB of cached blocks by 155,648 tokens at
+        // micro-batch 1024 (tools/amd_speed/pool_sim.py), the VRAM that the desktop lost in the amd-test-5b deep step of an
+        // RX 7900 XTX. A request of 64 MiB or more that no cached block holds first returns the cached blocks of 16 MiB up
+        // to its size. Captured (decode) graphs never ask for 64 MiB: the mask is packed only for 32 tokens or more a batch
+        // (llama-graph.cpp), 33 lookup rows at 262,144 cells are 17 MiB. GGML_CUDA_POOL_KEEP=1 keeps the old behavior.
+        if (size >= ((size_t) 64 << 20) && getenv("GGML_CUDA_POOL_KEEP") == nullptr) {
+            size_t freed = 0;
+            int    n_freed = 0;
+            for (int i = 0; i < MAX_BUFFERS; ++i) {
+                ggml_cuda_buffer & b = buffer_pool[i];
+                if (b.ptr != nullptr && b.size >= ((size_t) 16 << 20) && b.size < size) {
+                    if (n_freed == 0) {
+                        ggml_cuda_set_device(device);
+                        CUDA_CHECK(cudaDeviceSynchronize());
+                    }
+                    CUDA_CHECK(cudaFree(b.ptr));
+                    pool_size -= b.size;
+                    freed     += b.size;
+                    n_freed++;
+                    b.ptr  = nullptr;
+                    b.size = 0;
+                }
+            }
+            static bool logged = false;
+            if (n_freed > 0 && !logged) {
+                logged = true;
+                GGML_LOG_INFO("%s: pool[%d]: returned %.1f MiB in %d smaller cached blocks before a block of %.1f MiB (HIP pool trim, amd-test-5c; this line once)\n",
+                              __func__, device, freed/1048576.0, n_freed, size/1048576.0);
+            }
+        }
+#endif // defined(GGML_USE_HIP)
+#line 559
         void * ptr;
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
