@@ -811,7 +811,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (fp32_mma_hardware_available(cc)) {
+                if (fp32_mma_hardware_available(cc) && !ggml_cuda_batch_invariant()) { // amd-rc1: batch-invariant mode: MMVF for 1-8 columns
                     return ne11 <= 3;
                 }
                 return ne11 <= 8;
@@ -839,7 +839,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (fp16_mma_hardware_available(cc)) {
+                if (fp16_mma_hardware_available(cc) && !ggml_cuda_batch_invariant()) { // amd-rc1: batch-invariant mode: MMVF for 1-8 columns
                     if (GGML_CUDA_CC_IS_RDNA3(cc)) {
                         return ne11 <= 3;
                     }
@@ -871,7 +871,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (bf16_mma_hardware_available(cc)) {
+                if (bf16_mma_hardware_available(cc) && !ggml_cuda_batch_invariant()) { // amd-rc1: batch-invariant mode: MMVF for 1-8 columns
                     return ne11 <= 3;
                 }
                 return ne11 <= 8;
